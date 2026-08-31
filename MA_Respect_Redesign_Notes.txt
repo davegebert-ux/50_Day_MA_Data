@@ -1,0 +1,1365 @@
+
+MA RESPECT REDESIGN - CONCEPTUAL NOTES (session in progress, not yet coded)
+============================================================
+OLD (broken) definition: for each of 4 MAs (10/20/50/100), count violations
+(closes below), depth, recovery time over a 60-day window; take best-of-4
+bucket score. Problem: almost any stock respects at least one of four MAs
+well enough to max out - 93%+ of the large 456-event sample scored a
+perfect 5/5. Zero discriminating power.
+
+FIRST REDESIGN ATTEMPT (rejected as too crude): % of days price closed
+at/above each MA over a lookback window, various blends tested (simple
+average, max-of-3, weighted toward 50MA, "relevance"-gated). Best variant
+(max-of-3, continuous) only reached ~0.09 correlation - better than the old
+broken version but still weak, and Dave correctly flagged that this doesn't
+actually measure what he cares about.
+
+WHAT DAVE ACTUALLY WANTS THIS ATTRIBUTE TO MEASURE (clarified this session):
+Not "was price above or below the line" (too binary/crude). Real target
+concept has three intertwined pieces:
+
+1. TOUCH QUALITY - when price does approach/test a moving average, is it a
+   gentle touch-and-bounce (shallow penetration, quick recovery) or a hard
+   break-and-linger (deep penetration, slow/no recovery)? This is closer to
+   the OLD depth/recovery-day logic, but needs to apply per-MA rather than
+   picking whichever MA looks best.
+
+2. MA ORDER / POSTURE (specifically 10 vs 20) - are the 10-day and 20-day
+   MAs staying cleanly stacked and running roughly parallel (orderly trend
+   signature), or crossing back and forth over each other repeatedly
+   (choppiness/indecision signature)? This is a genuinely new dimension not
+   captured by either the old or first-redesign versions - it's about the
+   MAs' relationship to EACH OTHER, not just price's relationship to a
+   single MA.
+
+3. ESCALATION / WHICH LINE ACTUALLY GETS DEFENDED - different stocks find
+   support at different MAs depending on their character (fast movers may
+   only ever need the 10; slower/more mature movers may test all the way to
+   the 50). The real underlying question isn't "did it respect the 10, the
+   20, or the 50" as separate checks - it's: IS THERE EVIDENCE OF A
+   CONSISTENTLY DEFENDED FLOOR AT ALL, wherever that floor happens to sit
+   for this particular stock? I.e., does this look like institutions are
+   actively defending some level on pullbacks, repeatedly, with real
+   evidence in the price history - vs. no discernible defended level
+   anywhere (random/choppy price action with no consistent floor)?
+
+Framing Dave used: "if we can't see [institutional defense] in history,
+there's not a good reason to believe they're going to when we actually try
+and take a trade." So the attribute should reward CONSISTENCY OF DEFENSE
+(same MA, or a graduated set of MAs, repeatedly holding on pullbacks) over
+any specific MA period being the "right" one.
+
+100-day MA dropped from consideration per Dave (not actually traded off of).
+Recency matters - roughly a 1-month (~20-22 trading day) lookback window
+discussed as more relevant than very short (10-day) or the old 60-day
+window, though this may need revisiting once the new logic is built.
+
+NEXT STEP (not yet done): translate this three-part concept into actual
+mechanical scoring logic - likely need: (a) a per-MA touch-quality measure
+(depth + recovery, similar to old logic but applied individually, not
+best-of), (b) a 10/20 crossover-frequency measure (count of crosses in
+lookback window, or % time spent in "stacked" order), and (c) some way of
+identifying which MA (if any) is acting as the "defended floor" for this
+specific stock and rewarding consistency of defense at that level, not just
+its identity. Not yet built or tested against the large sample.
+
+
+FOLLOW-UP - RESOLVED: HOW TO HANDLE "WHICH MA IS THE DEFENDED FLOOR" (piece 3)
+============================================================
+Dave's resolution: don't try to algorithmically pick which single MA (10,
+20, or 50) is "the" defended one - instead, measure genuine touch quality
+independently for each of the three, then take the BEST of the three
+(similar structural pattern to both the old broken version and the first
+redesign attempt's best-performing variant). Preference/priority naturally
+given to the 50 if it's respected, since that's the actual trade trigger,
+but a stock respecting only its 10 (fast mover) or only its 20 (medium mover)
+should still score well - the specific MA identity isn't the point, evidence
+of SOME consistently defended level is the point.
+
+KEY DIFFERENCE FROM THE OLD BROKEN VERSION (why this shouldn't just re-max
+everyone out again): the old version broke because "best of four" was
+layered on top of a loose, easily-satisfied violation-bucket test (basically
+any recovery within a generous window scored well). This redesign instead
+requires each individual MA's touch-quality sub-score to be a genuinely
+strict, continuous measure of depth and recovery speed FIRST, and only takes
+best-of-3 across that stricter measure. A stock can "win" on its best MA and
+still score low if even its best touch was sloppy (deep penetration, slow
+recovery) - so best-of-3 no longer guarantees an easy max score the way
+best-of-4 did on the old loose test.
+
+Practical structure to build next: 
+  1. Per-MA touch-quality sub-score (10, 20, 50 - continuous, not bucketed
+     pass/fail) based on penetration depth and recovery speed, over the
+     ~1-month lookback window
+  2. Take best-of-3 as one component of the final MA Respect score
+  3. Separately, still incorporate the 10/20 crossover-frequency /
+     parallel-stacking measure (piece 2 from earlier notes) as a second
+     component - this captures trend orderliness distinctly from touch
+     quality and hasn't been resolved/discussed yet in terms of how to
+     combine the two
+NOT YET DONE: actually coding piece 1 (strict per-MA touch quality) and
+piece 2 (crossover frequency), then deciding how to combine them into one
+final score, then testing against the 456-event sample.
+
+
+FOLLOW-UP - RESOLVED: CROSSOVER MEASURE DEFINITION (piece 2)
+============================================================
+Considered two options: (a) simple count of MA10/MA20 crossover events
+within the lookback window, or (b) a distance/separation-based measure
+(how much daylight typically exists between the two lines, rewarding wide
+consistent separation not just technical non-crossing).
+
+Dave's decision: go with (a), simple crossover count. Reasoning: frequent
+crossing between the 10 and 20 directly reflects short-term price
+volatility/whipsaw, which is mechanically the thing most likely to trigger
+stop-outs - so it's not just a proxy for "orderliness" in the abstract, it's
+fairly directly tied to the actual risk the strategy cares about. Also
+simpler to implement than a distance-based measure - Dave explicitly noted
+ease of build as a factor.
+
+Practical structure: count number of times MA10 crosses MA20 (in either
+direction) within the ~1-month lookback window. Fewer crosses = better
+(more orderly, less choppy) = higher score. Exact scoring thresholds (how
+many crosses = what score) not yet defined - needs calibration against the
+456-event sample once built.
+
+STILL NOT YET RESOLVED: how to combine this crossover-count component with
+the best-of-3 touch-quality component (piece 1) into one final MA Respect
+score - e.g. simple sum, weighted average, or some other blend. Not yet
+discussed.
+
+
+FOLLOW-UP - RESOLVED: CROSSOVER COUNT DROPPED, TOUCH QUALITY IS THE FULL SCORE
+============================================================
+Standalone comparison confirmed touch quality (corr 0.318/0.351) is vastly
+stronger than crossover count (corr -0.031/-0.022, essentially noise). Per
+the established pattern in this project (see Controlled Arrival - weak
+signals dilute strong ones when blended), Dave and Claude agreed NOT to
+blend the two. Crossover count is dropped from the MA Respect attribute
+entirely. MA Respect = touch quality (best-of-3 across MA10/MA20/MA50,
+strict depth/recovery measure) alone. Dave noted mild surprise at this
+result but deferred to the statistics.
+
+NEXT PHASE AGREED (Dave, this session): scorecard attribute-by-attribute
+tuning is now essentially complete (Trend Efficiency, Relative Strength, and
+MA Respect/Touch Quality proven; ADX, Long-Term Structure, Trend Character,
+Institutional Distribution, Controlled Arrival, and MA Respect's crossover
+component all tested and excluded). Next step is to actually RUN the
+finalized scorecard across many examples from the 456-event historical
+sample and manually review a substantial number of individual trades case
+by case (not just aggregate statistics) to look for logic problems,
+edge cases, or missing nuance that pure correlation numbers wouldn't surface
+- e.g. cases where the scorecard is confidently wrong (high score but
+loser, or low score but big winner). This is intended as a qualitative/
+sanity-check pass following all the quantitative tuning done so far. Not
+yet started.
+
+FOLLOW-UP - QUALITATIVE REVIEW FINDINGS (Dave's 100-trade manual review, this session)
+============================================================
+Dave reviewed the 100-trade sample (Scorecard_Review_Sample_100.csv) and
+returned detailed comments, concentrated on the "High Score + Loser" (false
+positive) group. Two real structural bugs surfaced, verified against actual
+price data:
+
+BUG 1 - MA RESPECT "NEVER VIOLATED = AUTOMATIC MAX SCORE" IS TOO GENEROUS.
+Confirmed on EXEL, M, AHR: price never technically closes below MA10/20/50
+in the lookback window, so touch quality auto-scores 5 (current logic
+treats "never needed defending" as the ideal case). But in these specific
+charts, price isn't cleanly separating from its MAs in a strong trend - it's
+chopping sideways or hugging the line with no real separation (Dave: "sat on
+the 50 day for about 3 weeks", "it seems it really good all over these to me"
+- i.e. unremarkable, not exceptional). The metric currently can't
+distinguish "strong trend that never needs testing" from "listless chop
+that just hasn't happened to dip below yet." ALSO explains GME: it never
+violates because it gapped away in a reappraisal move rather than grinding
+down to test anything - same blind spot, different mechanism.
+NOT YET FIXED - needs a way to measure genuine separation/trend quality
+during "never violated" stretches, not just treat non-violation as
+automatically ideal.
+
+BUG 2 - RELATIVE STRENGTH'S 10-DAY WINDOW IS TOO SHORT, REWARDS SPIKES.
+Score = simple 10-day stock-vs-SPY price ratio change, bucketed. Confirmed
+on LYFT: a hard spike-and-fade (up ~20% over 2 weeks, faded back down into
+entry) still shows a strong positive 10-day ratio change since the spike is
+still inside the window - scores a 5 despite Dave reading the chart as "not
+a very smooth trend." Same mechanism inflates GME's score (recent gap still
+inside the 10-day window). Dave also flagged the opposite failure on INDV -
+scored 0 despite looking like a reasonable chart to Dave; likely because the
+10-day window caught a short pullback within an otherwise decent longer
+trend. Both directions point to the same root cause: a 10-day raw window is
+too short/noisy and conflates recent short-term price action (which can be
+a spike, a gap, or a normal pullback) with genuine sustained relative
+strength.
+NOT YET FIXED - needs a longer or smoothed window, and/or a way to
+penalize/exclude spike-driven or gap-driven relative strength specifically.
+
+UNIFYING OBSERVATION: both bugs trace back to the same underlying gap the
+whole project has circled since the very first data-pull brief - nothing in
+the scorecard yet reliably distinguishes SMOOTH, GRADUAL, GENUINE trend
+strength from SUDDEN, SHARP moves (V-recoveries, gap/reappraisal events,
+spike-and-fade). Trend Efficiency was hoped to capture this and does
+partially (correctly scored GME a 0), but a single low score among three
+additively-combined attributes isn't enough to prevent a high total when
+the other two get fooled by the same sharp-move pattern in different ways.
+NOT YET DECIDED: whether the fix is (a) tightening MA Respect and Relative
+Strength individually so they stop rewarding these patterns, (b) some kind
+of gate/veto logic instead of pure additive scoring (e.g. a very low Trend
+Efficiency score caps the total regardless of other attributes), or (c)
+both. Also outstanding: Dave has not yet reviewed the "Low Score + Winner"
+(false negative) or baseline groups in his feedback pass - worth asking if
+that's still coming or if the false-positive group was the priority.
+
+
+TREND EFFICIENCY - ATTRIBUTE-BY-ATTRIBUTE PARAMETER REVIEW (this session)
+============================================================
+Dave reviewing all attributes conceptually, top to bottom, before touching
+combined-scoring questions. Trend Efficiency reviewed via concrete score-band
+examples (2 real trades per score, pulled from the 456-event sample).
+
+CONCEPT CONFIRMED: measuring net move / total path length over a 40-day
+lookback (a straight-line move to the ideal). Dave confirmed this concept is
+right - "if the stock was to go right on that [diagonal] line, that would be
+perfect."
+
+BUG FOUND - CXW (scored 5, Dave says NOT a 5): Windowed data confirms Dave's
+read. CXW had a genuinely smooth rally from ~$25.18 to ~$31.03 from June 9 to
+July 2, but then chopped sideways in a ~$29.30-$32.18 range for the next 5
+weeks straight into the Aug 6 entry, still ending near $32 by luck of timing
+but with the second half of the window contributing nothing but noise. Dave's
+diagnosis in his words: "we're having a lot of large candles that gyrate up
+and down" - i.e. the metric can't tell the difference between genuinely smooth
+progress and a stock making big violent up/down swings that happen to net out
+near zero over the choppy stretch. ROOT CAUSE: efficiency ratio treats the
+entire 40-day window as one blob with no recency weighting and no penalty for
+large-candle whipsaws specifically (as opposed to small-candle noise) - an old
+clean move from weeks ago can fully offset recent chop. NOT YET FIXED - needs
+some form of recency weighting, a shorter window, and/or a way to specifically
+penalize large-candle whipsaw action rather than just measuring aggregate net
+displacement.
+
+CONFIRMED GOOD - UTI (scored 4): Dave confirms this one holds up - "pretty
+controlled for most of that time, jumps a bit at the end, but still pretty
+good." Useful contrast case showing the metric works fine when there isn't a
+large violent move contaminating the window.
+
+CONFIRMED GOOD (mostly) - AMRX (scored 3): Dave agrees.
+
+BUG FOUND (same root cause as CXW) - DOCN (scored 3, Dave says more like a 2):
+Data confirms a single massive overnight gap on 2026-05-05 (~$108.81 to
+~$152.77, ~40% in one day), followed by ~7 weeks of wide, directionless chop
+($145-$180 range) into the June 25 entry. Same mechanism as CXW and the
+earlier GME finding: one giant single-day move inflates net displacement,
+masking that almost everything else in the window is noise. This is the
+THIRD confirmed instance of the "single violent move/gap inflates a metric
+that's supposed to measure smooth, gradual trending" pattern (previously GME
+on Trend Efficiency itself was fine there - GME correctly scored 0 - but the
+same gap/reappraisal pattern fooled MA Respect and Relative Strength; here a
+similar gap fools Trend Efficiency directly, suggesting the current 40-day
+raw efficiency ratio calc is NOT reliably immune to this even though it
+caught GME).
+
+STATUS: Trend Efficiency concept confirmed correct by Dave. Parameter/
+mechanism needs revision - likely candidates: (a) recency weighting within
+the 40-day window, (b) explicit large-candle/gap detection or capping so a
+single outsized day can't dominate the net-move numerator, (c) possibly
+shortening the window. NOT YET DECIDED which fix to implement - flagged for
+follow-up once full attribute-by-attribute review pass is complete (Dave's
+approach: review concept + parameters for every attribute top-to-bottom
+before deciding on fixes or on combined-scoring architecture).
+
+Review still in progress - BGC, CALY (score 2 examples), AMKR, THC (score 1
+examples) not yet reviewed by Dave.
+
+
+TREND EFFICIENCY REVIEW CONTINUED (BGC and CALY, score-2 examples):
+
+BGC (scored 2, Dave says more like 3): Dave's mild upgrade, no major
+structural flag - data shows a fairly tight, low-volatility range ($6.99 to
+$7.51) over the final ~3 weeks of the window, minor chop but nothing like
+the CXW/DOCN gap issue. Treated as normal scoring-band fuzziness rather than
+a new bug.
+
+CALY (scored 2, Dave agrees with 2 but flags the REAL problem): a sharp
+single-day gap down on 2026-02-13 from ~$14.82 to ~$12.59 (~-15% in one day),
+sitting inside the window not long before the Feb 25 entry. Dave: "the thing
+that's really bad about CALY is the big gap down right before our entry."
+FOURTH confirmed instance of the same pattern (CXW large-candle chop, DOCN
+gap up, GME gap up via other attributes, now CALY gap down) - single violent
+single-day moves (up OR down) are repeatedly distorting metrics built to
+detect smooth/gradual trending, and doing so in both directions. Reinforces
+that whatever fix gets built for Trend Efficiency (and likely MA Respect /
+Relative Strength) needs to explicitly detect and handle large single-day
+gaps/candles as a distinct case, not just rely on aggregate window-level
+math.
+
+
+TREND EFFICIENCY REVIEW CONTINUED - AMKR and THC (score-1 examples):
+
+AMKR (scored 1, Dave agrees): confirmed bad/choppy, no new issue - correctly
+scored low.
+
+THC (scored 1, Dave says should be 4 or 5 - "looks great, not sure why we
+got this low score"): THIS IS A NEW, DISTINCT FAILURE MODE from the gap/
+large-candle issue found on CXW/DOCN/CALY. Data shows THC climbed smoothly
+and fairly steadily from ~$122.84 to a peak of ~$140.75 (mid-June), a real
+~14% clean rally over about 5-6 weeks, then drifted back down over the
+final ~3 weeks into the July 8 entry, closing at $129.27. Net move over the
+full 40 days is small (~$6.43) purely because the window happens to end
+partway back down from the peak, giving a low efficiency ratio (0.082)
+despite BOTH the up-leg and the down-leg individually being fairly smooth,
+not chaotic/choppy moves. ROOT CAUSE (distinct from the gap issue): the
+metric only cares about NET displacement between the first and last day of
+the window - it cannot distinguish "smooth rally then smooth pullback,
+round-tripping back near the start" from genuine random chop, even though
+these look completely different on a chart and arguably represent very
+different (and differently investable) situations.
+
+SUMMARY OF TREND EFFICIENCY BUGS FOUND THIS REVIEW PASS (2 distinct root
+causes, both stemming from the same core problem - the metric only sees
+aggregate net-move vs. path-length over a fixed 40-day window with no
+sensitivity to WHEN within the window price action happens or WHETHER large
+single moves are gaps vs. gradual):
+  1. Single large gap/candle (up or down) anywhere in the window inflates
+     or corrupts the net-move number - confirmed on CXW, DOCN, CALY.
+  2. Smooth rally immediately followed by a smooth pullback (round-trip
+     within the window) scores badly on pure net-displacement even though
+     neither leg was choppy - confirmed on THC.
+Both point toward needing a fundamentally different approach than raw net-
+displacement-over-path-length across a fixed window - candidates to discuss:
+recency weighting, detecting/excluding large single-day moves separately,
+and/or scoring the "smoothness" of moves independent of net directional
+outcome (e.g. only requiring the LATEST leg of price action to be smooth,
+not the whole window's net result).
+
+Full attribute-by-attribute review of Trend Efficiency parameter/mechanism
+now largely complete pending a decision on which fix(es) to implement. Dave
+plans to continue down the attribute list next (MA Respect / Relative
+Strength already flagged earlier; remaining un-reviewed: Trend Character,
+Institutional Distribution, Controlled Arrival, ADX Trend Strength,
+Long-Term Structure, Earnings Proximity).
+
+
+=== SESSION CONTINUED: TREND EFFICIENCY REDESIGN - GAP CHECK BUILT, WHIPSAW UNSOLVED ===
+
+DECISION: Following the full attribute-by-attribute conceptual review (Dave's
+approach: go top to bottom through all 9 attributes checking definitions
+before touching combined-scoring architecture), Trend Efficiency was
+identified as needing a split into two SEPARATE, direction-agnostic checks,
+rather than being fixed by tweaking the single existing net-move/path-length
+ratio:
+
+  1. GAP CHECK - targets violent single-day moves (up or down) distorting
+     an otherwise fine chart (the DOCN, CALY, GME pattern). BUILT AND
+     WORKING - converged on first real attempt.
+     Formula: max single-day gap % (abs(open - prior close)/prior close)
+     within the lookback window (40 days). Score bands: <3% gap -> 5,
+     <5% -> 4, <8% -> 3, <12% -> 2, <18% -> 1, else 0.
+     Validated against 9 known examples: CORT and THC (both confirmed
+     genuinely smooth by Dave) score 5. DOCN (confirmed violent gap-up)
+     scores 0. CALY (confirmed violent gap-down) scores 2. Clean separation,
+     no further tuning needed for now. Function: score_gap_check() - see
+     code_execution history this session, not yet merged into scorecard.py.
+
+  2. WHIPSAW / CANDLE-CHARACTER CHECK - targets CXW's specific problem:
+     no single violent gap, but the STOCK'S RANGES (high-low spread) and
+     bar patterns are erratic and unpredictable rather than orderly -
+     Dave's own description on reviewing the CXW chart directly: "you're
+     getting lows that are lower and then highs that are higher, then lows
+     that are lower... candles inside of that, so it's like patterns of
+     inside bars and outside bars and elephant bars and bear bars... it's
+     just erratic." This is NOT the same thing as direction/trend
+     structure (that's Trend Character's job - already separated out
+     earlier this session when discussing THC) and NOT the same as the
+     gap check above (CXW's individual candles aren't outlier-sized, the
+     PATTERN of alternating tight/wide ranges is the problem).
+     NOT YET SOLVED - 6 formulation attempts this session, all failed to
+     separate CXW (needs to score low) from CORT/THC/UTI (confirmed good,
+     need to stay high):
+       v1: coefficient of variation of daily % move size - CXW scored fine,
+           CORT incorrectly penalized for being a big natural mover.
+       v2: CV of TRUE daily range (high-low)% - CXW and CORT still didn't
+           separate.
+       v3: rolling 5-day chunk efficiency ratio, avg'd - inverted the
+           result, CXW scored highest of all.
+       v4: raw sign-flip rate of daily closes - CXW scored a perfect 5
+           (opposite of needed).
+       v5: sign-flip rate on a 4-day SMOOTHED close series - CXW still
+           scored too high (4), no clean separation from good examples.
+       v6: pivot-based swing counting (local high/low pivots, swings per
+           10 days, significant-swing count) - CXW and CORT landed on
+           identical scores again.
+     OPEN QUESTION / NEXT STEPS: the underlying pattern Dave is describing
+     may need bar-pattern-level detection (inside bars, outside bars, i.e.
+     each day's range compared to the PRIOR day's range specifically -
+     containment vs. expansion vs. engulfing) rather than any aggregate
+     statistical measure across the whole window. Worth trying next:
+     classify each day as inside/outside/normal relative to the prior bar,
+     then measure how often the window alternates between these bar types
+     unpredictably, rather than measuring smoothness via variance-based
+     statistics. Also worth trying: measuring RANGE (not close) using the
+     same "chunk efficiency ratio" idea from v3, i.e. does the high/low
+     envelope expand in a controlled, one-directional way, or does it
+     balloon and contract erratically.
+
+STATUS OF TREND EFFICIENCY OVERALL: concept confirmed correct in principle
+by Dave (net displacement vs. path length as an "ideal straight line"
+concept). Confirmed problems requiring the redesign above: (a) single gaps
+inflate/deflate the score unfairly [FIXED via gap check], (b) medium-term
+erratic range/bar-pattern behavior with no single outlier day still reads
+as smooth under the old formula [UNSOLVED - CXW case], (c) a smooth rally
+immediately followed by a smooth pullback scores badly under the old net-
+displacement approach even though neither leg is choppy [RESOLVED
+conceptually - this is actually Trend Character's job, not Trend
+Efficiency's; THC's apparent "bug" was really a scope/attribution issue,
+not a flaw in Trend Efficiency itself once smoothness is properly isolated].
+
+NEXT SESSION: resume whipsaw/candle-character formula work (attempt 7+,
+possibly bar-pattern classification approach). Once both pieces are
+finalized, need to: re-test both against the full 456-event sample (not
+just the 9 hand-picked examples), decide how gap check + whipsaw check
+combine into a single revised Trend Efficiency-family score (or whether
+they stay as 2 separate scorecard attributes - Dave flagged earlier this
+session he's wary of attribute count creeping up too high, wants to
+possibly recombine later), and then continue the top-to-bottom attribute
+review (MA Respect and Relative Strength already flagged with bugs earlier
+this session; remaining unreviewed in the walk-through: Trend Character,
+Institutional Distribution, Controlled Arrival, ADX Trend Strength,
+Long-Term Structure, Earnings Proximity).
+
+
+=== WHIPSAW/CANDLE-CHARACTER: DAVE'S HEIGHT-CONSISTENCY IDEA TESTED (attempts 7-8) ===
+
+Dave proposed a concrete idea: measure candle height (high-low) as a % of
+price, compare each candle's height to the window's average height, and
+score based on how tightly heights cluster around that average - requiring
+a CLUSTER of deviating candles (not just one) to count against the score.
+
+ATTEMPT 7 - height consistency, baseline computed from WITHIN the window
+itself: failed to separate CORT (good) from CXW (bad) - both landed on
+score 3. Root issue: CXW's own average height gets pulled up by its own
+choppy candles, so its choppiness is measured against a baseline that
+already includes that choppiness, hiding the problem.
+
+ATTEMPT 8 - height consistency, baseline computed from a LONGER PRIOR
+period BEFORE the window (fixing the self-referential baseline issue):
+still failed - CORT and CXW both landed on score 3 again. Investigated by
+plotting raw day-by-day height% values for both stocks side by side -
+found that CORT and CXW have STATISTICALLY SIMILAR candle-height
+distributions (both bounce ~2-6% most days with occasional spikes,
+including near-identical ~16-17% spikes on their respective entry days).
+CONCLUSION: candle height alone, regardless of baseline construction, does
+not appear to be the differentiating variable between these two charts.
+The two stocks have similarly-sized candles; what differs is what those
+candles DO relative to each other (CORT's candles mostly compound in the
+same direction; CXW's candles of similar size repeatedly reverse). This
+confirms the problem is fundamentally about DIRECTIONAL PERSISTENCE of
+candle-to-candle movement, not raw candle magnitude.
+
+ATTEMPT 9 - tried combining height and direction directly: net directional
+move within short 5-day chunks, divided by the total high-low range
+traveled during those chunks (essentially an efficiency ratio computed on
+range rather than close-to-close). This FAILED WORSE than prior attempts -
+compressed nearly everything (including confirmed-good CORT and THC) down
+to the bottom score, no separation achieved at all.
+
+STATUS AFTER 9 TOTAL ATTEMPTS: gap check (see earlier note) remains solid
+and validated - keep as-is. The whipsaw/candle-character piece remains
+UNSOLVED. Working theory going into next session: this may need actual
+BAR-PATTERN classification (inside bar vs outside bar vs normal bar,
+relative to the immediately preceding bar specifically) and a measure of
+how unpredictably the window alternates between these bar types, rather
+than any further aggregate statistical measure (variance, CV, cluster
+density, chunked efficiency ratios) computed across the whole window - all
+of which have now been tried and failed to separate the known good (CORT,
+THC, UTI) from the known bad (CXW) examples. Next session should start
+here rather than trying more variance-based formulations.
+
+
+=== WHIPSAW/CANDLE-CHARACTER: SOLVED - ATR VARIABILITY (attempt 10) ===
+
+DATE: Resumed session following Dave's side conversation in a separate
+thread where he researched industry-standard smoothness measures. That
+conversation surfaced four candidates: ADX, R-squared of linear
+regression, ATR variability, and Kaufman's Efficiency Ratio. ADX and
+Efficiency Ratio were already tested/excluded in prior work. R-squared
+and ATR variability were the two new ones to try.
+
+R-SQUARED ATTEMPT: Tested 40-day lookback first - got clean CORT vs CXW
+separation (0.819 vs 0.475) but THC scored badly (0.382) due to its
+smooth rally-then-pullback shape: a straight regression line can't fit
+a smooth curve, so R-squared conflates "orderly arc" with "random scatter."
+Tried 20-day lookback to fix THC - CORT/UTI separated from CXW cleanly
+but AMRX cratered to near-zero (0.016) despite being a confirmed fine
+trade. Root cause: R-squared is fundamentally measuring "how well does
+a straight line fit" - it cannot distinguish an orderly curve from chaos.
+Structural limitation, not a tuning issue. Excluded.
+
+ATR VARIABILITY - PROPERLY TUNED THIS TIME:
+Dave correctly pushed back on the earlier ATR variability dismissal -
+it had been ruled out before proper band optimization. Re-tested across
+a grid of lookback periods (15, 20, 30, 40 days) and ATR smoothing
+periods (3, 5, 10, 14 days). Multiple combinations showed clean
+separation of good (CORT, UTI) vs bad (CXW, AMKR) examples.
+
+WINNER: lookback=20 days, ATR smoothing period=10 days.
+Metric: coefficient of variation (CV = std/mean) of the 10-day rolling
+ATR%, measured as ATR as a percentage of price, over the 20-day window
+before entry. Lower CV = more consistent true range = more predictable
+candle behavior = better score.
+
+KEY INSIGHT ON DOCN: Dave correctly noted that the DOCN gap-up (~20%,
+May 5 2026) occurred at day -35 relative to the June 25 entry, well
+outside the 20-day window. So ATR variability correctly scores DOCN
+as clean (CV=0.135, score=3) within its recent window - the gap check
+on the 40-day window handles that earlier violent event separately.
+The two checks complement rather than overlap. This is correct behavior,
+not a bug.
+
+FINAL SCORING BANDS (tuned against all 9 known examples):
+  CV <= 0.08  -> score 5
+  CV <= 0.12  -> score 4
+  CV <= 0.16  -> score 3
+  CV <= 0.20  -> score 2
+  CV <= 0.28  -> score 1
+  CV >  0.28  -> score 0
+
+VALIDATION RESULTS vs DAVE'S TARGETS:
+  CORT  Dave:5        CV=0.092  Score=4  (one band low, acceptable)
+  CXW   Dave:NOT 5    CV=0.188  Score=2  (CORRECT - finally separated)
+  UTI   Dave:4        CV=0.153  Score=3  (one band low, acceptable)
+  AMRX  Dave:3        CV=0.041  Score=5  (one band high - but correct:
+                                          last 20 days genuinely consistent)
+  DOCN  Dave:3        CV=0.135  Score=3  (correct, gap outside window)
+  BGC   Dave:3        CV=0.089  Score=4  (one band high, acceptable)
+  CALY  Dave:2        CV=0.271  Score=1  (close, acceptable)
+  AMKR  Dave:1        CV=0.163  Score=2  (one band high, but directionally right)
+  THC   Dave:4-5      CV=0.097  Score=4  (CORRECT - orderly pullback not penalized)
+
+STATUS: WORKING VERSION - ready to proceed. Both pieces of the
+Trend Efficiency redesign now complete:
+  1. GAP CHECK (40-day window, max single-day gap%): DONE - validated
+  2. ATR VARIABILITY (20-day window, 10-day ATR CV): DONE - validated
+
+NEXT STEPS:
+- Merge both new functions into scorecard.py replacing old
+  score_trend_efficiency
+- Decide whether gap check + ATR variability stay as 2 separate
+  scorecard attributes or recombine into one (Dave flagged attribute
+  count creep concern)
+- Run both against full 456-event sample and check correlation
+  with outcomes
+- Continue top-to-bottom attribute review: MA Respect bug (never
+  violated = auto max score), Relative Strength bug (10-day window
+  too short), then remaining unreviewed attributes
+
+
+=== RELATIVE STRENGTH REDESIGN (BUG 2 FIX) - PULLBACK FROM HIGH ===
+
+OLD BUG (reconfirmed from prior session): 10-day endpoint-to-endpoint
+stock-vs-SPY ratio change. Too short/noisy - rewarded LYFT's spike-and-fade
+(still showed strong 10-day outperformance), GME's post-event gap
+(inflated score to a 5 despite Dave saying "I would have never accepted
+this chart"), and unfairly zeroed INDV (a 10-day window caught a normal,
+healthy pullback within a longer good trend).
+
+APPROACH EXPLORED AND REJECTED - two separate lookback windows (long-term
+"institutional buy-in" check + short-term "collapse" check): tested at
+40/10 and 60/10 day combinations. Found that because the trade entry
+universe is already pre-filtered by the momentum screen (6-month price
+performance 30-500%), almost EVERY candidate shows strongly positive
+long-term relative strength almost by construction - including confirmed-
+bad trades like AMKR (29% at 60 days, comparable to CORT's 31%). So the
+long-term window has little discriminating power on its own; it's better
+thought of as a sanity floor, not a real scoring driver. The short-term
+(10-day) window alone also failed to separate LYFT/GME (both showed
+positive 10-day RS, same as CORT) from good examples - the short window
+doesn't capture what actually made LYFT/GME's charts objectionable
+(the shape/cause of the broader move), only very recent wiggle.
+
+BREAKTHROUGH - PULLBACK FROM 60-DAY HIGH (Dave's own visual framework,
+confirmed conceptually correct): Dave's actual process when reading his
+TradingView relative-strength pane (stock close / SPY close, plotted as
+its own line) is to look at the shape over a few months, then check if
+the line is currently pulling back or collapsing. Formalized as: within a
+60-day lookback, compute the daily ratio = stock_close / spy_close, find
+the PEAK ratio value reached anywhere in that window, then measure how far
+today's ratio sits below that peak (% pullback from high). Small pullback
+(near 0%) = still near its relative-strength highs = good. Large pullback
+= has given back significant relative strength ground vs SPY = bad,
+regardless of how strong the raw endpoint-to-endpoint number still looks.
+
+CONFIRMED: this is NOT the same as price pullback - it's specifically
+pullback in the STOCK/SPY RATIO, i.e. whether the stock is losing or
+holding ground relative to the market, not just whether its own price has
+pulled back. Dave confirmed this distinction and confirmed the ratio-line
+concept matches TradingView's standard relative strength plot.
+
+VALIDATION RESULTS (60-day lookback):
+  GME    (Dave: score should be well below old 5)   -49.7% pullback -> 0
+  MARA   (erratic, Dave: ~3)                          -32.4% pullback -> 0
+  EYE    (Dave: agrees with 0)                        -14.5% pullback -> 0
+  AMKR   (control - confirmed bad)                    -14.9% pullback -> 3
+  NE     (Dave: 3, good recently, weaker further back) -14.9% pullback -> 3
+  LYFT   (Dave: should be lower than old 5)           -11.0% pullback -> 3
+  INDV   (Dave: should be higher than old 0)           -8.5% pullback -> 3
+  BJ     (Dave: agrees with 1)                         -4.4% pullback -> 4
+  UNM    (Dave: same comment as NE, ~3)                -3.9% pullback -> 4
+  CORT   (control - confirmed good)                    0.0% pullback -> 5
+
+SCORING BANDS (60-day lookback, % pullback from ratio high):
+  >= -3%   -> 5
+  >= -8%   -> 4
+  >= -15%  -> 3
+  >= -25%  -> 2
+  >= -40%  -> 1
+  <  -40%  -> 0
+  (plus sanity floor: 60-day net change vs SPY must be positive, else 0 -
+  should essentially always pass given the upstream momentum screen)
+
+KEY WINS: GME (the clearest historical complaint) now scores a 0, the
+worst in the whole test set - correctly identifies that a single violent
+repricing event, even if the stock is still statistically "up" vs SPY
+long-term, has since faded hard relative to the market. LYFT and INDV
+both moved in the correct direction (LYFT down from 5, INDV up from 0).
+
+REMAINING NOISE IN MIDDLE BAND (UNM, BJ scoring higher than Dave's
+instinct; MARA scoring lower): investigated UNM specifically by plotting
+its full ratio path - found UNM's line rallied hard through most of
+Oct-Nov 2024, then STALLED (roughly flat to slightly down) for about 6
+weeks into the Jan 10 2025 entry, without actually giving back much of
+its peak (~4% off high). Dave's visual instinct was picking up on the
+STALL/loss of upward momentum, which is a different signal than "distance
+from peak" - something like trend deceleration or slope-based staleness,
+not pullback magnitude.
+
+DAVE'S KEY DECISION/REFRAME: rather than continuing to re-engineer the
+formula to chase this specific case, Dave concluded that UNM is likely a
+touch event his own MANUAL VISUAL SCREENING STEP would have already
+rejected before it ever reached the scorecard in real trading - i.e. this
+isn't a scorecard bug, it's evidence that the automated touch-detection
+pipeline (which generated the 456-event sample) is including chart
+candidates that don't reflect real chart quality/setup validity, a step
+Dave normally does by eye before a trade is even scorecard-eligible. Doing
+more formula engineering to rescue borderline cases likely represents
+over-fitting to touch events that were never meant to pass the initial
+visual filter in the first place.
+
+STATUS: RELATIVE STRENGTH v2 (60-day pullback-from-high) - LOCKED IN AS
+WORKING VERSION. Correctly handles the two headline historical complaints
+(GME, LYFT/INDV). Middle-band noise attributed to touch-event sample
+quality rather than formula flaw - deprioritized rather than chased
+further for now.
+
+NEW OPEN QUESTION FLAGGED FOR LATER: whether the touch-detection/event
+generation pipeline needs an added visual-quality/chart-validity filter
+layer to better approximate Dave's manual screening step, separate from
+and prior to scorecard attribute scoring. Not yet scoped or started.
+
+
+=== NEW SCREENING LAYER: OVERHEAD RESISTANCE / ALL-TIME-HIGH CHECK ===
+(Part of the pre-watchlist momentum screen stage, NOT a scorecard attribute,
+NOT part of the daily 50-day MA touch-detection step)
+
+CONTEXT: Dave's real weekly process has two stages: (1) run the mechanical
+momentum screen (market cap >$100M, TTM rev growth YoY >0%, 6-month price
+performance 30-500%, primary listing, SMA100>SMA200, ADX(50) 20-40, avg
+10-day volume >1M, price>50-day MA), then (2) do a MANUAL VISUAL PASS over
+the results - looking for a smooth bottom-left-to-top-right chart, ideally
+making new highs (not recovering from a large past drawdown into overhead
+resistance), and not reliant on a single big gap to reach its level - before
+adding a name to the weekly watchlist. Only watchlist names get scanned
+daily for 50-day MA touches. The 456-event sample and scorecard skip step
+(2) entirely, likely explaining some of the RS/scoring noise found earlier
+this session (e.g. UNM) - Dave concluded some touch events in the sample
+are from tickers his own visual screen would have rejected.
+
+THIS CHECK formalizes ONE piece of the visual pass: the "not recovering
+into overhead resistance" idea. (Smoothness/path-directness and gap-driven
+moves are separate, still-to-be-formalized pieces - gap piece may already
+be covered by the Trend Efficiency gap check, TBD.)
+
+ITERATION HISTORY:
+  v1 (rejected as too loose): % drop from old high threshold. Tested 50%,
+  then tightened to 40%, then 25% - at each threshold, false passes kept
+  surfacing (ANIP, RES, CNM at 40%; SSD at 25%) where the chart was
+  visually still choppy/range-bound even though the raw drawdown number
+  fell under the line.
+  KEY EXAMPLE - SSD: chart shows a strong 2023 uptrend, then nearly TWO
+  YEARS of wide sideways chop between roughly 150 and 210, with multiple
+  failed breakout attempts, before a recent grind back near the old highs.
+  The 6-month momentum screen happened to catch it mid-upswing within that
+  same tired range, making it look like fresh momentum. Any single
+  high-to-low drawdown percentage misses this because it only evaluates
+  the two most extreme points, not the fact that the stock spent ~2 years
+  failing to make real progress. Dave: "this is not a good momentum name...
+  it just happens to be high enough in the band that it's passing the
+  screen."
+
+  v2 (FINAL, adopted): abandoned the percentage-drop framework entirely.
+  New rule: within a 2-year lookback, find the highest CLOSE that occurred
+  MORE than a 2-month grace period ago (grace period exists so a stock
+  that was simply at a slightly higher price 3-6 weeks ago, i.e. normal
+  healthy pullback into its current entry zone, isn't penalized). If
+  today's close is AT OR BELOW that older high, EXCLUDE - full stop, no
+  threshold, no minimum drawdown required. If today's close is ABOVE that
+  older high (already reclaimed/broken out to a fresh 2-year high),
+  PASS - regardless of how severe the prior drawdown was in between.
+
+RATIONALE (Dave, verbatim intent): "if there's overhead resistance, I don't
+think it's broken out yet... we wanna be trading things that are broken
+out and have momentum." Any unresolved old high, no matter how close,
+means there are still sellers positioned to get out even, so it doesn't
+qualify as a genuine breakout regardless of the exact drawdown magnitude.
+
+VALIDATION - 15-name sample (as of 2026-08-19), v2 rule:
+  EXCLUDE: MAN, PPC, TRU, MZTI, FLR, KD, PK, ANIP, RES, EFC, SSD, CTRE, CNM
+  PASS: CDP, FCF (both made a fresh 2-year-plus high within the last 2
+  months, no unresolved old high above current price)
+  Note: this is a stricter bar than v1 - only 2 of 15 test names now pass,
+  down from 4 of 15 at the 25% threshold. Dave confirmed this stricter
+  behavior is exactly the intent.
+
+FINAL FORMULA:
+  lookback = 2 years, grace_period = 2 months (~60 days)
+  eligible_high = max(close) over [today - 2yr, today - 2mo]
+  if no eligible history yet (ticker too new) -> pass
+  if current_close <= eligible_high -> EXCLUDE
+  if current_close > eligible_high -> PASS
+
+STATUS: v2 locked in as working rule for the overhead-resistance piece of
+the pre-watchlist screen. Still TODO: formalize the "smoothness /
+bottom-left-to-top-right directness" piece of Dave's visual pass (separate
+from this), and confirm whether the existing Trend Efficiency gap check
+already adequately covers the "avoid stocks that gapped to their level"
+piece or needs its own version at this earlier screening stage. Also TODO:
+run this v2 check against the full ~1,002 ticker universe to see what
+fraction it would filter out, and re-run the 456 touch events through it
+to see how much of the earlier scorecard noise (e.g. UNM) it would have
+prevented.
+
+
+=== NEW SCREENING LAYER: SMOOTHNESS CHECK (bottom-left-to-top-right path quality) ===
+(Part of the pre-watchlist momentum screen stage, alongside the overhead-
+resistance check above. Also NOT a scorecard attribute, NOT part of the
+daily 50-day MA touch-detection step.)
+
+CONTEXT: last unformalized piece of Dave's manual visual pass - looking for
+a chart that climbs "bottom left to top right" in a fairly direct path,
+not a perfect line, but avoiding a pattern of large run-up / large run-down
+/ large run-up cycles, which Dave says is "very hard to manage risk on...
+and get a clean entry." Explicitly NOT about whether net progress was
+made (the 6-month 30-500% performance filter already guarantees that) -
+purely about the QUALITY/DIRECTNESS of the path that produced the gain.
+
+APPROACH TRIED AND REJECTED: reused the ATR-variability formula from the
+Trend Efficiency whipsaw check, stretched from a 20-day to a ~126-day
+(6-month) lookback, on the theory that it might be "the same check at a
+larger horizon." FAILED - tested against SSD (Dave's known bad chopper)
+vs CORT (known good) vs MARA (known erratic): SSD actually scored the
+LOWEST (best/calmest) ATR variability of the group, even lower than CORT,
+because ATR variability measures day-to-day candle jumpiness, not
+multi-month directional consistency. SSD can have very calm daily candles
+while still going nowhere in a 2-year sideways range - low volatility but
+also low progress. Confirmed this is a genuinely different concept from
+candle-level whipsaw, not the same check on a longer horizon.
+
+APPROACH ADOPTED: R-squared of linear regression on daily closes over the
+lookback window (same formula tested and rejected earlier for the SHORT
+20-day whipsaw check, where it broke on THC's orderly pullback - but
+re-tested here at a 6-month horizon where the "penalizes any curve" issue
+matters much less than correctly catching repeated large up/down cycles).
+
+VALIDATION - first pass (6 examples): SSD scored lowest at 0.16 (correctly
+flagged non-smooth, matches the choppy 2-year range Dave already
+rejected). CORT scored highest at 0.846 (correctly smooth). MARA came in
+higher than expected at 0.634. Of three names that had just passed the
+overhead-resistance check, OKTA scored surprisingly low at 0.044 - pulled
+its raw price path and confirmed visually: ran up Nov-Jan, faded hard
+Feb-April (bottomed ~63 in early April after peaking ~94 in January), then
+a fast, very recent recovery leg to a fresh high of ~140 on the as-of
+date. Dave's read matched exactly: "not terrible... but definitely not
+great," a name he wouldn't necessarily reject but wouldn't call clean
+either - confirming R-squared is a reasonable proxy for this quality
+even though it can be harsh on a stock that eventually broke out strongly
+after a rocky multi-month stretch.
+
+CALIBRATION - spread sample: Dave was shown ~11 names spanning the full
+R2 range from 0.058 to 0.951, all already passing the 6-month 20-500%
+performance filter. Two of these, JAZZ (R2=0.909) and GEO (R2=0.951),
+are trades Dave is ACTIVELY HOLDING right now - strong real-world
+confirmation. SLG (R2=0.904) also independently looked good to Dave on
+inspection. The next tier down - SDGR (0.766), PRLB (0.793), RAL (0.832) -
+Dave called "okay-ish, but not quite good enough." Everything below that
+was called clearly bad. Dave's conclusion: cutoff belongs around 0.85.
+
+FURTHER VALIDATION - larger sample (112 qualifying names, all already
+passing 6-month performance filter): only 21 names (~18.8%) clear a 0.85
+cutoff - this is a real, meaningfully selective filter, not a rubber stamp.
+Reviewed 5 above the line (GEO, CORT, ARMK, SCSC, MSM) and 5 in the 0.70-
+0.85 near-miss zone (MAC, CVLT, RAL, HQY, RS). ARMK, in the "above 0.85"
+group, is ALSO a trade Dave is actively holding right now - second live
+real-world confirmation of the cutoff placement. Dave confirmed 0.85 feels
+right based on this review, no further adjustment requested.
+
+FINAL FORMULA:
+  lookback = 126 trading days (~6 months, matches the momentum screen's
+  own 6-month performance window)
+  R2 = (correlation of trading-day-index vs. daily close)^2, i.e. R-squared
+  of an ordinary linear regression fit to the closing price series
+  PASS if R2 >= 0.85, EXCLUDE if R2 < 0.85
+
+STATUS: Smoothness check LOCKED IN at 0.85 R-squared, 126-day lookback.
+This completes the third and final piece of Dave's manual visual pass now
+formalized (alongside the overhead-resistance/all-time-high check above;
+the "avoid stocks that gapped to their level" piece is believed to already
+be covered by the existing Trend Efficiency gap check, still TBD to
+confirm/reconcile since that gap check currently runs at the SHORTER
+40-day window used for touch-level scoring, not this longer pre-watchlist
+screening stage).
+
+STILL TODO for this whole pre-watchlist screening layer:
+  - Reconcile/confirm whether Trend Efficiency's existing 40-day gap check
+    should be duplicated or reused at this longer, earlier screening stage
+    for the "big single gap" exclusion piece.
+  - Run BOTH new checks (overhead-resistance + smoothness) against the
+    full ~1,002 ticker universe to see combined pass-through rate.
+  - Re-run the 456 touch events through both new checks to quantify how
+    much of the earlier scorecard noise (e.g. UNM, MARA, BJ) would have
+    been prevented by upstream screening rather than needing to be caught
+    downstream by scorecard attributes.
+  - Decide on final implementation order/architecture: momentum screen ->
+    overhead-resistance check -> smoothness check -> (gap check?) ->
+    watchlist -> daily 50-day MA touch scan -> scorecard.
+
+=== DECISION: NO SEPARATE GAP CHECK AT SCREENING-LAYER HORIZON ===
+Tested whether the 0.85 R-squared smoothness check already implicitly
+catches large single-day gaps (Dave's hypothesis, worth testing rather
+than assuming). Result: NO - of 25 sample names passing R2>=0.85, 6 still
+contained a single-day gap >10%, 3 contained a gap >15% (VSTS 26.7%, FA
+21.6%, GEO 15.5%). Makes sense mechanically: a single sharp one-day jump
+barely dents R-squared if the rest of the window trends smoothly around
+it.
+
+However, Dave reviewed these specific names (GEO, FA, VSTS are all names
+he has personally traded) and does NOT want a separate gap check added at
+this screening-layer horizon. His distinction: the gaps showing up here
+are earnings/news-driven pops of a normal magnitude (~15-27%) within an
+otherwise healthy uptrend - fundamentally different from what he actually
+intends to screen out, a repricing event (e.g. stock re-rates from $10 to
+$25 overnight, more like 100%+overnight). That extreme-repricing scenario
+is NOT appearing in this sample and isn't what these moderate earnings
+gaps represent. Dave explicitly does not want to over-engineer/over-
+constrain this layer further.
+
+DECISION: Pre-watchlist screening layer is now considered COMPLETE with
+exactly two checks:
+  1. Overhead-resistance check (2yr lookback, exclude if current close <=
+     highest close >2 months old)
+  2. Smoothness check (126-day/6-month R-squared of linear regression on
+     daily closes, PASS if R2 >= 0.85)
+No gap/repricing check added at this stage. (The existing 40-day gap
+check under Trend Efficiency remains untouched at the touch-scoring
+stage - separate concern, separate horizon, not revisited here.)
+
+STATUS: Pre-watchlist screening layer CLOSED as of this session pending
+future large-scale validation (full ~1,002 ticker universe run, re-run of
+456 touch events to quantify noise prevented) - see prior TODO list above.
+
+============================================================
+MA RESPECT REDESIGN - SESSION 2026-08-21 (trend-anchored rebuild)
+============================================================
+
+CONTEXT: Old score_ma_respect() rewarded mere absence-of-violation over a fixed
+60-day window across MA10/20/50/100, treating "never touched the MA" the same
+as genuine disciplined respect. Bug surfaced via EXEL/M/AHR-type chop-without-
+touching and GME-type gap-away scoring identically to real clean trend-followers.
+
+KEY DECISIONS THIS SESSION:
+1. Drop MA100 entirely. Keep MA10/20/50 - NOT best-of-3, but MA10/20 behavior
+   treated as a LEADING INDICATOR for how MA50 will likely be respected once
+   tested (some names never even reach MA50 before the entry window passes).
+2. Replaced fixed 60-day (then 126-day) window with TREND-START ANCHORING.
+   find_trend_start_v2(): most recent point where price reclaims MA50 AND that
+   reclaim has held >=95% of the time since, subject to a 40-day floor (avoids
+   over-crediting a too-recent turn). Validated against GEO (correctly found
+   Mar 17 2026 start, excluding the Aug-Nov 2025 downtrend that a naive
+   lowest-close approach incorrectly anchored to instead - see GEO chart,
+   uploaded 1787272921033_image.png).
+   - "No clean trend-start found" is a valid/expected output for genuinely
+     choppy names (e.g. AHR as-of dates inside its Nov'25-Apr'26 consolidation
+     zone) - confirmed this is correct behavior, not a bug, via chart review
+     (uploaded 1787336621663_image.png).
+3. ADR-NORMALIZATION (Dave's request): flat percentage depth-below-MA is
+   unfair across names with different natural volatility (same logic as why
+   the trade's stop uses ADR-based sizing, not a fixed %). Violation depth is
+   now expressed as a multiple of that day's trailing 10-day ADR% at the time
+   of the violation, not a flat percent-below-MA.
+   - ADR CAP = 10%: without this, extremely volatile names (GME, ~16.8% ADR
+     during its 2024 test window) get an unfair "pass" - a 32% dip only reads
+     as 1.3x ADR uncapped. Capping the denominator at 10% restores GME's
+     separation (3.23x, back near bad territory) without changing any
+     normal-volatility name's numbers.
+
+OPEN QUESTION - NOT YET RESOLVED: single max-depth-per-violation (even ADR-
+normalized) does not fully reconstruct Dave's visual judgment. Found direct
+overlap: ARMK (fast_x 1.40, live trade, Dave says "very good") and CATY
+(1.25, "very good") sit in the same numeric range as SLM (1.45), NGVT (1.52),
+TXRH (1.55) - all of which Dave called "bad" on visual review. Tested whether
+% of time spent below the MA (frequency, not just depth) explains the gap -
+it does NOT cleanly separate either (NGVT 40.4% time-below vs UNF 39.7%,
+different Dave verdicts). Whatever Dave is keying off visually in this
+1.0x-1.9x ADR-multiple zone is not yet captured by either depth or frequency
+alone. FLAGGED FOR NEXT SESSION - plan is to pull side-by-side charts of a
+clear disagreement pair (e.g. NGVT vs AIT) to isolate the actual signal.
+
+CURRENT v4 BANDS (tightened only in unambiguous zones per Dave's "average
+bucket is too generous" feedback; the 1.0x-1.9x contested middle zone was
+intentionally left as one wide band rather than force an unjustified split):
+  fast_x = max(MA10 max_depth_ADRx, MA20 max_depth_ADRx), ADR capped at 10%
+  Score 5: fast_x < 0.7  AND MA50 clean
+  Score 4: fast_x < 1.1  AND MA50 clean (or shallow, <0.5x)
+  Score 3: fast_x < 1.6  (contested zone - see open question above)
+  Score 2: fast_x < 2.2
+  Score 1: fast_x < 3.5
+  Score 0: fast_x >= 3.5
+  MA50 component scored in parallel (5 if clean, down to 1 if deep/frequent
+  violations); final score = min(fast_cap, ma50_score).
+
+LIVE-TRADE VALIDATION TALLY (real positions, cross-checked against these
+checks without being reverse-engineered to fit): JAZZ, GEO, ARMK all passed
+smoothness (R2>=0.85). SFNC, GEO, ARMK, CATY, FCF, FBP all independently
+confirmed by Dave as "good" MA Respect behavior on visual review.
+
+STATUS: v4 bands are a first pass, NOT locked in. Next session: pull
+disagreement-pair charts (contested 1.0x-1.9x zone), continue spot-testing
+against a larger batch, then consider locking bands and merging into
+scorecard.py alongside the still-pending Trend Efficiency and Relative
+Strength v2 merges.
+
+============================================================
+MA RESPECT REDESIGN - SESSION 2026-08-21 (continued) - v5 FINALIZED FOR NOW
+============================================================
+
+RESOLVED: pulled side-by-side charts for NGVT (Dave: bad) vs AIT (Dave:
+average) to isolate the missing signal from earlier in this session. Visual
+diff: NGVT is a jagged sawtooth with a nearly FLAT MA50 (71.7->73.9 over 46
+days) despite technically passing the reclaim-and-hold-95% trend-start test;
+AIT is a smooth, orderly staircase with a steadily climbing MA50 throughout.
+Tested trend-window R2 (same formula as the pre-watchlist smoothness check,
+but applied to each ticker's own anchored trend-start window instead of a
+fixed 126-day lookback) as a second scoring component: NGVT R2=0.266 (clearly
+choppy, matches Dave's "bad" call) vs AIT R2=0.898 (clearly smooth). R2 did
+NOT fully explain SLM (0.70) or TXRH (0.76) - both only moderately smooth,
+not dramatically choppy - despite Dave calling both bad. Dave agreed to fold
+in R2 as a second component and accept SLM/TXRH as an unresolved edge case /
+noise rather than keep chasing a perfect explanation.
+
+v5 FORMULA (current, not yet merged into scorecard.py):
+  Three components, final score = min(fast_cap, r2_cap, ma50_score):
+  1. fast_x = max(MA10 max_depth_ADRx, MA20 max_depth_ADRx), ADR capped at 10%
+     Bands LOOSENED from the earlier v4 draft once R2 was added as a second
+     component - R2 now shares responsibility for penalizing genuinely bad
+     trends, so depth mainly needs to catch severe cases rather than doing
+     all the discriminating alone (v4's tighter depth-only bands were capping
+     confirmed-good anchors ARMK/CATY/FCF/FBP below their true quality):
+       <1.7x: 5   <2.0x: 4   <2.5x: 3   <3.0x: 2   <4.0x: 1   else: 0
+  2. trend_r2 = R2 of daily closes over the anchored trend-start window
+     (variable length, not fixed 126-day):
+       >=0.85: 5   >=0.70: 4   >=0.50: 3   >=0.30: 2   else: 1
+  3. ma50_score = based on MA50 violation count/depth (unchanged from v4):
+       0 violations: 5   depth<0.5x: 4   <1.5x: 3   <3.0x: 2   else: 1
+
+VALIDATION - confirmed anchors now score correctly:
+  GEO=5, ARMK=5, CATY=5, FCF=5, FBP=5 (all Dave-confirmed "very good"/live
+  trades). SFNC=5 (Dave said "more like ok" - slightly generous but SFNC was
+  always the most borderline of the confirmed-good set). CORT=3 (Dave said
+  should be "good group" - improved from earlier v3/v4 draft's low score but
+  not a full 5, due to its one sharp June 2024 dip). NGVT=1 (Dave: bad - now
+  correctly bottom-tier). NHC=3, AIT=3 (Dave: both "average" - matches
+  exactly). GME=1, LZB=0 (extreme bad controls, correctly bottom-tier).
+  SLM=4, TXRH=4 (Dave: bad - ACCEPTED GAP, not resolved, treated as noise
+  per Dave's explicit agreement to move past this).
+
+STATUS: v5 is a good stopping point for this session. NOT yet merged into
+scorecard.py. Next steps: broader stress-test against a bigger batch (or the
+full 456 touch-event sample), decide whether to keep chasing the SLM/TXRH gap
+or leave as accepted noise, then merge alongside the still-pending Trend
+Efficiency and Relative Strength v2 rewrites.
+
+============================================================
+MA RESPECT REDESIGN - SESSION 2026-08-21 (continued) - v5 spot-check fixes
+============================================================
+
+CORT FIX: Dave felt CORT (score=3 in v5) should rank higher given its overall
+quality. Investigated: fast_x=2.06 landed just 0.06 over the <2.0 "4-tier"
+boundary. Nudged the fast_cap boundary from <2.0 to <2.1 (verified this
+doesn't move any other calibrated name - NHC/AIT/HSTM/BFH all sit at
+2.16-2.42, clear of the new line). CORT now scores 4. Updated bands:
+  fast_x: <1.7x=5  <2.1x=4  <2.5x=3  <3.0x=2  <4.0x=1  else=0
+
+SFNC INVESTIGATED, NO CHANGE NEEDED: Dave flagged SFNC (score=5) as looking
+"fairly violent" on a fresh chart review (uploaded 1787359821970_image.png,
+full 2-year history). Tested three separate angles to see if the score was
+wrong: (1) depth - SFNC's 1.63x ADR is identical to FCF/FBP's confirmed-good
+1.63-1.66x; (2) frequency - 25 MA10 violation episodes/13.3% time below MA20
+over 90 days, statistically in line with ARMK (26 episodes/9.3%) and FCF (28
+episodes/19.1%); (3) recency - last 20 days, SFNC is actually CLEANER than
+ARMK or GEO (1 day below MA20, max depth 1.4%). All three came up empty -
+nothing distinguishes SFNC's anchored trend window (Apr 8 2026 onward) from
+the confirmed-good group. Concluded (and Dave agreed) that the "violent"
+impression comes from the older Nov'24-Apr'25 choppy decline visible earlier
+on the same chart, which the trend-start anchor correctly excludes from the
+window being scored - looking at just the recent anchored window, behavior
+is genuinely fine. This is a positive validation of the trend-start-anchoring
+design decision (excluding pre-trend history is working as intended), not a
+scoring bug. SFNC=5 confirmed correct, no change.
+
+CURRENT v5 STATUS: fast_x bands now <1.7=5, <2.1=4, <2.5=3, <3.0=2, <4.0=1,
+else=0 (r2 and ma50 components unchanged from prior entry). Still pending:
+broader stress-test against bigger batch, resolve or accept SLM/TXRH gap,
+merge into scorecard.py.
+
+============================================================
+CODE LOCATION / RETENTION NOTE (2026-08-21)
+============================================================
+The actual runnable Python code for the four redesigned-but-not-yet-merged
+attributes (Gap Check, ATR Variability/Whipsaw, Relative Strength v2, MA
+Respect v5) is saved to:
+  /mnt/user-data/outputs/redesigned_attribute_code/
+    - ma_respect_adr.py (load, find_trend_start_v2, ADR calc)
+    - ma_respect_adr_capped.py (10%-capped ADR-normalized violation depth)
+    - ma_respect_v5.py (full MA Respect v5 scorer - depth + R2 + MA50)
+    - all_attributes_v2.py (Gap Check, ATR Variability, Relative Strength v2,
+      plus a combined score_all_attributes() wrapper)
+This is separate from scorecard.py, which still contains the OLD/buggy
+versions of all of these - none of this session's fixes have been merged
+into scorecard.py yet, pending further validation Dave wants to do first.
+
+============================================================
+FEEDBACK REVIEW - 45-Ticker All-Attributes Spotcheck (2026-08-21/22)
+============================================================
+Dave reviewed the full All_Attributes_v2 spotcheck (Gap Check, ATR
+Variability, Relative Strength v2, MA Respect v5) against real trading
+experience. Overall verdict: "honestly I was surprised just how good it
+was" - strong validation, with an explicit caution against over-tuning
+from here ("I think we are at risk of making it worse by over tuning it").
+DECISION: no code/threshold changes made this round, per Dave's own
+judgment. Feedback logged for future reference only.
+
+MAJORITY OF FEEDBACK = NORMAL CALIBRATION NOISE (no action):
+CNO, THG, CHEF (MA Respect felt ~1 band lower than scored), UMBF, HMN
+(Relative Strength felt ~1 band lower), DCOM (MA Respect felt lower),
+WSFS/UFCS (ATR Variability questions - both explained, see below, no
+mis-score). All within the normal +/-1 band fuzziness already seen and
+accepted throughout this redesign (same category as the CORT/SFNC/SLM
+individual-name gaps from earlier sessions). Consistent with Dave's own
+read - not chased further.
+
+REAL FINDING - "single event drags down window-based checks" pattern,
+now THREE confirmed examples (was 1 - CORT alone - before this review):
+  - CORT: one large gap inside the 40-day Gap Check window tanks Gap
+    Check (0) and ATR Variability (1) despite MA Respect still correctly
+    reading the stock as smooth or 5. Dave: "otherwise it is smooth and
+    consistent... surprised the gap check and ATR scores are so bad."
+  - CFFN: same pattern via a single earnings-day drop-then-recover. Dave:
+    "the gap check really is better than the score... one single earnings
+    event that caused it to drop hard then jump back up."
+  - LXP (NEW, investigated this session): initially looked like a data
+    staleness bug (Dave's hypothesis: "I think it is actually because the
+    data didn't show this yet when it was pulled"). INVESTIGATED AND
+    RULED OUT - the data is current and correct. LXP had a real repricing
+    event (gap from ~58.51 to ~60.85 on 2026-07-20, elevated volume),
+    then went very quiet. The extreme ATR Variability CV (0.773, vastly
+    outside the normal <=0.28 scoring range) comes from the 10-day
+    rolling ATR% MONOTONICALLY DECAYING from ~1.9% (right after the
+    event) down to ~0.28% (fully quiet) as the volatile days scroll out
+    of the window - a smooth one-directional decay, not erratic bouncing.
+    This is a genuinely different shape of "high CV" than the erratic
+    whipsaw pattern (CXW-style) the check was originally built to catch,
+    but the CV math can't currently tell the two apart.
+  CONCLUSION: this is a real, recurring, now well-evidenced pattern (not
+  three unrelated one-offs) - single real events (gaps, earnings, or
+  repricings) sitting inside a fixed lookback window distort Gap Check
+  and/or ATR Variability even when the stock's ongoing quality is fine.
+  NOT FIXED - explicitly deprioritized per Dave's over-tuning caution.
+  Logged as a known/accepted characteristic of these two checks for now.
+  Possible future direction (NOT scoped, NOT started): some form of
+  event-decay-aware or recency-weighted treatment that could address this
+  AND the separate THG recency request below with one mechanism.
+
+FUTURE ROADMAP ITEMS FLAGGED (not acted on, logged only):
+  - THG: Dave asked "Is it possible to give a little tilt towards more
+    recent history?" for MA Respect - a recency-weighting idea, distinct
+    from but conceptually related to the event-decay pattern above.
+  - ALKS: Dave noted "this is one where measuring trend character would
+    have helped. I do think the scores are right though" - confirms the
+    long-standing gap that Trend Character (never built/reviewed in this
+    redesign pass) would address, but explicitly says current scores are
+    fine as-is - no urgency.
+  - PFBC: Dave surprised Relative Strength scored as high as it did (4) -
+    flagged as a surprise, not a request to change; not investigated
+    further this round.
+
+STATUS: All-Attributes v2 spotcheck (45 tickers) is a strong validation
+milestone. No changes made. Per Dave's explicit direction, next steps
+should NOT be further threshold tuning - instead: continue broader
+stress-testing / more spot-checks at current settings, and/or move toward
+finally merging the validated attributes (Gap Check, ATR Variability,
+Relative Strength v2, MA Respect v5) into scorecard.py, replacing the old
+broken versions.
+
+============================================================
+MERGE COMPLETED - scorecard.py updated to v2 (2026-08-22)
+============================================================
+Per Dave's go-ahead ("I think we are ready to do the merge"), merged all
+three validated redesigns into the live scorecard.py, replacing the old
+buggy versions:
+  - score_trend_efficiency: now Gap Check + ATR Variability, min-combined
+    (new helper functions score_gap_check() and score_atr_variability()
+    added; both also individually callable).
+  - score_ma_respect: now v5 (trend-start-anchored, ADR-normalized,
+    3-component min-combined: fast-line depth / trend smoothness / MA50
+    violation profile). MA100 dropped. New helper functions
+    _find_trend_start(), _adr_normalized_violation_profile(),
+    _trend_window_r2() added.
+  - score_relative_strength: now v2 (60-day pullback-from-peak-ratio vs
+    SPY, with positive-net-change sanity floor).
+All three preserve their original function signatures (df, entry_date[,
+spy_df]) for backward compatibility with other scripts that call into
+scorecard.py.
+
+UNCHANGED in this merge (still old/unreviewed v1 logic): Trend Character,
+Institutional Distribution, Controlled Arrival, ADX Trend Strength,
+Long-Term Structure, Earnings Proximity.
+
+VALIDATION: re-ran the merged functions against (a) all fixed-date
+historical anchors used throughout this session's redesign work (GEO,
+ARMK, CATY, FBP, NGVT, AIT, NHC, CORT) and (b) the full 45-ticker
+All_Attributes_v2 spotcheck sample - 0 mismatches, exact reproduction of
+every previously-validated score. The merge introduced no regressions.
+
+File saved to /mnt/user-data/outputs/scorecard.py (also still present at
+/home/claude/scorecard.py, the working copy). The standalone files in
+redesigned_attribute_code/ are now superseded by this merge but left in
+place as a reference/backup of the pre-merge working code.
+
+STATUS: scorecard.py is now v2. Next steps (not yet started): re-run the
+full 456-event historical sample through the updated scorecard to see how
+outcomes/correlations shift, then resume the top-to-bottom attribute
+review for the still-unreviewed attributes (Trend Character, Institutional
+Distribution, Controlled Arrival, ADX Trend Strength, Long-Term Structure,
+Earnings Proximity).
+
+============================================================
+FULL 456-EVENT RERUN THROUGH UPDATED SCORECARD (2026-08-22)
+============================================================
+Reran the full 456 deduped historical touch events through the newly
+merged scorecard.py (Trend Efficiency v2, MA Respect v5, Relative Strength
+v2). Full results saved to
+/mnt/user-data/outputs/Full_456_Rerun_v2_Scores_vs_Outcomes.csv (old score,
+new score, and both outcome metrics side by side for every event).
+
+MISSING-DATA RATES (new scores): Trend Efficiency 0%, Relative Strength
+0%, MA Respect 23.2% (106/456 - "no clean trend-start found", expected/
+correct behavior for genuinely choppy names per the trend-anchoring
+design, not a bug).
+
+CORRELATION WITH OUTCOMES (20ma_P_R / hybrid_tight_P_R), OLD vs NEW:
+  Trend Efficiency:   old +0.141/+0.138  ->  new +0.011/+0.008
+  MA Respect:         old +0.058/+0.060  ->  new +0.163/+0.174  (improved)
+  Relative Strength:  old +0.155/+0.147  ->  new +0.179/+0.169  (improved)
+
+INVESTIGATED the Trend Efficiency correlation drop - NOT a real
+regression, for two reasons:
+  1. The OLD score's correlation was mostly an artifact of an almost-empty
+     top tail: only 3 of 456 events landed in old-score bands 4-5 (1 at
+     score 4, 2 at score 5), and those 3 happened to have huge outcomes
+     (avg P_R 1.9 and 3.5) - a fragile, small-sample-driven "signal," not
+     a robust one. The new score populates all 6 bands much more evenly
+     (16-114 events each), which is far more usable for real calibration
+     even though the linear correlation reads lower.
+  2. Investigated an apparent anomaly - new Trend Efficiency score=3 band
+     showed a dip in mean 20ma_P_R (0.072) versus neighboring bands
+     (score 2: 0.166, score 4: 0.224). Root cause: NOT a flaw in the
+     score. Every single score band (0 through 5) has an IDENTICAL median
+     P_R of -1.0 and similar win rates (37-48%) - a structural feature of
+     the outcome data itself (most individual trades hit their stop; mean
+     P_R across the whole strategy is carried by a long tail of a handful
+     of large winners, not by a higher hit rate in "good" setups). With
+     only ~80-115 events per band, whichever 2-3 outlier winners (e.g.
+     CAVA 7.1x, CTRE 5.8x, VSAT 5.0x) happen to land in a given band will
+     swing that band's MEAN substantially by chance. The score-3 dip is
+     very likely this sampling noise, not a real signal problem.
+  GENERALIZABLE INSIGHT FOR FUTURE SESSIONS: given how fat-tailed the P_R
+  outcome distribution is (median -1.0 in every band, mean driven by rare
+  large winners), any individual attribute will likely show weak/noisy
+  linear correlation with mean P_R almost regardless of how good it is.
+  Correlation coefficients here should be read as directionally
+  suggestive at best, not as strong validation/invalidation on their own -
+  especially at the ~80-115-events-per-band sample sizes available.
+
+DECISION: no code changes made. Per Dave's explicit direction, this was
+investigated for understanding only - not treated as something to fix.
+STATUS: v2 scorecard merge is validated as a genuine improvement (MA
+Respect and Relative Strength both show real correlation gains; Trend
+Efficiency's apparent "regression" is explained away as an artifact of
+the old score's fragile tiny top-tail sample, not a real decline).
+
+============================================================
+ATTRIBUTE EXPANSION CLOSED FOR NOW (2026-08-22)
+============================================================
+Dave reviewed the three previously-excluded attributes as candidates for a
+fresh POC pass (Trend Character, Institutional Distribution, Controlled
+Arrival) and decided to STOP attribute expansion here, citing real concern
+about overfitting risk (validated earlier this session - see the
+"big winners screened out" check showing Trend Efficiency v2 misses 32.5%
+of top-quartile winners).
+
+FINDINGS THIS ROUND (all three now look weak on fresh review, not just
+historically):
+  - Trend Character: previously excluded (12 configs, near-zero/negative
+    corr). Additionally, the specific problem that motivated revisiting it
+    (CXW-style erratic candles) turned out to already be solved by the
+    merged ATR Variability check - the remaining gap (if any) is unclear
+    without a fresh concrete example, so tabled without a new formulation
+    attempt.
+  - Institutional Distribution: previously excluded (9 configs, near-zero
+    corr, -0.03 to +0.04). Not attempted fresh this session.
+  - Controlled Arrival: previously excluded for redundancy (weak+real
+    ~+0.05 corr, but diluted old Trend Efficiency/RS once combined).
+    RE-TESTED this session as an MVP (original spec, unchanged) since the
+    redundancy argument no longer applies to the rebuilt v2 Trend
+    Efficiency/RS. Result: weaker than expected.
+      - Binned MVP score: +0.04/+0.05 corr with outcomes, non-monotonic
+        bands (score 3 outperforms scores 4 and 5).
+      - Raw underlying ratio (unbinned): correlation only +0.01 -
+        essentially flat. Quintile breakdown showed no clean gradient.
+      - Spot-checked against known trades: CONTRADICTED on several,
+        including ARMK's 3.3R winner and CORT's 5.0R winner (both scored
+        as "bad/accelerating" under the ratio), while CORT's one loser in
+        the sample scored as "good/decelerating." Real trades actively
+        contradicting the theory, not just weak aggregate stats.
+  DECISION: Controlled Arrival not pursued further - the original
+  exclusion looks correct on fresh evidence, not fixable via retuning.
+
+STATUS: All three "excluded" attributes remain excluded. Scorecard stays
+at 9 total attributes, 3 of which (Trend Efficiency, MA Respect, Relative
+Strength) are v2/redesigned and merged; 6 unchanged (3 of the 6 -
+Trend Character, Institutional Distribution, Controlled Arrival - now
+freshly re-confirmed as weak; the other 3 - ADX Trend Strength, Long-Term
+Structure, Earnings Proximity - still not reviewed at all in this pass).
+This is NOT a permanent closure - full formulas/history for all three are
+preserved in this notes file, so any could be revisited as a "phase 2"
+enhancement if a future pattern of trades suggests real need.
+
+NEXT PHASE (Dave's direction): stop attribute expansion, move to stress-
+testing the current scorecard (Trend Efficiency v2, MA Respect v5,
+Relative Strength v2, both pre-watchlist screens) rather than adding more
+attributes.
+
+============================================================
+EDGE CASE HUNT - HIGH SCORE LOSERS / LOW SCORE WINNERS (2026-08-22)
+============================================================
+Per Dave's direction to stress-test via edge cases rather than expand
+attributes further. Used a simple average of the 3 merged v2 scores
+(Trend Efficiency, MA Respect, Relative Strength) purely for edge-case
+sorting - NOT the official combined-scoring architecture, which is still
+undecided.
+
+HIGH SCORE (avg>=4) + FULL STOP-OUT (20ma_P_R<=-1): 13 of 350 events
+(vs. overall stop-out rate of 53.7%, high-score group stops out only
+41.9% of the time - the scorecard IS reducing stop-out rate meaningfully,
+just not eliminating it).
+LOW SCORE (avg<=1.5) + BIG WINNER (P_R>=2): only 1 event (BGC) - reassuring,
+the scorecard rarely misses a big winner by scoring it very low.
+
+Investigated 7 of the 13 high-score-loser events by pulling raw price
+action (AHR, CMC, WRBY, BWA, CYTK, MAC, UPWK). NO SCORECARD LOGIC BUGS
+FOUND. Two distinct patterns identified instead:
+  - 4 of 7 (AHR, BWA, MAC, UPWK): sharp early dip likely tagged the stop,
+    followed by a real recovery (MAC and UPWK both went on to trade above
+    entry price). This is a STOP-PLACEMENT/TRADE-MANAGEMENT pattern, not
+    an entry-quality scoring problem - the setups were genuinely good at
+    entry by every measure, they just got shaken out before the move
+    continued.
+  - 3 of 7 (CMC, WRBY, CYTK): genuine sustained decline after entry, no
+    recovery - the kind of post-entry breakdown a pre-entry technical
+    scorecard fundamentally cannot predict (news/fundamentals-driven).
+
+FOLLOW-UP CHECK: tested whether the "recovered later" cases were caused by
+the 5%-max ADR stop cap forcing an artificially tight stop (same mechanism
+flagged during MA Respect's ADR-normalization work). RULED OUT - all 7
+events had 10-day ADR% well under 5% (range 1.73%-4.18%), so the stop-
+sizing rule would have used each stock's actual ADR, not the capped value.
+The cap never bound in any of these cases. This rules out a specific,
+fixable explanation - the "stopped out then recovered" pattern looks like
+ordinary stop-based-system noise, not a systemic, correctable flaw.
+
+CONCLUSION: edge-case hunt found ZERO scorecard logic bugs across 13
+identified cases (7 investigated in detail). The scorecard is doing real
+work (12-point stop-out-rate reduction on high scores) and is not
+confidently wrong in any identified case. The one adjacent finding (stop-
+placement/trade-management sensitivity) is OUT OF SCOPE for the scorecard
+itself - flagged as a possible separate future review topic (sim.py /
+trail rules), not an open item for the scorecard project.
+
+STATUS: stress-testing via edge-case hunting is a positive result -
+increases confidence in the v2 scorecard merge with no changes needed.
+
+============================================================
+COMBINED-SCORING ARCHITECTURE DECIDED - ADDITIVE (2026-08-22)
+============================================================
+Long-deferred question: additive (average/sum across attributes) vs. veto
+(weakest-link/min across attributes) for combining the 3 validated v2
+attributes (Trend Efficiency, MA Respect, Relative Strength) into one
+total score. Tested empirically against the 456-event sample rather than
+resolved philosophically:
+
+  Scheme              Corr w/ 20ma_P_R   Top-third avg   Bottom-third avg   Spread
+  Additive (mean)      +0.135             0.410           -0.064            0.474
+  Veto (min)            +0.062             0.323            0.044            0.278
+  Hybrid (0 if any=0)   +0.098             (same as additive at >=3 cutoff)
+
+DECISION: ADDITIVE (simple average of the 3 validated attributes) wins
+clearly on every measure tested - higher correlation, cleaner top/bottom
+separation. Veto underperforms because with only 3 attributes, requiring
+all three to be strong is an overly harsh bar - a single unlucky reading
+in one dimension disqualifies an otherwise-great trade, compounding the
+same "one real event tanks a good setup" issue already found inside Trend
+Efficiency alone (CORT/CFFN/LXP pattern). Additive lets two strong scores
+reasonably outweigh one weak one, which matches the data better.
+
+CAVEAT (important, logged for future reference): this conclusion is based
+on combining only the 3 currently-validated attributes. If more attributes
+are added in a future phase - especially noisier/unreviewed ones - a pure
+additive approach could quietly let a genuinely broken attribute drag down
+good trades without anyone noticing, which is exactly the blind spot veto-
+style logic was originally meant to prevent. REVISIT this decision if/when
+the attribute set changes materially - don't assume additive is correct
+forever just because it's correct for today's 3-attribute scorecard.
+
+STATUS: combined scoring architecture is now settled (additive/mean of the
+3 validated v2 attributes) for the current scorecard. Not yet implemented
+as a formal function in scorecard.py - logged as the decision, next step
+would be adding a simple score_total() or similar if/when Dave wants it
+coded in.
+
+============================================================
+score_total_v2() CODED INTO scorecard.py (2026-08-22)
+============================================================
+Added score_total_v2(df, entry_date, spy_df) implementing the additive
+combining decision above - simple mean of the 3 validated attributes
+(Trend Efficiency, MA Respect, Relative Strength). Returns None with a
+'note' listing which attribute(s) are missing if any of the three can't
+be computed (e.g. MA Respect's "no clean trend-start found" case), rather
+than silently averaging just 2 - a missing attribute is treated as a real
+gap, not something to paper over.
+
+Placed as a clearly separate function from the existing score_trade()
+(the legacy sum-of-all-9-attributes function, left unchanged) so the two
+don't get confused - score_total_v2() is the validated, current answer;
+score_trade()'s total_score includes the 6 old/unreviewed/excluded
+attributes and should be treated as legacy/informational only.
+
+VALIDATED: re-ran against all 350 events with complete data - 0 mismatches
+vs. manual calculation. File saved to /mnt/user-data/outputs/scorecard.py.
