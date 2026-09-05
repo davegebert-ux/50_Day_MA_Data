@@ -613,6 +613,164 @@ strictly open or closed, no in-between state to track. If tiered/partial
 sizing is ever revisited in Phase 2, this two-file design would need a
 fresh look at that time.
 
+## Daily Automation - First Test Run + Bug Fix (2026-09-05)
+
+**Ran `orchestrator.py` for the first time**, against the historical
+1,002-ticker dataset (data only extends through 2026-08-19). Two real
+findings, one fixed immediately, others logged for next session:
+
+**FIXED: `wilder_adx` import triggered the entire `touch_scan_and_
+momentum_screen.py` script as a side effect.** That file was originally
+written as a standalone top-level script - all its scan logic sat at
+module level, not inside a function. `orchestrator.py` does
+`from touch_scan_and_momentum_screen import wilder_adx` to reuse that one
+calculation, but because Python executes a module's top-level code on
+import, this silently ran the ENTIRE historical scan (against that file's
+own hardcoded, stale DATA_DIR) every time it was imported - confirmed via
+the test run's unexpected "Found 0 ticker files" output. It failed
+silently in testing only because that hardcoded path doesn't exist here;
+in a real deployment this could error out or silently duplicate a full
+historical rescan on every daily run.
+
+**Fix applied**: wrapped all of that top-level scan logic inside a new
+`run_full_historical_scan()` function, with a `if __name__ == "__main__":`
+guard so it still runs standalone when the file is executed directly, but
+importing anything from the file (like `wilder_adx`) no longer triggers
+it. Verified: (1) `from touch_scan_and_momentum_screen import wilder_adx`
+now imports cleanly with no side-effect output, (2) `orchestrator.py`
+re-run end to end with no errors, (3) `find_new_signals_for_date()`
+re-tested directly against 2026-08-19 and still correctly finds the OKTA
+signal (score 3.5) matching one of the 4 known-open trades from the MVP
+pipeline demonstration - confirms the underlying signal logic still works
+correctly after the fix.
+
+**NOT fixed yet, logged for next session (per the test run's other
+findings, discussed in conversation this session):**
+- Missed-day replay uses plain calendar days, not a real trading-day
+  calendar - needs a market-calendar library (e.g.
+  `pandas_market_calendars`) substituted in before production use, so
+  weekends/holidays aren't wrongly treated as missed trading days needing
+  catch-up.
+- No live/fresh daily data feed exists yet - today's test run correctly
+  found zero new signals for "today" (2026-09-05) simply because local
+  data doesn't extend past 2026-08-19. This isn't a bug, it's the
+  expected state until the daily `pull_data.py` run is actually wired up
+  and running on schedule.
+- Email sending, GitHub Actions scheduling (6pm ET / 8pm ET retry /
+  failure email) still not implemented - `orchestrator.py` currently only
+  prints progress to the console.
+
+## Daily Automation - orchestrator.py Written (first pass, 2026-09-05)
+
+**A real, working `orchestrator.py` has been written** implementing the
+full design above: loads/saves the two state files, checks open positions
+for exits by re-running `sim.simulate_trail()`, scans for new signals
+restricted to a single target date, filters through overhead-resistance
+and `scorecard.score_total_v2()`, sizes and opens new trades off the
+static account balance in `parameters.py`, and flags if total committed
+capital exceeds the account balance. It also implements missed-day
+replay: it tracks the last successful run date in a small `last_run_date.txt`
+file and, on each run, processes every day from the day after that
+through today, in order, one at a time.
+
+**This is a first-pass scaffold, not yet production-ready. Known open
+gaps, to be addressed before this runs unattended for real:**
+- It has NOT been run/tested end to end yet against live or refreshed
+  data.
+- Email sending (the daily summary and the failure-notification email)
+  is NOT implemented yet - `orchestrator.py` currently only prints
+  progress to the console.
+- The 6pm ET / 8pm ET retry / GitHub Actions scheduling itself is not
+  implemented yet - this file is just the script that would get run by
+  that schedule.
+- Missed-day replay currently uses plain calendar days, NOT a real market
+  holiday/weekend calendar - it will currently treat weekends as "missed
+  trading days" needing catch-up, which is wrong. A market-calendar
+  library (e.g. `pandas_market_calendars`) should be substituted in
+  before production use.
+- `find_new_signals_for_date()` reimplements the touch-scan and
+  momentum-screen conditions restricted to one date, rather than calling
+  `touch_scan_and_momentum_screen.py` directly, because that file is
+  written as a standalone top-level script (module-level code that runs
+  a full scan on import), not as a callable function. If that file is
+  ever refactored into an importable function, the orchestrator should
+  call it directly instead of maintaining a parallel reimplementation of
+  the same logic.
+
+File saved to `/mnt/user-data/outputs/orchestrator.py`, pending upload to
+`pipeline/orchestrator.py` in GitHub alongside the other pipeline files.
+
+## Daily Automation - Touch-Scan Restriction (decided 2026-09-05)
+
+**DECISION: restrict `touch_scan_and_momentum_screen.py` to evaluate only
+ONE target date per call, not a full history scan.** As originally built
+(and as run in the MVP end-to-end pipeline demonstration above), this
+script scans an entire multi-year date range per ticker and returns every
+qualifying touch event found across the whole window (1,476 touches
+across the full historical run). For daily/forward use this is both
+wasteful and wrong to keep as-is - every prior day's touches are already
+known and already correctly acted on (either they became a trade now
+sitting in the open-positions file, or they didn't qualify and were
+correctly ignored), so re-scanning full history every day would just mean
+building extra logic to figure out which of the returned results are
+actually new.
+
+Instead, the script needs a mode where it is told a specific target date
+and evaluates ONLY whether that single date is a touch event per ticker -
+still loading whatever trailing price history it needs behind that date
+to compute the 50-day MA comparison, but only emitting a result for the
+one target date, not the whole lookback window.
+
+**This target date is NOT hardcoded to literally "today."** It ties
+directly into the missed-day replay design above: on a normal day the
+orchestrator calls this with target date = today, but during a catch-up
+replay after a gap, the orchestrator calls it once per missed day, in
+order, each time with that day's date as the target - never trying to
+open a trade retroactively "as of" a past date in a way that wasn't
+actually evaluated in sequence. Dave's own framing: logically, you can't
+go back and place a trade for yesterday, so each day (real or replayed)
+must be evaluated in its own right, in order.
+
+## Daily Automation - State File Schemas (decided 2026-09-05)
+
+**Open-positions file columns:**
+- `ticker`
+- `entry_date`
+- `entry_price`
+- `risk_per_share` (dollars - the stop distance `simulate_trail()` needs
+  to re-run this position forward each day)
+- `score_at_entry` (the `score_total_v2` value that triggered the trade)
+- `shares` (position size in shares)
+- `position_cost` (dollars - `shares * entry_price`; summed across all
+  rows to get total capital currently committed, checked against the
+  account balance in `parameters.py`)
+
+**Closed-trades log columns:** everything in the open-positions file,
+plus:
+- `exit_date`
+- `exit_reason`
+- `exit_price`
+- `realized_R`
+- `realized_pnl` (dollars)
+
+This is the append-only record used for week-over-week forward
+validation.
+
+**DECISION: dollar risk per trade is calculated off the STATIC starting
+balance, not a running/compounding balance.** I.e. `risk_per_share` and
+`position_cost` are computed using `RISK_PERCENT_PER_TRADE` (1 percent)
+applied to the fixed `ACCOUNT_STARTING_BALANCE` (25,000 dollars) in
+`parameters.py`, every time, regardless of how the running total of
+closed-trade wins/losses has actually moved account equity up or down.
+Rationale (Dave, 2026-09-05): simpler to start with, and meaningfully
+easier to troubleshoot while the system is still being validated, since
+every trade's dollar sizing is independently checkable against one fixed
+number rather than a constantly shifting running balance. **Flagged as a
+likely future revisit**: once the system is trusted and running smoothly,
+switching to sizing off a running/updating equity balance would be more
+realistic to how a real account is actually traded - not urgent, logged
+here as the known next step if/when it comes up.
+
 ## Daily Automation - Schedule and Failure Handling (decided 2026-09-05)
 
 **DECISION: daily run time is 6:00 PM Eastern.** Chosen to sit safely
