@@ -155,89 +155,121 @@ def wilder_adx(df, period=50):
     return adx
 
 
-# Load SPY -- kept for potential relative-strength / 6mo-performance
-# context, but not actually required by any of the screen conditions
-# below as written.
-spy = load_ticker(SPY_PATH) if os.path.exists(SPY_PATH) else None
+def run_full_historical_scan():
+    """
+    FULL multi-year historical scan -- reproduces the original 456/1,476-event
+    touch-detection run (loops over the whole DATA_DIR universe and the whole
+    date range of each ticker). This is the ORIGINAL top-level script logic,
+    wrapped into a callable function on 2026-09-05 so that importing this
+    module (e.g. to reuse wilder_adx() elsewhere, such as in orchestrator.py)
+    no longer triggers this full scan as a side effect of import.
 
-files = sorted(glob.glob(os.path.join(DATA_DIR, "*_1d_data.csv")))
-print(f"Found {len(files)} ticker files")
+    BUG FIX (2026-09-05): previously, this scan's logic lived directly at
+    module level (not inside any function), which meant simply writing
+    `from touch_scan_and_momentum_screen import wilder_adx` anywhere else in
+    the codebase would silently execute this entire historical scan against
+    this file's own hardcoded DATA_DIR -- confirmed during orchestrator.py's
+    first test run, where it printed "Found 0 ticker files" (failing
+    silently, since that hardcoded path doesn't exist in the test
+    environment) as an unwanted side effect of an unrelated import. Wrapping
+    this in a function, callable only when explicitly invoked (including via
+    the `if __name__ == "__main__":` guard below when this file is run
+    directly), fixes that -- importing wilder_adx (or anything else) from
+    this module is now side-effect-free.
 
-all_touches = []
-skipped_tickers = []
+    NOT used by the daily orchestrator -- orchestrator.py's own
+    find_new_signals_for_date() reimplements this same logic restricted to a
+    single target date (see that function's docstring for why). This
+    function remains for reproducing/re-running the original full historical
+    scan on demand.
+    """
+    # Load SPY -- kept for potential relative-strength / 6mo-performance
+    # context, but not actually required by any of the screen conditions
+    # below as written.
+    spy = load_ticker(SPY_PATH) if os.path.exists(SPY_PATH) else None
 
-for fi, fpath in enumerate(files):
-    ticker = os.path.basename(fpath).replace("_1d_data.csv", "")
-    df = load_ticker(fpath)
-    if len(df) < 260:  # need enough history for SMA200 etc plus some runway
-        skipped_tickers.append((ticker, "insufficient history", len(df)))
-        continue
+    files = sorted(glob.glob(os.path.join(DATA_DIR, "*_1d_data.csv")))
+    print(f"Found {len(files)} ticker files")
 
-    df['SMA50'] = df['Close'].rolling(50).mean()
-    df['SMA100'] = df['Close'].rolling(100).mean()
-    df['SMA200'] = df['Close'].rolling(200).mean()
-    df['AvgVol10'] = df['Volume'].rolling(10).mean()
-    df['ADX50'] = wilder_adx(df, period=50)
+    all_touches = []
+    skipped_tickers = []
 
-    # 6-month performance ~ 126 trading days
-    df['Perf6mo'] = (df['Close'] / df['Close'].shift(126) - 1) * 100
-
-    # SMA50 slope: rising if higher than 5 days ago
-    df['SMA50_prior5'] = df['SMA50'].shift(5)
-
-    n = len(df)
-    for i in range(200, n):
-        row = df.iloc[i]
-        if pd.isna(row['SMA50']) or pd.isna(row['SMA100']) or pd.isna(row['SMA200']) or pd.isna(row['ADX50']) or pd.isna(row['AvgVol10']) or pd.isna(row['Perf6mo']) or pd.isna(row['SMA50_prior5']):
+    for fi, fpath in enumerate(files):
+        ticker = os.path.basename(fpath).replace("_1d_data.csv", "")
+        df = load_ticker(fpath)
+        if len(df) < 260:  # need enough history for SMA200 etc plus some runway
+            skipped_tickers.append((ticker, "insufficient history", len(df)))
             continue
 
-        # Condition: SMA50 rising
-        sma50_rising = row['SMA50'] > row['SMA50_prior5']
-        # Condition: price > 50MA (screen requirement, checked at screen
-        # time - general uptrend context)
-        # *** FOUND BUG: this is computed but NEVER included in the filter
-        # below -- see "FOUND BUG" note in the file header. As written,
-        # this condition is NOT enforced. ***
-        price_above_50ma = row['Close'] > row['SMA50']
-        # Condition: SMA100 > SMA200 (long-term stack)
-        stack_ok = row['SMA100'] > row['SMA200']
-        # Condition: ADX(50) between 20 and 40
-        adx_ok = 20 <= row['ADX50'] <= 40
-        # Condition: avg 10-day volume > 1,000,000
-        vol_ok = row['AvgVol10'] > 1_000_000
-        # Condition: 6-month perf between 30% and 500%
-        perf_ok = 30 <= row['Perf6mo'] <= 500
+        df['SMA50'] = df['Close'].rolling(50).mean()
+        df['SMA100'] = df['Close'].rolling(100).mean()
+        df['SMA200'] = df['Close'].rolling(200).mean()
+        df['AvgVol10'] = df['Volume'].rolling(10).mean()
+        df['ADX50'] = wilder_adx(df, period=50)
 
-        # NOTE: price_above_50ma is deliberately left OUT of this
-        # condition in the recovered code, exactly as it was actually
-        # run. Flagging rather than silently fixing it -- see file header.
-        if not (sma50_rising and stack_ok and adx_ok and vol_ok and perf_ok):
-            continue
+        # 6-month performance ~ 126 trading days
+        df['Perf6mo'] = (df['Close'] / df['Close'].shift(126) - 1) * 100
 
-        # Touch definition: low of day <= SMA50 <= high of day (price
-        # touched the MA intraday), OR close within a small tolerance
-        # band of the MA (since we only have OHLC, not exact touch
-        # confirmation)
-        touched = (row['Low'] <= row['SMA50'] <= row['High'])
+        # SMA50 slope: rising if higher than 5 days ago
+        df['SMA50_prior5'] = df['SMA50'].shift(5)
 
-        if touched:
-            all_touches.append({
-                'Ticker': ticker,
-                'Date': row['Date'],
-                'Close': row['Close'],
-                'SMA50': row['SMA50'],
-                'ADX50': row['ADX50'],
-                'Perf6mo': row['Perf6mo'],
-                'AvgVol10': row['AvgVol10'],
-                'SMA100': row['SMA100'],
-                'SMA200': row['SMA200'],
-            })
+        n = len(df)
+        for i in range(200, n):
+            row = df.iloc[i]
+            if pd.isna(row['SMA50']) or pd.isna(row['SMA100']) or pd.isna(row['SMA200']) or pd.isna(row['ADX50']) or pd.isna(row['AvgVol10']) or pd.isna(row['Perf6mo']) or pd.isna(row['SMA50_prior5']):
+                continue
 
-touches_df = pd.DataFrame(all_touches)
-print(f"Total qualifying touches found: {len(touches_df)}")
-print(f"Unique tickers with at least one touch: {touches_df['Ticker'].nunique() if len(touches_df) else 0}")
-print(f"Tickers skipped for insufficient history: {len(skipped_tickers)}")
+            # Condition: SMA50 rising
+            sma50_rising = row['SMA50'] > row['SMA50_prior5']
+            # Condition: price > 50MA (screen requirement, checked at screen
+            # time - general uptrend context)
+            # *** FOUND BUG: this is computed but NEVER included in the filter
+            # below -- see "FOUND BUG" note in the file header. As written,
+            # this condition is NOT enforced. ***
+            price_above_50ma = row['Close'] > row['SMA50']
+            # Condition: SMA100 > SMA200 (long-term stack)
+            stack_ok = row['SMA100'] > row['SMA200']
+            # Condition: ADX(50) between 20 and 40
+            adx_ok = 20 <= row['ADX50'] <= 40
+            # Condition: avg 10-day volume > 1,000,000
+            vol_ok = row['AvgVol10'] > 1_000_000
+            # Condition: 6-month perf between 30% and 500%
+            perf_ok = 30 <= row['Perf6mo'] <= 500
 
-touches_df.to_pickle('/home/claude/touches_raw.pkl')
-touches_df.to_csv('/mnt/user-data/outputs/Historical_Touches_Raw.csv', index=False)
-print("saved")
+            # NOTE: price_above_50ma is deliberately left OUT of this
+            # condition in the recovered code, exactly as it was actually
+            # run. Flagging rather than silently fixing it -- see file header.
+            if not (sma50_rising and stack_ok and adx_ok and vol_ok and perf_ok):
+                continue
+
+            # Touch definition: low of day <= SMA50 <= high of day (price
+            # touched the MA intraday), OR close within a small tolerance
+            # band of the MA (since we only have OHLC, not exact touch
+            # confirmation)
+            touched = (row['Low'] <= row['SMA50'] <= row['High'])
+
+            if touched:
+                all_touches.append({
+                    'Ticker': ticker,
+                    'Date': row['Date'],
+                    'Close': row['Close'],
+                    'SMA50': row['SMA50'],
+                    'ADX50': row['ADX50'],
+                    'Perf6mo': row['Perf6mo'],
+                    'AvgVol10': row['AvgVol10'],
+                    'SMA100': row['SMA100'],
+                    'SMA200': row['SMA200'],
+                })
+
+    touches_df = pd.DataFrame(all_touches)
+    print(f"Total qualifying touches found: {len(touches_df)}")
+    print(f"Unique tickers with at least one touch: {touches_df['Ticker'].nunique() if len(touches_df) else 0}")
+    print(f"Tickers skipped for insufficient history: {len(skipped_tickers)}")
+
+    touches_df.to_pickle('/home/claude/touches_raw.pkl')
+    touches_df.to_csv('/mnt/user-data/outputs/Historical_Touches_Raw.csv', index=False)
+    print("saved")
+
+
+if __name__ == "__main__":
+    run_full_historical_scan()
