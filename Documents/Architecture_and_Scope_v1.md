@@ -540,11 +540,214 @@ decided or built:
   system can be handed off to and executed by a new conversation or
   Claude Code with zero additional explanation needed.
 
+## Daily Automation - Orchestration Design (decided 2026-09-05)
+
+**DECISION: a lightweight orchestrator script, not one big rewritten
+script.** The daily automation will be a new, small orchestrator script
+that IMPORTS and calls the existing, already-proven pipeline files as-is
+- `touch_scan_and_momentum_screen.py`, `overhead_resistance_and_smoothness_checks.py`,
+`scorecard.py`, `sim.py` (soon to live together in `pipeline/`, per the
+GitHub reorganization above) - rather than duplicating their logic into
+one large new file. Rationale: these four files are already validated
+end to end (see the MVP pipeline demonstration above); the orchestrator's
+only new job is sequencing them for daily/forward use and managing state.
+
+**Daily run logic, four steps, run once per trading day:**
+1. **Check existing open positions for exits.** For every ticker
+   currently in an open trade (per the open-positions state file below),
+   pull its updated price history and re-run `sim.py`'s
+   `simulate_trail()` from the original entry point/price/risk-per-share.
+   `simulate_trail()` does NOT need to be rewritten for this - it already
+   walks forward day by day and returns either an exit (reason + realized
+   R) or a "still open" state, so re-running it against updated data
+   naturally tells us whether today's bar closed the trade. If it now
+   reports an exit, close the trade and append it to the closed-trades
+   log. If still open, leave it in the open-positions file and report its
+   current unrealized R.
+2. **Scan for new signals** using the touch-scan/momentum-screen logic,
+   restricted to touches occurring on the current trading day only (not
+   the full history - that's already accounted for).
+3. **Filter today's new signals** through the overhead-resistance check
+   and `scorecard.py`'s scoring, same logic as the backtest, applied only
+   to today's touches.
+4. **Open new trades** for any signal scoring >= 2.5 (the MVP skip
+   threshold) on a ticker that is NOT already in an open position (same
+   overlap/dedup rule used to build the clean 226-trade backtest result -
+   see the MVP demonstration section above). Add newly opened trades to
+   the open-positions state file.
+
+**New persistent state required (does not exist yet, to be built next
+session):**
+
+**DECISION (Dave, 2026-09-05): TWO separate files, not one file with a
+status column.** Considered combining open and closed trades into a
+single file with an open/closed status column, but decided against it.
+Rationale: open positions and closed trades behave completely
+differently in practice. Open positions is small and "hot" - read AND
+modified every single day as the orchestrator checks each live trade for
+an exit. Closed trades should be a pure append-only historical log - once
+a trade closes it is written once and never touched again, since it's the
+permanent record used for week-over-week forward validation. A single
+file with a mutable status column would mean "closing a trade" = finding
+and editing an existing row in place, which is both riskier (a crash or
+multi-day catch-up replay could corrupt an already-closed trade's row)
+and produces messy day-to-day GitHub diffs, versus a true append-only log
+where closing a trade is just adding a new line and existing history is
+never rewritten.
+
+- An **open-positions file** - ticker, entry date, entry price, risk per
+  share, current status - for every trade currently live. Read and
+  updated by every daily run. When `simulate_trail()` reports an exit for
+  a position, that row is REMOVED from this file (not marked closed in
+  place).
+- A **closed-trades log** - append-only running history of every trade
+  once it exits (ticker, entry date, exit date, exit reason, realized R,
+  score at entry). A new row is APPENDED here the moment a position closes
+  out of the open-positions file above. This is the record Dave will use
+  for the week-over-week forward validation.
+
+Note: partial-fill / partial-taken states are a non-issue for this
+design under the current MVP no-partial decision (full size in, full
+size out - see Stage 6 / Conviction_Sizing_Model_v2.md) - trades are
+strictly open or closed, no in-between state to track. If tiered/partial
+sizing is ever revisited in Phase 2, this two-file design would need a
+fresh look at that time.
+
+## Daily Automation - Schedule and Failure Handling (decided 2026-09-05)
+
+**DECISION: daily run time is 6:00 PM Eastern.** Chosen to sit safely
+after market close and after Yahoo Finance's daily OHLCV data for the
+session is fully settled and available, with real buffer built in.
+
+**DECISION: one retry, two hours later, then a failure email.** If the
+6:00 PM Eastern run fails outright (a genuine error - API outage, bug,
+etc. - not to be confused with the separate "missed day" catch-up/replay
+logic covered above, which handles the orchestrator simply not running on
+a given day at all), the orchestrator retries once at 8:00 PM Eastern. If
+that retry also fails, send a failure notification email so Dave knows
+immediately rather than only noticing by the absence of the normal daily
+summary email.
+
+## Daily Automation - Delivery, Account Tracking, and parameters.py (decided 2026-09-05)
+
+**DECISION: fully automatic, unattended daily trigger.** The orchestrator
+runs on its own schedule (e.g. a scheduled GitHub Action) with no manual
+kickoff needed day to day. Rationale (Dave): at this stage the system
+only ever writes results to a file - no broker order placement exists yet
+(that remains a possible future step, likely a few months out at the
+earliest, only after the forward-tracked results build enough of a track
+record) - so there is no real-money risk in letting it run itself daily.
+
+**DECISION: daily results delivered by email.** At the end of each daily
+run, a summary email is sent covering: new trades opened today, trades
+closed today (with exit reason and realized R), and current status of all
+still-open positions. Mechanically this uses a standard app-password-based
+email send (Gmail/Outlook or similar), with the app password stored as a
+GitHub Actions secret - a solved, standard pattern, not a research item.
+
+**DECISION: add dollar-based account tracking on top of the existing
+R-multiple system.** The scoring/sizing system currently expresses
+everything in R multiples only, with no dollar or account-size
+assumption anywhere (see Conviction_Sizing_Model_v2.md). Dave wants the
+daily email to also surface real dollar figures - specifically, total
+dollar cost currently committed across all open positions, so it's
+obvious if the simulated system would ever try to commit more capital
+than a real account of this size could actually support. This requires
+exactly two new inputs to convert R into dollars:
+- **Account starting balance**: 25,000 dollars (simulated - no live
+  broker connection exists yet).
+- **Risk per trade**: 1 percent of account equity per trade - i.e. what
+  one unit of R represents in dollar terms.
+With these two numbers, the orchestrator can compute dollar risk per
+trade, total dollar cost of all currently open positions, and flag if
+total capital committed ever exceeds the assumed account balance.
+
+**DECISION: new `parameters.py` config file** (Dave's suggestion) added
+to the repo, in `pipeline/` alongside the other pipeline scripts (fits
+the architecture-and-code-only rule - this is a code-adjacent config
+file, not a findings doc). Holds `ACCOUNT_STARTING_BALANCE` (25,000) and
+`RISK_PERCENT_PER_TRADE` (0.01) today, and is the designated future home
+for other tunable constants currently hardcoded across individual
+pipeline files (cap percent, trail-rule settings, the 2.5 skip-score
+threshold, etc.) as those come up for revisit, rather than editing values
+inside scattered script files directly. File saved to
+`/mnt/user-data/outputs/parameters.py`, pending upload to
+`pipeline/parameters.py` in GitHub alongside the other pipeline files
+already slated for that folder.
+
+**DECISION: missed days are replayed, not skipped.** If the orchestrator
+doesn't run on a given day (market holiday, a crash, simply not run), the
+next time it runs it must catch up by replaying each missed trading day
+IN ORDER, one day at a time, exactly as if it had run live that day -
+checking open positions for exits and scanning for new signals on day 1
+of the gap, then day 2, etc. - rather than jumping straight to the
+present or trying to reconcile a multi-day gap in one pass. Rationale
+(Dave): skipping days risks missing a trade's actual exit trigger or
+otherwise producing an inaccurate forward record.
+
 **FIRST STEP for that next session (Dave, 2026-09-05):** before scoping
 the automation build itself, review what is CURRENTLY in the GitHub repo
 already, and reconcile/retain anything from this project's artifacts that
 isn't in there yet. Do the inventory first, don't assume anything is
 missing.
+
+**DATA RETENTION REQUIREMENT for the daily pull (confirmed 2026-09-05):**
+The daily data-pull step must maintain a minimum ROLLING 2-YEAR (730
+calendar day) window of daily OHLCV history per ticker, refreshed every
+day. This is a hard floor, not a rough guess - it comes directly from
+`overhead_resistance_and_smoothness_checks.py`'s `overhead_resistance_check()`,
+which is the single longest lookback anywhere in the pipeline:
+  - It looks back `lookback_years=2` (2 years) from the as-of date.
+  - Within that window it applies a `grace_days=60` buffer - i.e. it
+    excludes the most recent ~2 months of that window when determining
+    whether an "old high" is still unresolved overhead resistance.
+  - It requires a minimum of 100 days of history in the window just to
+    return a verdict at all (returns None / skips silently below that).
+Every other stage's lookback need is comfortably shorter than this
+(SMA200 for the momentum screen = 200 trading days, the smoothness
+check's R-squared window = 126 trading days). So 2 years is the true
+floor for how much history must be kept available per ticker at all
+times - NOT the 3 years used for the original historical backtest (that
+long a window was only needed to validate across multiple market
+cycles, not to run the system forward day to day). Recommend keeping
+some margin above the bare 2-year floor (e.g. maintaining roughly 2
+years plus a few weeks of buffer) rather than cutting it exactly at 730
+days, so the check never silently degrades to "no eligible history yet"
+for a ticker sitting right at the edge.
+
+Practically, this means the daily pull script Claude Code builds should:
+append each new day's OHLCV bar per ticker to its existing history file
+(the same per-ticker CSV format already used in `data/`), and does NOT
+need to re-pull 3+ years from scratch each day - only fetch what's new
+since the last successful pull, while ensuring at least ~2 years plus
+buffer of trailing history remains available locally per ticker at all
+times.
+
+**DECISION (Dave, 2026-09-05): existing `pull_data.py` adopted as-is for
+daily use, full re-pull design, NOT incremental.** On reviewing the
+existing `scripts/pull_data.py` (already in the GitHub repo, used to
+build the original 1,002-ticker dataset), it turns out it already
+satisfies the 2-year floor above with real margin - it pulls a rolling
+3.6-year window (`LOOKBACK_DAYS = int(3.6 * 365)`) fresh from Yahoo
+Finance every time it runs, completely overwriting each ticker's CSV
+rather than appending just the new day's bar. Because `START_TS`/`END_TS`
+are both computed from "now" on every run, the window slides forward
+together each day - one day gained at the front, one day lost off the
+back - so the total width stays constant at ~3.6 years indefinitely.
+That's a full re-pull, not an incremental daily append.
+
+Dave elected to keep this design and run it as-is once a day, rather
+than build a lighter incremental version, for now. Rationale: 1,002
+tickers is not a large enough pull to cause real bandwidth/API concern,
+the extra width (3.6 years vs. the 2-year floor) gives useful slack while
+the system is still being tuned, and a full-repull approach is naturally
+self-healing (no gap/drift risk from missed incremental runs) and simpler
+to reason about. If bandwidth, Yahoo rate-limiting, or run-time ever
+becomes a real problem at daily cadence, the documented fallback is to
+redesign this script to do a true incremental append (fetch/append only
+the newest day(s) per ticker) instead of a full re-pull - not urgent or
+expected to be needed in the near term, but logged here as the known
+next step if it ever is.
 
 ## Future Enhancements and Open Questions (Post-MVP)
 
