@@ -79,9 +79,21 @@ jobs:
         run: |
           git config user.name "scorecard-automation-bot"
           git config user.email "actions@github.com"
-          git add data/ state/
-          git diff --cached --quiet && echo "No changes to commit" || git commit -m "Automated daily update: $(date -u +'%Y-%m-%d %H:%M UTC')"
-          git push
+          # FIX (2026-09-06): "git add" errors out with "pathspec did not
+          # match any files" if a folder exists but is completely empty
+          # (git does not track empty directories) -- this happens
+          # legitimately on days the market is closed or no trades
+          # occurred, since state/ gets created but nothing gets written
+          # into it. "|| true" makes that a harmless no-op instead of a
+          # hard failure. Commit and push only happen inside the "else"
+          # branch below, i.e. only if there's actually something staged.
+          git add data/ state/ || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit -- nothing new from today's run (normal on non-trading days)."
+          else
+            git commit -m "Automated daily update: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
 
       - name: Send failure notification email (only if this was the 8pm retry AND it failed)
         if: steps.check_time.outputs.should_run == 'true' && steps.check_time.outputs.is_retry_slot == 'true' && failure()
