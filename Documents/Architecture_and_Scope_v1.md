@@ -739,6 +739,80 @@ steps currently point at scripts that don't exist. Flagged clearly as a
 hard dependency before this workflow can go live.
 
 
+## Daily Automation - Email Scripts Built + Credentials Configured (2026-09-06)
+
+**Built `pipeline/send_summary_email.py`.** Sends the daily summary email
+referenced by the workflow. Stateless by design -- rather than have
+`orchestrator.py` track and pass along "what happened today," this
+script re-reads `state/open_positions.csv` and `state/closed_trades.csv`
+after the fact and filters for rows matching the target date (the most
+recent date `orchestrator.py` actually processed, per
+`state/last_run_date.txt` -- not necessarily today's literal calendar
+date, which matters correctly during a missed-day replay). Reports new
+trades opened, trades closed with results, and the full current
+open-positions snapshot with total capital committed. Verified the
+content-building logic directly against real state data from the mock
+repo test: correctly picked up the last-processed date, correctly showed
+zero new/closed trades for that date, and correctly listed the one open
+OKTA position with accurate totals.
+
+**Built `pipeline/send_failure_email.py`.** Deliberately minimal --
+sends a simple alert (not an automated diagnosis) directing Dave to check
+the GitHub Actions run logs directly, since if something failed badly
+enough to reach this point, that's the safer path than trusting an
+automated guess at the cause. Per the workflow's condition, this only
+fires if BOTH the 6pm primary run and the 8pm retry fail for the same
+day -- a single failed 6pm attempt does not trigger this on its own,
+since the 8pm retry might still succeed. Verified: correctly exits with
+code 1 and a clear error message when credentials aren't set, rather
+than failing unpredictably.
+
+Both scripts use Gmail's SMTP server and read `EMAIL_ADDRESS`,
+`EMAIL_APP_PASSWORD`, `EMAIL_TO` from environment variables, populated by
+the workflow from the three repo secrets (see below).
+
+**GitHub repo secrets configured (Dave, 2026-09-06).** Three repository
+secrets added under Settings > Secrets and variables > Actions >
+Repository secrets, matching exactly what
+`daily_scorecard_automation.yml` expects: `SCORECARD_EMAIL_ADDRESS`,
+`SCORECARD_EMAIL_APP_PASSWORD`, `SCORECARD_EMAIL_TO`. Dave is using his
+own Gmail address as both sender and recipient (sending the daily summary
+to himself), authenticated via a Gmail App Password (generated under
+Google Account > Security > 2-Step Verification > App Passwords) rather
+than his real account password, since Gmail blocks plain password logins
+for third-party scripts. Security note discussed and Dave's decision
+logged: an app password grants send/possibly-read access to the Gmail
+account it's tied to, but is scoped, GitHub-secret-encrypted, never
+printed in logs, and instantly revocable from the Google account without
+affecting the main password or any other app passwords -- Dave considered
+a separate dedicated sending-only Gmail account as an extra-cautious
+alternative but chose to proceed with his main account for now, given the
+easy revocability.
+
+**Files uploaded to GitHub `pipeline/` folder this session (Dave,
+2026-09-06):** `send_summary_email.py`, `send_failure_email.py`, plus
+(per earlier in this session) `nyse_market_calendar_2026_2029.csv`,
+`orchestrator.py` (updated), `touch_scan_and_momentum_screen.py`
+(bug-fixed version), `check_run_window.py`, and
+`.github/workflows/daily_scorecard_automation.yml` in its required
+special location. `Architecture_and_Scope_v1.md` also re-uploaded to
+`Documents/`.
+
+**STATUS: the daily automation build is now believed complete end to
+end** -- data pull, orchestration, state tracking, missed-day replay
+against a real market calendar, GitHub Actions scheduling across the
+Eastern-time DST boundary, and both email notifications, are all built,
+individually tested in a sandbox, and now live in the repo with
+credentials configured. **NOT yet done: a real, live end-to-end test of
+the actual GitHub Actions workflow** -- either waiting for the next
+scheduled 6pm Eastern trigger to fire naturally, or manually triggering
+it via the workflow's `workflow_dispatch` option in the GitHub Actions
+UI, to confirm the whole chain (data pull, orchestrator, git commit-back,
+email send) works correctly in the real GitHub environment, not just
+against sandboxed test data. This is the natural next-session starting
+point.
+
+
 ## Daily Automation - First Test Run + Bug Fix (2026-09-05)
 
 **Ran `orchestrator.py` for the first time**, against the historical
