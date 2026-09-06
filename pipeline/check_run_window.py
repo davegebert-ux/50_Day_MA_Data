@@ -57,24 +57,42 @@ def already_ran_today(now_eastern):
 def main():
     now = datetime.now(EASTERN)
 
-    is_six_pm_window = minutes_from(18, now) <= TOLERANCE_MINUTES
-    is_eight_pm_window = minutes_from(20, now) <= TOLERANCE_MINUTES
+    # FIX (2026-09-06): manual force-run escape hatch. The scheduled
+    # workflow's manual "Run workflow" button was originally gated by
+    # this same Eastern-hour check as the automatic schedule triggers --
+    # meaning clicking it outside the 6pm/8pm windows correctly, but
+    # unhelpfully, skipped every real step, making it useless for
+    # on-demand testing. FORCE_RUN (set via a workflow_dispatch input,
+    # passed through as an env var) bypasses the time check entirely when
+    # explicitly requested, while leaving the automatic scheduled
+    # triggers' behavior completely unchanged.
+    force_run = os.environ.get("FORCE_RUN", "false").lower() == "true"
 
-    should_run = False
-    is_retry_slot = False
-
-    if is_six_pm_window:
+    if force_run:
         should_run = True
         is_retry_slot = False
-    elif is_eight_pm_window:
-        is_retry_slot = True
-        # only run the 8pm retry if today hasn't already been recorded as
-        # a successful run (i.e. the 6pm run either failed or never
-        # triggered)
-        should_run = not already_ran_today(now)
+        print(f"Current Eastern time: {now.isoformat()}")
+        print("FORCE_RUN=true -- bypassing Eastern-hour check for manual test run.")
+        print(f"should_run: {should_run}, is_retry_slot: {is_retry_slot}")
+    else:
+        is_six_pm_window = minutes_from(18, now) <= TOLERANCE_MINUTES
+        is_eight_pm_window = minutes_from(20, now) <= TOLERANCE_MINUTES
 
-    print(f"Current Eastern time: {now.isoformat()}")
-    print(f"should_run: {should_run}, is_retry_slot: {is_retry_slot}")
+        should_run = False
+        is_retry_slot = False
+
+        if is_six_pm_window:
+            should_run = True
+            is_retry_slot = False
+        elif is_eight_pm_window:
+            is_retry_slot = True
+            # only run the 8pm retry if today hasn't already been recorded as
+            # a successful run (i.e. the 6pm run either failed or never
+            # triggered)
+            should_run = not already_ran_today(now)
+
+        print(f"Current Eastern time: {now.isoformat()}")
+        print(f"should_run: {should_run}, is_retry_slot: {is_retry_slot}")
 
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
