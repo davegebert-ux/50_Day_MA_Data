@@ -314,30 +314,62 @@ def process_single_day(target_date):
 # ============================================================
 # MAIN ENTRY POINT -- handles missed-day replay
 # ============================================================
+# Resolved relative to THIS FILE's own location, not the current working
+# directory -- so this correctly finds the calendar file regardless of
+# where the script is invoked FROM (e.g. a GitHub Action or Claude Code
+# running it from the repo root rather than from inside pipeline/).
+# Expects nyse_market_calendar_2026_2029.csv to live in the same folder
+# as this script (pipeline/), same as the other pipeline files.
+MARKET_CALENDAR_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "nyse_market_calendar_2026_2029.csv",
+)
+
+
+def load_market_open_dates():
+    """
+    Loads the static NYSE market-calendar CSV (nyse_market_calendar_2026_2029.csv)
+    and returns a set of pd.Timestamp dates on which the market was actually
+    open. FIX (2026-09-05): this replaces the earlier plain-calendar-day
+    approach, which wrongly treated weekends/holidays as "missed trading
+    days" needing replay. This is a static, hand-generated file (NYSE
+    holiday rules computed directly and cross-checked against published
+    NYSE sources for 2026), covering 2026-2029 -- a deliberate simplicity
+    choice (Dave, 2026-09-05) over an external market-calendar library
+    dependency. It will need to be regenerated/extended before it runs out
+    at the end of 2029 -- see the note in Architecture_and_Scope_v1.md.
+    """
+    cal = pd.read_csv(MARKET_CALENDAR_PATH, parse_dates=["date"])
+    open_days = cal[cal["market_open"] == True]["date"]
+    return set(open_days)
+
+
 def get_trading_days_to_process(today=None):
     """
-    Returns the list of dates to process this run, in order. If the
-    orchestrator has run before, replays every day from the day after
-    the last successful run through today (inclusive), one at a time --
-    this is the missed-day catch-up behavior. If it has never run before,
-    processes only today.
+    Returns the list of TRADING days to process this run, in order. If the
+    orchestrator has run before, replays every trading day from the day
+    after the last successful run through today (inclusive), one at a
+    time -- this is the missed-day catch-up behavior. If it has never run
+    before, processes only today (if today is itself a trading day).
 
-    NOTE: this uses calendar days, not a real market-holiday calendar --
-    a market-calendar library (e.g. pandas_market_calendars) should be
-    substituted here before this runs unattended in production, so
-    weekends/holidays aren't treated as "missed trading days" needing
-    catch-up. Flagged as a known gap, not yet resolved.
+    FIX (2026-09-05): now filters against the static NYSE market calendar
+    (see load_market_open_dates()) so weekends/holidays are correctly
+    skipped rather than counted as missed trading days needing catch-up.
     """
     today = pd.Timestamp(today) if today else pd.Timestamp(datetime.now().date())
+    market_open_dates = load_market_open_dates()
     last_run = get_last_run_date()
+
     if last_run is None:
-        return [today]
+        return [today] if today in market_open_dates else []
+
     days = []
     d = last_run + timedelta(days=1)
     while d <= today:
-        days.append(d)
+        if d in market_open_dates:
+            days.append(d)
         d += timedelta(days=1)
-    return days if days else [today]
+    return days
 
 
 def main():
