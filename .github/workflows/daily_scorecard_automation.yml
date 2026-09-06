@@ -1,0 +1,92 @@
+name: Daily Scorecard Automation
+
+# ============================================================
+# Runs the daily 50-day MA bounce scorecard pipeline automatically:
+# pulls fresh market data, then runs the orchestrator (check exits,
+# scan for new signals, score, size, and open new trades), then commits
+# the updated data and state files back into this repository so
+# tomorrow's run picks up exactly where today left off.
+#
+# SCHEDULING NOTE: GitHub Actions "schedule" triggers run on UTC time
+# only -- US Eastern time shifts between UTC-4 (EDT, summer) and UTC-5
+# (EST, winter) twice a year. Two cron triggers are defined for each
+# intended Eastern time (one per possible UTC offset); pipeline/
+# check_run_window.py checks the REAL Eastern clock at run time and
+# decides whether this specific trigger should actually do anything --
+# on any given day, two of the four triggers are no-ops.
+#
+# Intended run times: 6:00 PM Eastern (primary), 8:00 PM Eastern (retry
+# -- only actually does anything if the 6pm run failed or never ran,
+# per state/last_run_date.txt not yet reflecting today's date).
+#
+# WHY STATE GETS COMMITTED BACK: each GitHub Actions run starts from a
+# clean checkout of the repo -- nothing persists between runs unless
+# it's explicitly committed. Without this commit-back step, the
+# orchestrator's state files (open positions, closed trades, last run
+# date) and the freshly-pulled data would be thrown away at the end of
+# every run, and the next run would have no memory of what happened
+# before it.
+# ============================================================
+
+on:
+  schedule:
+    - cron: '0 22 * * *'   # 6:00 PM EDT = 10:00 PM UTC
+    - cron: '0 23 * * *'   # 6:00 PM EST = 11:00 PM UTC
+    - cron: '0 0 * * *'    # 8:00 PM EDT retry = 12:00 AM UTC (next day)
+    - cron: '0 1 * * *'    # 8:00 PM EST retry = 1:00 AM UTC (next day)
+  workflow_dispatch: {}     # allows manually triggering a run from the GitHub UI, for testing
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed so this workflow can commit state/data back to the repo
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas numpy requests
+
+      - name: Determine if this trigger should actually run (correct Eastern hour check)
+        id: check_time
+        run: python3 pipeline/check_run_window.py
+
+      - name: Pull fresh market data
+        if: steps.check_time.outputs.should_run == 'true'
+        run: python3 scripts/pull_data.py
+
+      - name: Run orchestrator
+        if: steps.check_time.outputs.should_run == 'true'
+        id: orchestrator
+        run: python3 pipeline/orchestrator.py
+
+      - name: Commit updated data and state files back to the repo
+        if: steps.check_time.outputs.should_run == 'true' && success()
+        run: |
+          git config user.name "scorecard-automation-bot"
+          git config user.email "actions@github.com"
+          git add data/ state/
+          git diff --cached --quiet && echo "No changes to commit" || git commit -m "Automated daily update: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
+
+      - name: Send failure notification email (only if this was the 8pm retry AND it failed)
+        if: steps.check_time.outputs.should_run == 'true' && steps.check_time.outputs.is_retry_slot == 'true' && failure()
+        run: python3 pipeline/send_failure_email.py
+        env:
+          EMAIL_ADDRESS: ${{ secrets.SCORECARD_EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.SCORECARD_EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.SCORECARD_EMAIL_TO }}
+
+      - name: Send daily summary email (only on success)
+        if: steps.check_time.outputs.should_run == 'true' && success()
+        run: python3 pipeline/send_summary_email.py
+        env:
+          EMAIL_ADDRESS: ${{ secrets.SCORECARD_EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.SCORECARD_EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.SCORECARD_EMAIL_TO }}
