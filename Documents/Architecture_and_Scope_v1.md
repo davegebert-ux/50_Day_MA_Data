@@ -613,6 +613,132 @@ strictly open or closed, no in-between state to track. If tiered/partial
 sizing is ever revisited in Phase 2, this two-file design would need a
 fresh look at that time.
 
+## Daily Automation - Market Calendar Built and Wired In (2026-09-05)
+
+**DECISION: a static, hand-generated NYSE market-calendar CSV, not a
+library dependency.** Dave's suggestion: rather than pull in an external
+market-calendar library (e.g. `pandas_market_calendars`, which was also
+unavailable to install in this sandbox), generate a fixed CSV of NYSE
+open/closed dates covering the next several years, extend it as needed
+over time, and revisit automating that generation only if it ever becomes
+a real burden. Rationale: simpler, no new dependency risk, and easy for
+Dave to visually spot-check if something ever looks wrong.
+
+**Built `nyse_market_calendar_2026_2029.csv`** - one row per calendar day
+from 2026-01-01 through 2029-12-31, with columns `date`, `market_open`
+(True/False), and `reason_closed` (holiday name, "Weekend", or blank).
+Standard NYSE holiday rules were computed directly (New Year's Day, MLK
+Day, Presidents Day, Good Friday, Memorial Day, Juneteenth, Independence
+Day, Labor Day, Thanksgiving, Christmas, each with weekend-observed-date
+adjustment applied) and cross-checked against published 2026 NYSE holiday
+sources - all dates matched exactly, including Good Friday (April 3,
+2026) and Independence Day observed on Friday July 3 (since July 4 falls
+on a Saturday in 2026). Covers 1,003 total market-open days across the
+4-year span (~250/year, as expected). File saved to
+`/mnt/user-data/outputs/nyse_market_calendar_2026_2029.csv`, pending
+upload to `pipeline/` in GitHub alongside the other pipeline files.
+
+**FLAGGED for the future**: this file will need to be regenerated/
+extended before it runs out at the end of 2029. Not urgent - gives years
+of runway - but worth remembering it's a static file with a hard edge,
+not a self-updating source.
+
+**`orchestrator.py` updated to use this calendar.** `get_trading_days_to_
+process()` now filters the missed-day replay window against
+`load_market_open_dates()` (reads the CSV above) instead of counting
+plain calendar days, so weekends and holidays are correctly excluded from
+the "days to replay" list rather than being wrongly treated as missed
+trading days. Verified with two test scenarios: (1) a gap spanning only a
+weekend plus Labor Day correctly resolved to zero missed trading days,
+processing just the current day; (2) a gap including two genuine missed
+trading days (Thursday and Friday before a weekend-plus-Labor-Day stretch)
+correctly identified exactly those two days plus the days after the
+holiday, in chronological order, correctly skipping the weekend and
+Labor Day itself.
+
+**Repo placement + path-resolution fix**: this file belongs in
+`pipeline/` alongside `orchestrator.py`, `parameters.py`, and the other
+pipeline scripts - same category as `parameters.py`, a static,
+code-adjacent config file the code depends on to run, fitting the
+architecture-and-code-only repo rule the same way. While confirming this,
+caught and fixed a real fragility: `orchestrator.py` originally looked
+for this CSV using a plain relative path, which would only resolve
+correctly if the script happened to be run from exactly the right working
+directory - a real risk for a GitHub Action or Claude Code invocation.
+Fixed by resolving `MARKET_CALENDAR_PATH` relative to the script file's
+own location (`os.path.dirname(os.path.abspath(__file__))`) instead of
+the current working directory. Verified by running the script's calendar
+loader from a different directory entirely (`/tmp` rather than the
+pipeline folder) and confirming it still correctly found and loaded all
+1,003 open trading dates.
+
+
+## Daily Automation - GitHub Actions Scheduling Built (2026-09-06)
+
+**State files relocated to a dedicated `state/` folder at the repo
+root**, separate from `pipeline/` (code). `orchestrator.py` updated:
+`OPEN_POSITIONS_PATH`, `CLOSED_TRADES_PATH`, `LAST_RUN_PATH` now resolve
+via `os.path.dirname(os.path.abspath(__file__))` (one level up from
+pipeline/, into state/), same fix pattern as `MARKET_CALENDAR_PATH`, so
+this works correctly regardless of the working directory a GitHub Action
+invokes the script from. Verified via a mock repo structure (pipeline/,
+data/, scripts/, state/ folders) run from the repo root: `state/` folder
+auto-created correctly, and a forced real trading day (2026-08-19)
+correctly opened the OKTA trade and wrote both `open_positions.csv` and
+`last_run_date.txt` into the new `state/` location.
+
+**`orchestrator.py` `main()` now exits with a proper process exit code**
+(0 on success, 1 on any unhandled exception, with a printed traceback to
+stderr) - required for GitHub Actions to detect success vs. failure at
+all; previously a silent Python exception and a clean run looked
+identical from the workflow's point of view. Verified both paths
+directly: a forced exception correctly produced exit code 1 with a clean
+traceback, and a normal run correctly exited 0.
+
+**Built `pipeline/check_run_window.py`** - solves the fact that GitHub
+Actions "schedule" triggers only run on UTC, while US Eastern time shifts
+between UTC-4 (EDT) and UTC-5 (EST) twice a year. Rather than hardcode
+one offset and have the run silently drift an hour off twice a year, the
+workflow defines FOUR cron triggers (6pm EDT, 6pm EST, 8pm EDT retry, 8pm
+EST retry - one for each real-clock-time possibility), and this script
+checks the actual, current Eastern time at run time (using `zoneinfo`,
+which correctly handles the EDT/EST transition automatically) to decide
+whether THIS specific trigger should do anything. On any given day, two
+of the four triggers are legitimate and two are no-ops. Also decides
+whether the 8pm trigger counts as a real "retry": it checks whether
+`state/last_run_date.txt` already reflects today's date - if the 6pm run
+already succeeded today, the 8pm trigger has nothing to do and skips
+itself. Verified with six scenarios: 6:05pm Eastern correctly matches
+only the 6pm window; 8:10pm Eastern correctly matches only the 8pm
+window; 10:00pm Eastern (a "wrong season" duplicate trigger) correctly
+matches neither; and the already-ran check correctly returns false with
+no state file, true with a matching date, false with a different date.
+
+**Built `.github/workflows/daily_scorecard_automation.yml`** (saved as
+`daily_scorecard_automation.yml` in outputs, destined for
+`.github/workflows/` in the repo). Sequence per trigger: check out repo,
+install dependencies, run `check_run_window.py` to gate whether to
+proceed, if yes run `scripts/pull_data.py` then `pipeline/orchestrator.py`,
+then (this is the key missing piece caught and fixed this session) commit
+the updated `data/` and `state/` folders back into the repository so the
+next run has the correct starting point - GitHub Actions runs start from
+a clean checkout every time, so without this commit-back step the
+orchestrator's state and the freshly-pulled data would be silently
+discarded at the end of every run and each day would start from scratch
+with no memory of prior days. Finally, sends a failure-notification email
+only if this was the 8pm retry slot and it still failed, or a daily
+summary email on success. YAML syntax validated.
+
+**NOT yet built (explicitly still pending, next session): the two email
+scripts this workflow references** - `pipeline/send_summary_email.py`
+(daily summary: new trades, closed trades with results, current open
+status) and `pipeline/send_failure_email.py` (failure notification). The
+scheduling and data-refresh half of this workflow is built and tested,
+but it will not run end-to-end successfully in GitHub yet since those two
+steps currently point at scripts that don't exist. Flagged clearly as a
+hard dependency before this workflow can go live.
+
+
 ## Daily Automation - First Test Run + Bug Fix (2026-09-05)
 
 **Ran `orchestrator.py` for the first time**, against the historical
