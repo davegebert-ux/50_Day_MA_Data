@@ -1448,3 +1448,75 @@ can change), not just a future risk introduced by the TradingView
 migration -- worth fixing as its own small, immediate correctness fix in
 `pull_data.py` / `get_sp400_sp600_tickers()`'s caller, independent of
 whether/when the broader universe-expansion work happens.
+
+---
+
+## 2026-09-09 (continued) -- Local Prototyping Plan, and New Phase 3: Trade Execution Automation
+
+**Local prototyping approach for `tradingview-screener` confirmed.** This
+session's sandbox environment has no live internet/pip access (pip
+install and direct PyPI fetch both failed -- confirmed again this
+session), so live testing of the `tradingview-screener` package cannot
+happen inside this Claude conversation. Dave does not currently have
+Claude Code (the local command-line coding tool) installed on his
+machine -- he has only been using the web-based Claude interface, which
+has no terminal/package-install/internet access of its own. Plan: Dave
+will install Claude Code locally (setup deferred to a future session
+when he has more time), which WILL have real internet and pip access
+on his own machine. The follow-up session's first concrete step is
+installing `tradingview-screener` via Claude Code and running a live
+test query against Dave's actual screen criteria (market cap, revenue
+growth, 6-month performance, SMA100/SMA200 stack, ADX, average volume)
+to confirm field names, bulk-query mechanics, and throttling behavior
+against real TradingView data.
+
+**Important clarification: local testing does not change the production
+architecture.** Claude Code running locally is purely a one-time
+exploration/prototyping tool to confirm the TradingView screener
+package works and to learn the correct API calls. Once confirmed, that
+logic gets written into the actual pipeline files that already live in
+the GitHub repo, and GitHub Actions continues to run the full pipeline
+on its existing automated schedule, independent of Dave's laptop. Local
+prototyping and the production pipeline remain fully separate; there is
+no conflict or migration of the production system to "local."
+
+**NEW: Phase 3 defined -- Trade Execution Automation (sim first, then
+live).** Dave explicitly framed the project's phased roadmap during
+this session:
+- **Phase 1 (current/complete-ish):** signal detection and daily
+  summary emails -- the pipeline detects setups and notifies Dave, but
+  does not touch a broker or place any trades.
+- **Phase 2 (near-term, in progress):** tuning and updating the model
+  itself -- universe scope expansion, fundamentals data sourcing
+  (the TradingView-screener vs. Yahoo `.info` decision above), and the
+  other model-refinement items already tracked in this document
+  (Trend Efficiency redesign, trail rule segmentation, smoothness
+  metric revisit, tiered conviction sizing revisit, etc.).
+- **Phase 3 (future, newly defined this session):** automating actual
+  trade placement -- first in a simulator/paper environment, then,
+  once proven, in a live-money environment. This is a materially new
+  body of work distinct from Phase 2: it requires integrating with a
+  broker's order-execution layer (handling order submission, fills,
+  error handling around real capital), not just refining detection
+  logic. Not to be started until Phase 2 model-tuning work is settled
+  and the detection side is fully proven.
+
+**Phase 3 execution-path note: Dave's existing TradingView-to-
+TradeStation bridge.** Dave currently places trades manually today via
+TradingView's built-in integration with his broker,
+
+TradeStation
+: he uses TradingView's long/short drawing tool to
+construct an order (entry, quantity, stop, profit targets), adjusts it
+as needed, then hits "place trade," which sends the order directly to
+TradeStation -- landing in either the live or simulated account
+depending on which one he's logged into. Dave reports this manual
+workflow already works nicely and wants to keep leveraging it if
+possible, rather than necessarily building a from-scratch broker API
+integration for Phase 3. Flagged as an option worth investigating when
+Phase 3 planning begins: whether TradingView's TradeStation bridge (or
+underlying order-submission mechanism) can be driven programmatically,
+which could be a substantially simpler execution path than a raw
+TradeStation/other-broker API integration built from zero. Not
+evaluated or researched yet this session -- purely logged as a lead for
+the dedicated Phase 3 planning session.
