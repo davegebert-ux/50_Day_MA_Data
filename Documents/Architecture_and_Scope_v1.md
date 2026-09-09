@@ -813,6 +813,141 @@ against sandboxed test data. This is the natural next-session starting
 point.
 
 
+## Daily Automation - First Live Workflow Test + Manual Force-Run Added (2026-09-06)
+
+**First-ever live run of the actual GitHub Actions workflow** (Dave,
+manually triggered via the Actions tab's "Run workflow" button). Result:
+Success, in 20 seconds. Correctly revealed that the manual trigger was
+being gated by the exact same Eastern-hour check as the automatic
+schedule -- since the manual click happened mid-afternoon, nowhere near
+6pm or 8pm Eastern, `check_run_window.py` correctly determined it wasn't
+a legitimate run window and set `should_run=false`, so every downstream
+step (data pull, orchestrator, commit-back, both emails) correctly
+skipped itself rather than running. This was the correct, intended
+behavior, but revealed the manual trigger wasn't useful for on-demand
+testing as originally wired.
+
+**FIX: added a manual force-run override.** `daily_scorecard_
+automation.yml`'s `workflow_dispatch` trigger now takes a `force_run`
+boolean input (default false), passed through to `check_run_window.py`
+as a `FORCE_RUN` environment variable. When `FORCE_RUN=true`,
+`check_run_window.py` bypasses the Eastern-hour check entirely and
+returns `should_run=true` immediately -- giving Dave an on-demand way to
+run the real pipeline any time via the Actions UI, for testing, while
+leaving the automatic scheduled triggers' behavior completely unchanged
+(they never set `FORCE_RUN`, so they still only fire within the real
+6pm/8pm Eastern windows). Verified directly: with `FORCE_RUN=true`, the
+script correctly bypasses the clock and returns `should_run=true`
+regardless of actual time (tested at 1:17pm Eastern); with `FORCE_RUN`
+unset, behavior is unchanged from before -- correctly returns
+`should_run=false` outside the real windows.
+
+**Also discussed and confirmed for Dave: the 20-minute tolerance window**
+on the 6pm/8pm checks (already built, see the "Market Calendar Built and
+Wired In" section above) exists specifically to absorb both GitHub
+Actions' own scheduling imprecision (scheduled triggers can fire a few
+minutes late during high load) and any minor clock misalignment -- a
+run would need to be delayed by more than 20 minutes to be incorrectly
+skipped.
+
+**NEXT STEP (unchanged): Dave to upload the updated `check_run_window.py`
+and `daily_scorecard_automation.yml` to GitHub, then either use the new
+`force_run` manual option to see a real full pipeline run end-to-end
+(data pull, orchestrator, commit-back, and an actual summary email
+landing in his inbox), or simply let it fire naturally at the next real
+6pm Eastern trigger tonight.**
+
+
+**SECOND LIVE TEST, using the new force_run checkbox -- FAILED, real bug
+found and fixed.** With `force_run` checked, the time-gate correctly
+passed and the real pipeline attempted to run for the first time. Failed
+at the "Pull fresh market data" step: `pull_data.py` uses
+`pd.read_html()` to scrape the S&P 400 / S&P 600 constituent lists from
+Wikipedia, which requires the `lxml` package as a parsing backend --
+`ImportError: Import lxml failed. Use pip or conda to install the lxml
+package.` The workflow's "Install dependencies" step only installed
+`pandas`, `numpy`, and `requests`, missing this one dependency.
+
+**Fix applied**: added `lxml` to the pip install line in
+`daily_scorecard_automation.yml`. Cross-checked `pull_data.py`'s full
+import list to confirm no other missing dependencies -- everything else
+it imports (`csv`, `datetime`, `json`, `random`, `time`,
+`concurrent.futures`, `io`, `pathlib`) is part of Python's standard
+library and needs no separate installation.
+
+**THIRD LIVE TEST -- FAILED again, a different real bug found and
+fixed.** With the `lxml` fix in place, "Pull fresh market data" and "Run
+orchestrator" both succeeded this time. Failed at the "Commit updated
+data and state files back to the repo" step: `fatal: pathspec 'state/'
+did not match any files`, exit code 128. Cause: today (Sunday, September
+6) is not an actual trading day, so the orchestrator correctly did
+nothing and the `state/` folder, while created, stayed completely empty
+-- git does not track empty directories, so `git add data/ state/` threw
+a hard error trying to add a folder with nothing in it, rather than
+treating "nothing to add" as a harmless no-op.
+
+**Fix applied**: `git add data/ state/` now has `|| true` appended so a
+failed add (e.g. an empty directory) doesn't halt the step, and the
+subsequent commit-and-push logic is wrapped in an explicit if/else on
+`git diff --cached --quiet` -- only actually commits and pushes inside
+the "else" branch, i.e. only when something was genuinely staged.
+Verified locally against both scenarios in a real git repo: an empty
+state folder (reproducing the exact failure) now completes cleanly with
+a "nothing to commit" message instead of erroring out; and, separately,
+real new file content in both folders correctly still triggers an actual
+commit.
+
+**NEXT STEP (updated again): Dave to upload the corrected
+`daily_scorecard_automation.yml` and re-run with `force_run` checked
+once more.** Given today isn't a real trading day, this next run is
+expected to succeed but produce an empty/no-op result from the
+orchestrator itself (no trades, no state changes) -- that's expected,
+not a bug. A cleaner full functional test (a real trading day, actual
+signals, an actual commit, and an actual summary email) will only be
+possible once the automation is tested on or after this data's actual
+next trading day, or Dave could temporarily test against a known
+historical trading day if he wants to see the full chain fire for
+real sooner.
+
+**FOURTH LIVE TEST -- SUCCESS (empty/no-op result, as expected).** With
+the commit-step fix in place, a force_run triggered on a non-trading day
+(Sunday, September 6) completed with every step green, including the
+summary email step. Confirmed this is the whole mechanical chain working
+correctly end to end: data pull, orchestrator, commit-back, and the
+conditional email send all fired in the right order with the right
+conditions. The summary email correctly did NOT get sent with real
+content -- `send_summary_email.py` found no `state/last_run_date.txt`
+yet (this being the very first real run ever, on a day that isn't an
+actual trading day) and correctly, deliberately bailed out with "nothing
+to summarize, skipping email" rather than sending something confusing or
+blank. This is correct defensive behavior, not a bug.
+
+**Attempted, NOT completed: a manual test-override to point the
+orchestrator at a specific real past trading day** (e.g. Friday,
+September 4) so the full pipeline could be exercised against genuine
+signal/sizing activity and produce a real summary email. Started adding
+a `TEST_OVERRIDE_DATE` environment variable to `orchestrator.py`'s
+`main()` (test-only, not used by the real scheduled triggers), but the
+edit did not get successfully saved to the output file before the
+session ended -- **this is not sitting ready in outputs and was never
+uploaded.** Treat as not-yet-attempted if picked up again.
+
+**DECISION: rather than force a synthetic historical test, Dave opted
+to simply let the automation run for real** at the next actual trading
+day. Monday, September 7, 2026 is Labor Day (market closed, confirmed
+in the NYSE calendar), so the first genuine live trading-day run will be
+Tuesday, September 8, 2026 at the real scheduled 6pm Eastern trigger --
+no manual action needed, it should just fire on its own. This will be
+the first true end-to-end proof: a real signal scan, possible new
+trade(s) or exits, a real state commit, and a real summary email
+landing in Dave's inbox.
+
+**NEXT SESSION: check whether Tuesday's real 6pm run succeeded** (GitHub
+Actions tab, or the summary email itself if it arrived) and review
+whatever it actually did -- this is the natural starting point next
+time.
+
+
 ## Daily Automation - First Test Run + Bug Fix (2026-09-05)
 
 **Ran `orchestrator.py` for the first time**, against the historical
@@ -1231,3 +1366,85 @@ re-validating Step B/C/D against the cleaner set, remains open (see Stage
 Dave provided a screenshot of the actual saved screen ("Momentum - Top
 Performers 6M"), confirming all 8 criteria exactly as documented. No
 longer an open item - kept here only as a record of resolution.
+
+
+**PHASE 2 ITEM (NEW, 2026-09-09): Universe scope expansion + TradingView-sourced screening -- planning discussion, no code yet**
+
+Revisited the current universe scope (S&P 400 + S&P 600 only, pulled via
+Wikipedia scrape in `pull_data.py`'s `get_sp400_sp600_tickers()`), which
+was a deliberate "get something running with real data" simplicity
+choice early on, NOT a permanent design commitment. Dave's live
+TradingView screen ("Momentum - Top Performers 6M") has no such index
+restriction, and Dave wants to close that gap.
+
+**Confirmed gap: three of the eight documented momentum-screen criteria
+are not enforced ANYWHERE in code today** -- market cap > $100M, TTM
+revenue growth YoY > 0%, and primary listing status. These were
+historically covered implicitly, by Dave's manual TradingView export
+already having filtered for them before tickers ever reached our
+pipeline. That implicit coverage disappears entirely once ticker
+selection is automated with no TradingView step in between, so this is a
+real, currently-unenforced gap, not just a nice-to-have expansion.
+
+**Yahoo Finance option investigated:** `yfinance`/Yahoo's ticker `.info`
+endpoint does expose market cap and revenue growth (same underlying,
+unofficial Yahoo endpoint already used for price history, so no new
+data source needed). Two caveats: (1) it's a per-ticker lookup, not
+bulk, so screening a much larger universe means a much larger number of
+individual calls than today's price pull, with real rate-limit risk if
+not throttled carefully; (2) revenue growth reflects Yahoo's most
+recently reported figure, which can lag actual current reality by a
+quarter or more depending on filing timing -- a general fundamentals
+data-lag reality, not something specific to Yahoo.
+
+**TradingView-sourced option investigated, and preferred lead:** the
+`tradingview-screener` Python package (unofficial, but talks directly to
+TradingView's own screener backend -- same numbers Dave already sees
+live in the tool, not a separately-sourced approximation) supports
+querying 3,000+ fields including exactly the criteria needed --
+`market_cap_basic`, revenue growth, 6-month performance, SMA100/SMA200,
+ADX, average volume -- in a SINGLE bulk call returning a full filtered
+table, not one-ticker-at-a-time. This could plausibly replace both the
+universe-scope problem AND parts of the existing technical re-derivation
+logic in `touch_scan_and_momentum_screen.py` (the SMA-stack and ADX
+checks currently reimplemented from raw price data could instead come
+directly from TradingView's own calculation). Caveats: unofficial/
+reverse-engineered interface (same risk category as the existing Yahoo
+scrape -- could break if TradingView changes something, and sits in a
+gray area re: their terms of service for automated pulls); package docs
+explicitly warn to be mindful of server load / potential bans on large
+pulls, so daily full-universe queries would need deliberate throttling,
+not naive unrestricted pulls. NOT YET INSTALLED OR TESTED -- this
+session's sandbox had no general package-install/internet access to
+verify live; a real test against actual TradingView data is the
+required first step of the dedicated follow-up session.
+
+**Proposed sequencing for that follow-up session (agreed with Dave):**
+(1) decide final universe scope (e.g. add S&P 500 back in for S&P 1500
+coverage, vs. going broader); (2) prototype `tradingview-screener`
+live -- confirm field availability/naming, confirm bulk-query mechanics,
+and confirm throttling needs before relying on it; (3) if it works,
+relocate the SMA-stack/ADX checks from reactive touch-time
+reimplementation into a proper upfront universe screen, and source
+market cap / revenue growth / primary listing from it directly,
+retiring the Wikipedia S&P 400/600 scrape; (4) if it does NOT pan out,
+fall back to the Yahoo `.info` per-ticker approach with explicit
+throttling built in from the start.
+
+**IMPORTANT ADDITIONAL REQUIREMENT surfaced by Dave, applies regardless
+of which data-source approach is chosen:** whatever the final screened
+candidate list is for a given day, the data-pull step must fetch price
+data for the UNION of (screen-passing tickers) and (all currently open
+positions) -- never gate data collection on the screen result alone. An
+open position can legitimately fall out of the screen (momentum fades,
+fundamentals change) or, under the current system, fall out of S&P 400/
+600 index membership, without the trade itself being closed. If data
+collection stops for a ticker the moment it drops off the
+screen/index, that open position's price history goes stale and
+`check_open_positions_for_exits()` can no longer correctly detect a
+stop-out or update the trail -- a silent, dangerous gap. This is
+actually a LATENT bug in the current system too (S&P 400/600 membership
+can change), not just a future risk introduced by the TradingView
+migration -- worth fixing as its own small, immediate correctness fix in
+`pull_data.py` / `get_sp400_sp600_tickers()`'s caller, independent of
+whether/when the broader universe-expansion work happens.
