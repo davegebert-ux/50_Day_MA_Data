@@ -53,9 +53,21 @@ from overhead_resistance_and_smoothness_checks import overhead_resistance_check
 DATA_DIR = "data"  # per-ticker {TICKER}_1d_data.csv files
 SPY_PATH = "data/SPY_1d_data.csv"
 
-OPEN_POSITIONS_PATH = "open_positions.csv"
-CLOSED_TRADES_PATH = "closed_trades.csv"
-LAST_RUN_PATH = "last_run_date.txt"
+# FIX (2026-09-06): state files now live in a dedicated state/ folder at
+# the REPO ROOT (not inside pipeline/ with the code), since they are data
+# the orchestrator reads/writes every run, not code -- same reasoning as
+# keeping open-positions and closed-trades as separate files. Resolved
+# relative to this script's own location (one level up from pipeline/,
+# then into state/), same fix applied earlier to MARKET_CALENDAR_PATH, so
+# this works correctly regardless of the working directory a GitHub
+# Action or Claude Code happens to invoke this script from.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_STATE_DIR = os.path.join(_REPO_ROOT, "state")
+os.makedirs(_STATE_DIR, exist_ok=True)
+
+OPEN_POSITIONS_PATH = os.path.join(_STATE_DIR, "open_positions.csv")
+CLOSED_TRADES_PATH = os.path.join(_STATE_DIR, "closed_trades.csv")
+LAST_RUN_PATH = os.path.join(_STATE_DIR, "last_run_date.txt")
 
 SKIP_SCORE_THRESHOLD = 2.5  # MVP decision -- see Conviction_Sizing_Model_v2.md
 
@@ -310,6 +322,21 @@ def process_single_day(target_date):
     check_capital_committed(open_df)
     set_last_run_date(target_date)
 
+    # TEMP DEBUG (2026-09-09): tracing down a mystery where the orchestrator
+    # step completes successfully and prints its normal output, but the very
+    # next workflow step (git commit) reports the state/ folder as having no
+    # files in it at all. Printing exactly where this process THINKS it's
+    # writing, and confirming immediately afterward whether those files are
+    # actually sitting on disk where expected. Remove once resolved.
+    print(f"  [DEBUG] _STATE_DIR resolves to: {_STATE_DIR}")
+    print(f"  [DEBUG] OPEN_POSITIONS_PATH: {OPEN_POSITIONS_PATH} -- exists: {os.path.exists(OPEN_POSITIONS_PATH)}")
+    print(f"  [DEBUG] LAST_RUN_PATH: {LAST_RUN_PATH} -- exists: {os.path.exists(LAST_RUN_PATH)}")
+    try:
+        print(f"  [DEBUG] Contents of _STATE_DIR: {os.listdir(_STATE_DIR)}")
+    except Exception as e:
+        print(f"  [DEBUG] Could not list _STATE_DIR: {e}")
+    print(f"  [DEBUG] Current working directory: {os.getcwd()}")
+
 
 # ============================================================
 # MAIN ENTRY POINT -- handles missed-day replay
@@ -373,8 +400,26 @@ def get_trading_days_to_process(today=None):
 
 
 def main():
-    for day in get_trading_days_to_process():
-        process_single_day(day)
+    """
+    Runs the daily pipeline. FIX (2026-09-05): now wrapped so that any
+    unhandled exception causes the process to exit with a non-zero exit
+    code, and success exits 0. This is required for the GitHub Actions
+    scheduling workflow to correctly detect success vs. failure -- a
+    silent Python exception with no exit-code signal would otherwise look
+    identical to success from the workflow's point of view, and the
+    6pm-fail / 8pm-retry logic depends on being able to tell the
+    difference.
+    """
+    import sys
+    try:
+        for day in get_trading_days_to_process():
+            process_single_day(day)
+    except Exception as e:
+        print(f"ORCHESTRATOR FAILED: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
