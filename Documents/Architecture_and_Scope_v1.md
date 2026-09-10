@@ -1520,3 +1520,140 @@ which could be a substantially simpler execution path than a raw
 TradeStation/other-broker API integration built from zero. Not
 evaluated or researched yet this session -- purely logged as a lead for
 the dedicated Phase 3 planning session.
+
+
+---
+
+## 2026-09-10 -- `tradingview-screener` Live Prototyping: CONFIRMED WORKING
+
+**Environment used:** Google Colab (colab.research.google.com), chosen
+over Claude Code as the local-testing environment because Dave has not
+installed Claude Code and is not comfortable with a terminal-based
+workflow. Colab requires no installation -- Dave opened a new notebook
+in-browser, pasted code cells, and ran them with Shift+Enter. This
+worked well and gave real internet/pip access, resolving the sandbox
+limitation from the prior two sessions.
+
+**Result: the full 8-criterion momentum screen has been confirmed
+achievable in a single live bulk query against real TradingView data.**
+This directly closes the gap flagged on 2026-09-09 (market cap, TTM
+revenue growth, and primary listing were previously unenforced in
+code).
+
+**Package confirmed:** `tradingview-screener` v3.2.1, installed via
+`pip install tradingview-screener` in Colab. Real API surface confirmed
+as `from tradingview_screener import Query, Column`, with `.select()`,
+`.where()`, `.limit()`, and `.get_scanner_data()` returning
+`(count, dataframe)`.
+
+**Field-name discovery process:** Two of the eight fields initially
+guessed incorrectly (came back as blank `None` columns on the first
+live test: 215 matches, but `primary_listing` and
+`revenue_yoy_growth_ttm` both empty). Rather than guessing again,
+Dave's live Colab session was used to fetch and regex-search
+TradingView's own published field-name reference page
+(`https://shner-elmo.github.io/TradingView-Screener/fields/stocks.html`)
+directly -- this is the correct way to resolve unknown/uncertain field
+names going forward, since guessing from the package's general naming
+convention is unreliable given 3000+ fields. This surfaced the correct
+names:
+- **`is_symbol_primary_listing`** (boolean) -- for the primary-listing
+  filter.
+- **`total_revenue_yoy_growth_ttm`** -- for trailing-twelve-month
+  year-over-year revenue growth, matching Dave's screen criterion
+  exactly.
+
+**Confirmed working query, mapping all 8 of Dave's live TradingView
+screen criteria in one bulk call:**
+
+```python
+from tradingview_screener import Query, Column
+
+query = (
+    Query()
+    .select(
+        'name', 'close', 'market_cap_basic', 'volume', 'average_volume_10d_calc',
+        'Perf.6M', 'SMA50', 'SMA100', 'SMA200', 'ADX',
+        'is_symbol_primary_listing', 'total_revenue_yoy_growth_ttm'
+    )
+    .where(
+        Column('market_cap_basic') > 100_000_000,
+        Column('Perf.6M').between(30, 500),
+        Column('SMA50') < Column('close'),
+        Column('SMA100') > Column('SMA200'),
+        Column('average_volume_10d_calc') > 1_000_000,
+        Column('is_symbol_primary_listing') == True,
+        Column('total_revenue_yoy_growth_ttm') > 0,
+    )
+    .limit(50)
+)
+
+count, df = query.get_scanner_data()
+```
+
+**Live test result (2026-09-10, during market hours):** 154 matches
+returned (vs. 215 with only the technical filters, and 49 in an
+earlier narrower test), all fields populated with real, distinct,
+correct-looking values -- `is_symbol_primary_listing` = True across the
+board, `total_revenue_yoy_growth_ttm` showing a real spread from ~1%
+up to 460%+, ADX/SMA-stack/volume/market-cap all matching the earlier
+confirmed-working technical fields. No blank/None columns remained.
+Sample tickers returned: MU, AMD, INTC, DELL, MUFG, SFTBY, SNDK, ANET,
+C, SAN, CRWD, MRVL, STX, QCOM, SMFG, MFG, SNOW, VLO, NET, BNY, MPC,
+EQNR, PSX, ING, ABNB, ELV, ASX, LITE, and others.
+
+**One caveat noted, not yet resolved:** `.limit(50)` was used during
+testing; the real pipeline will need to either raise the limit or
+paginate to make sure ALL qualifying tickers are captured on a given
+day, not just the first 50 by whatever default sort order the API
+uses. Needs explicit handling before this goes into production code.
+
+**Conclusion / recommended path forward per the 2026-09-09 sequencing
+plan:** Step 2 (prototype live) is now DONE and successful. Recommend
+proceeding to steps 3 and 4 in a dedicated follow-up session: relocate
+the SMA-stack/ADX checks out of
+`touch_scan_and_momentum_screen.py`'s reactive re-derivation-from-raw-
+price-data logic and into this upfront TradingView query instead (since
+TradingView's own calculated values are now confirmed retrievable
+directly), source market cap/revenue growth/primary listing from this
+same query rather than leaving them unenforced, and retire the
+Wikipedia S&P 400/600 scrape in favor of whatever universe-scope
+decision is made (still open: S&P 1500 vs. broader, per the
+2026-09-09 sequencing item #1, not yet decided). The open-positions-
+union requirement (data pull must cover screen-passing tickers UNION
+open positions, never gate on screen result alone) remains a must-have
+in whatever implementation replaces the current logic. Throttling
+behavior on repeated/larger daily pulls was not yet stress-tested this
+session (only a couple of manual one-off queries were run) -- worth
+deliberately testing before relying on this in the daily automated
+pipeline.
+
+
+---
+
+## 2026-09-10 (continued) -- Universe Scope: DECIDED
+
+**Decision (Dave, confirmed):** The ticker universe will no longer be
+defined by index membership (not S&P 400/600, not S&P 1500, not
+NASDAQ-only, etc.) at all. Instead, **the TradingView screen itself
+IS the universe** -- whatever set of tickers passes all 8 live screen
+criteria (market cap, TTM revenue growth, 6-month performance,
+primary listing, SMA50/SMA100/SMA200 stack, ADX, average volume) on a
+given day becomes that day's candidate list, full stop. This
+resolves/closes the "S&P 1500 vs. broader" open question from the
+2026-09-09 sequencing plan (step 1) -- no separate index-membership
+filter layer is needed at all once the TradingView-screener migration
+happens. This also better matches how Dave has always traded manually
+-- his live TradingView screen was never index-restricted either.
+
+**Still firmly required regardless of this decision:** the
+open-positions-union rule stands unchanged and is not superseded by
+this -- daily data collection must still be the UNION of
+(that day's screen-passing tickers) and (all currently open
+positions), never gated on the screen result alone. An open position
+can legitimately fall out of the screen on a later day (momentum
+fades, a filter threshold is no longer met) without the trade itself
+being closed; losing price data for it would silently break
+`check_open_positions_for_exits()`. This remains a standalone,
+independent fix that should happen even before/separately from the
+full TradingView migration -- see next section.
