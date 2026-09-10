@@ -57,7 +57,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pandas numpy requests lxml
+        run: pip install pandas numpy requests lxml tradingview-screener
 
       - name: Determine if this trigger should actually run (correct Eastern hour check)
         id: check_time
