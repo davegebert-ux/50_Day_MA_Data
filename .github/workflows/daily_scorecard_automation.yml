@@ -15,6 +15,16 @@ name: Daily Scorecard Automation
 # decides whether this specific trigger should actually do anything --
 # on any given day, two of the four triggers are no-ops.
 #
+# WEEKEND GUARD (FIX 2026-09-13): previously all four crons ran seven
+# days a week, so the pipeline fired on Saturday and Sunday and mailed
+# a stale Friday summary. Day-of-week fields are now set on every cron.
+# NOTE the offset: the 6pm Eastern primaries land on the SAME UTC day
+# (Mon-Fri = 1-5), but the 8pm Eastern retries cross midnight UTC into
+# the NEXT day, so they must run Tue-Sat (2-6) in order to cover
+# Friday evening's retry slot. This is cron-level defence only --
+# check_run_window.py should ALSO reject Saturday/Sunday on the real
+# Eastern clock, since that is the authoritative check.
+#
 # Intended run times: 6:00 PM Eastern (primary), 8:00 PM Eastern (retry
 # -- only actually does anything if the 6pm run failed or never ran,
 # per state/last_run_date.txt not yet reflecting today's date).
@@ -30,10 +40,10 @@ name: Daily Scorecard Automation
 
 on:
   schedule:
-    - cron: '0 22 * * *'   # 6:00 PM EDT = 10:00 PM UTC
-    - cron: '0 23 * * *'   # 6:00 PM EST = 11:00 PM UTC
-    - cron: '0 0 * * *'    # 8:00 PM EDT retry = 12:00 AM UTC (next day)
-    - cron: '0 1 * * *'    # 8:00 PM EST retry = 1:00 AM UTC (next day)
+    - cron: '0 22 * * 1-5'   # 6:00 PM EDT = 10:00 PM UTC, Mon-Fri
+    - cron: '0 23 * * 1-5'   # 6:00 PM EST = 11:00 PM UTC, Mon-Fri
+    - cron: '0 0 * * 2-6'    # 8:00 PM EDT retry = 12:00 AM UTC next day, Tue-Sat
+    - cron: '0 1 * * 2-6'    # 8:00 PM EST retry = 1:00 AM UTC next day, Tue-Sat
   workflow_dispatch:         # allows manually triggering a run from the GitHub UI, for testing
     inputs:
       force_run:
@@ -103,6 +113,16 @@ jobs:
           EMAIL_APP_PASSWORD: ${{ secrets.SCORECARD_EMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.SCORECARD_EMAIL_TO }}
 
+      # DUPLICATE-EMAIL NOTE (2026-09-13): on 2026-09-12 both the primary
+      # and the retry sent an identical summary. Root cause was NOT here
+      # -- it was that orchestrator.py only stamped
+      # state/last_run_date.txt when it actually processed a trading day,
+      # so on a quiet day the primary's success left no trace and the 8pm
+      # retry concluded the 6pm run had never happened. Both fixes now
+      # live in the Python: orchestrator.py stamps the date on every
+      # completed run, and check_run_window.py rejects non-trading days
+      # outright using the NYSE calendar. This step's condition is
+      # therefore unchanged -- should_run is now trustworthy.
       - name: Send daily summary email (only on success)
         if: steps.check_time.outputs.should_run == 'true' && success()
         run: python3 pipeline/send_summary_email.py
