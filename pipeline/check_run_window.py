@@ -30,6 +30,8 @@ import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+
 EASTERN = ZoneInfo("America/New_York")
 
 # how close (in minutes) the real Eastern clock needs to be to 6pm or 8pm
@@ -39,6 +41,47 @@ TOLERANCE_MINUTES = 20
 
 STATE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state")
 LAST_RUN_PATH = os.path.join(STATE_DIR, "last_run_date.txt")
+
+# FIX (2026-09-13): the same static NYSE calendar the orchestrator uses.
+# Single source of truth for "is today a trading day" -- see
+# is_trading_day() below.
+MARKET_CALENDAR_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "nyse_market_calendar_2026_2029.csv",
+)
+
+
+def is_trading_day(now_eastern):
+    """
+    FIX (2026-09-13): this script previously checked ONLY the Eastern
+    clock hour, with no notion of what day of the week it was -- so the
+    weekend crons sailed straight through, the orchestrator found no
+    trading days to process, and a summary email went out anyway
+    restating Friday's numbers. (Observed Sat 2026-09-12: two identical
+    "Friday" summaries.)
+
+    Rather than hardcoding Sat/Sun, this reuses the SAME static NYSE
+    calendar file the orchestrator already reads, so weekends AND market
+    holidays are excluded from one source of truth and the two cannot
+    drift apart.
+
+    Fails OPEN (returns True) if the calendar file is missing or
+    unreadable: a stray weekend email is a far cheaper failure than
+    silently skipping a real trading day.
+    """
+    try:
+        cal = pd.read_csv(MARKET_CALENDAR_PATH, parse_dates=["date"])
+        open_days = set(cal[cal["market_open"] == True]["date"].dt.date)
+    except Exception as e:
+        print(f"WARNING: could not read market calendar ({e}) -- "
+              f"assuming today IS a trading day and proceeding.")
+        return True
+
+    today = now_eastern.date()
+    if today not in open_days:
+        print(f"{today} is not an NYSE trading day per the market calendar.")
+        return False
+    return True
 
 
 def minutes_from(hour, now):
@@ -81,7 +124,14 @@ def main():
         should_run = False
         is_retry_slot = False
 
-        if is_six_pm_window:
+        # FIX (2026-09-13): weekend/holiday gate, checked BEFORE the hour
+        # windows so a Saturday or holiday trigger is a clean no-op.
+        trading_day = is_trading_day(now)
+
+        if not trading_day:
+            should_run = False
+            is_retry_slot = is_eight_pm_window
+        elif is_six_pm_window:
             should_run = True
             is_retry_slot = False
         elif is_eight_pm_window:

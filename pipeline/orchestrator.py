@@ -41,6 +41,8 @@ system.
 import os
 import glob
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo   # FIX (2026-09-13): needed to stamp the
+                                # last-run date on the real Eastern clock
 
 import pandas as pd
 import numpy as np
@@ -412,8 +414,33 @@ def main():
     """
     import sys
     try:
-        for day in get_trading_days_to_process():
+        days = get_trading_days_to_process()
+        for day in days:
             process_single_day(day)
+
+        # FIX (2026-09-13): stamp today's date even when there were NO
+        # trading days to process. Previously set_last_run_date() was
+        # only called inside process_single_day(), so on a quiet day
+        # (weekend, holiday, or a day already fully processed) the state
+        # file kept an older date -- which made check_run_window.py
+        # believe the 6pm run had never happened, so the 8pm retry ran
+        # and sent a SECOND identical summary email. Observed
+        # Sat 2026-09-12: two identical "Friday" summaries, with
+        # state/last_run_date.txt still reading 2026-09-11.
+        #
+        # Recording the date on every completed run makes "has today's
+        # run already succeeded?" answerable regardless of whether there
+        # was any market activity to report. Note this writes the real
+        # Eastern calendar date, matching how check_run_window.py
+        # compares it.
+        if not days:
+            today_eastern = pd.Timestamp(
+                datetime.now(ZoneInfo("America/New_York")).date()
+            )
+            print(f"No trading days to process -- recording "
+                  f"{today_eastern.date()} as last successful run "
+                  f"(no market activity).")
+            set_last_run_date(today_eastern)
     except Exception as e:
         print(f"ORCHESTRATOR FAILED: {e}", file=sys.stderr)
         import traceback
