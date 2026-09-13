@@ -53,21 +53,21 @@ in TradingView. If that export process/list isn't available anywhere,
 this is a real gap: there's currently no code, anywhere, enforcing those
 three conditions on an ongoing basis.
 
-FOUND BUG WHILE RECOVERING THIS SCRIPT: "price > 50-day MA" IS COMPUTED
-BUT NEVER ACTUALLY APPLIED
+BUG FOUND AND FIXED 2026-09-11: "price > 50-day MA" WAS COMPUTED BUT NEVER
+ACTUALLY APPLIED
 ----------------------------------------------------------------------------
-Look at the loop below: it computes `price_above_50ma = row['Close'] >
-row['SMA50']` but this variable is NEVER included in the final `if not
-(...)` filter condition that decides whether a day passes the screen. It's
-dead code -- calculated and then silently ignored. So even though "price >
-50-day MA" is one of the eight documented screen criteria, THIS SCRIPT, as
-actually run, does not enforce it. In practice this may not have mattered
-much for touch DETECTION specifically, since the touch definition itself
-(`row['Low'] <= row['SMA50'] <= row['High']`) already requires price to be
-straddling the 50-day MA that day, which is a related but not identical
-condition to closing above it. Still, this is worth deciding on
-deliberately rather than leaving as an accidental gap when this pipeline
-gets rebuilt/rerun end to end.
+Originally, this script computed `price_above_50ma = row['Close'] >
+row['SMA50']` but never included it in the final `if not (...)` filter
+condition that decides whether a day passes the screen -- it was dead
+code, calculated and then silently ignored. So even though "price > 50-day
+MA" is one of the eight documented screen criteria, this script, as
+originally written, did not enforce it. Fixed 2026-09-11 as part of the
+wide-universe historical backtesting rebuild, at Dave's explicit request,
+since letting it through risked counting touches/trades that would not
+have actually qualified in real trading, which would have distorted the
+backtest statistics. This fix means historical touch counts from this
+version will differ (likely be somewhat lower) than any prior run of this
+script.
 
 TOUCH DEFINITION
 -----------------
@@ -236,10 +236,12 @@ def run_full_historical_scan():
             # Condition: 6-month perf between 30% and 500%
             perf_ok = 30 <= row['Perf6mo'] <= 500
 
-            # NOTE: price_above_50ma is deliberately left OUT of this
-            # condition in the recovered code, exactly as it was actually
-            # run. Flagging rather than silently fixing it -- see file header.
-            if not (sma50_rising and stack_ok and adx_ok and vol_ok and perf_ok):
+            # FIXED 2026-09-11: price_above_50ma is now included in the
+            # filter below. Previously computed but silently ignored -- see
+            # "FOUND BUG" note in the file header for the original context.
+            # This fix changes historical touch counts vs. any prior run of
+            # this script -- expect fewer touches than before.
+            if not (sma50_rising and price_above_50ma and stack_ok and adx_ok and vol_ok and perf_ok):
                 continue
 
             # Touch definition: low of day <= SMA50 <= high of day (price

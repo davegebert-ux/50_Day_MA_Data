@@ -5,8 +5,10 @@ WHAT THIS FILE DOES
 --------------------
 Given one ticker's daily price data and a single entry (a date + entry price +
 initial risk-per-share), this simulates how a trade plays out day by day under
-one of five different trailing-stop "rules" (10-day MA, 20-day MA, a hybrid of
-the two, an ADR-adaptive version, or a ratcheting swing-low stop), and returns
+one of six different trailing-stop "rules" (10-day MA, 20-day MA, a hybrid of
+the two, an ADR-adaptive version, a ratcheting swing-low stop, or a 1.0x
+ATR(14) "Chandelier"-style stop -- see the 2026-09-11 changelog note below),
+and returns
 the exit date, exit reason, and the realized result in R-multiples (R = the
 initial dollar risk per share).
 
@@ -95,15 +97,27 @@ import numpy as np
 def load_ticker(path):
     """
     Load one ticker's daily OHLCV CSV and compute the moving averages and
-    volatility measure the trail rules need.
+    volatility measures the trail rules need.
 
-    Adds four columns to the raw price data:
+    Adds columns to the raw price data:
       - MA10, MA20, MA50 : simple moving averages of the Close price
       - ADR10            : 10-day average daily range, as a percentage
                             ( (High/Low - 1) * 100, averaged over 10 days ).
                             This is the volatility measure used both to size
                             the initial stop and to drive the adr_adaptive
                             trail rule.
+      - ATR14            : Wilder's 14-day Average True Range (dollar
+                            terms, not a percentage) -- ADDED 2026-09-11
+                            to support the 'atr_1.0x' trail rule (see
+                            get_trail_line() and the
+                            2026-09-11 Cap Percent x Trail Rule
+                            Cross-Sweep finding in
+                            Architecture_and_Scope_v1.md). Distinct from
+                            ADR10: ATR14 uses TRUE range (accounting for
+                            gaps via the prior close) over 14 days,
+                            Wilder-smoothed, and is used in dollar terms
+                            as a trailing-stop distance, not as a percent
+                            volatility measure.
     """
     df = pd.read_csv(path)
     df['Date'] = pd.to_datetime(df['Date'])
@@ -113,6 +127,14 @@ def load_ticker(path):
     df['MA20'] = df['Close'].rolling(20).mean()
     df['MA50'] = df['Close'].rolling(50).mean()
     df['ADR10'] = ((df['High'] / df['Low'] - 1) * 100).rolling(10).mean()
+
+    high, low, close = df['High'], df['Low'], df['Close']
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df['ATR14'] = tr.ewm(alpha=1/14, adjust=False).mean()
+
     return df
 
 
@@ -122,10 +144,14 @@ def get_trail_line(df, i, rule, entry_idx, adr_threshold, swing_state):
     This is just "what is the line today" -- it does NOT check whether
     price has broken it; simulate_trail() does that comparison itself.
 
-    rule           : which of the five trail rules to use (see file header)
+    rule           : which trail rule to use (see file header) --
+                      '10ma', '20ma', 'hybrid_tight', 'adr_adaptive',
+                      'swing_low', or 'atr_1.0x' (added 2026-09-11, see
+                      below)
     entry_idx      : the row index of the entry date (needed by
                       adr_adaptive, which locks in its ADR reading at entry
-                      and never re-checks it)
+                      and never re-checks it; also needed by atr_1.0x to
+                      find the highest close since entry)
     adr_threshold  : the ADR% cutoff used only by 'adr_adaptive' to decide
                       10ma vs 20ma for the whole trade
     swing_state     : a small dict (see update_swing_low below) tracking the
@@ -150,6 +176,24 @@ def get_trail_line(df, i, rule, entry_idx, adr_threshold, swing_state):
         return row['MA10'] if adr < adr_threshold else row['MA20']
     elif rule == 'swing_low':
         return swing_state.get('confirmed_low', np.nan)
+    elif rule == 'atr_1.0x':
+        # ADDED 2026-09-11: NEW RECOMMENDED DEFAULT, replacing 20ma, per
+        # the Cap Percent x Trail Rule Cross-Sweep finding (see
+        # Architecture_and_Scope_v1.md). Stop = highest CLOSE since entry,
+        # minus 1.0 x ATR14 (Wilder's 14-day Average True Range, a
+        # "Chandelier Exit"-style construction). On the wide-universe
+        # 2,310-event sample, this beat every one of the 5 original rules
+        # once known outlier trades were excluded (mean +0.528R, 41.5%
+        # win rate), and was preferred over a 1.5x ATR variant (marginally
+        # higher average return but a meaningfully lower 35.7% win rate)
+        # for its steadier, more frequent win rate -- Dave's explicit
+        # preference given his stated preference for disciplined,
+        # easy-to-run rules-based frameworks.
+        highest_close_since_entry = df.loc[entry_idx:i, 'Close'].max()
+        atr_today = row['ATR14']
+        if pd.isna(atr_today):
+            return np.nan
+        return highest_close_since_entry - (1.0 * atr_today)
 
 
 def update_swing_low(df, i, swing_state):
@@ -181,7 +225,7 @@ def update_swing_low(df, i, swing_state):
                 swing_state['confirmed_low'] = candidate_low
 
 
-def simulate_trail(df, entry_idx, entry_price, risk_per_share, rule='20ma', take_partial=False,
+def simulate_trail(df, entry_idx, entry_price, risk_per_share, rule='atr_1.0x', take_partial=False,
                           adr_threshold=10.0, grace_R=1.5):
     """
     Walk a single trade forward day by day from entry and determine how and
@@ -312,13 +356,26 @@ def simulate_trail(df, entry_idx, entry_price, risk_per_share, rule='20ma', take
 # ============================================================
 # RECOMMENDED CONFIGURATION (enforced in code, not just comments)
 # ============================================================
-# Resweep completed 2026-09-03 across 253 events (see
-# Cap_Percent_and_Trail_Rule_Resweep_Findings_v1.md for full detail):
-#   - cap_pct    = 0.07 (7 percent) -- beat both 0.03 and the old 0.05
-#                  default across the full dataset.
-#   - rule       = '20ma' -- best performer at every cap level tested.
-#   - take_partial = False -- no-partial beat with-partial on nearly
-#                  every rule/cap combination tested.
+# UPDATED 2026-09-11 (supersedes the 2026-09-03 trail-rule choice; see
+# Architecture_and_Scope_v1.md, "Cap Percent x Trail Rule Cross-Sweep"
+# entry, for the full writeup):
+#   - cap_pct    = 0.07 (7 percent) -- UNCHANGED. Re-confirmed on the much
+#                  larger 2,310-event wide-universe sample: 7 percent was
+#                  the best cap level for nearly every trail rule tested,
+#                  both with and without known outlier trades included.
+#   - rule       = 'atr_1.0x' -- CHANGED from '20ma'. On the wide-universe
+#                  sample, 20ma turned out to be the WEAKEST of the
+#                  original 5 rules (a reversal from the 2026-09-03
+#                  finding on the smaller 253-event sample, where it won
+#                  outright). The new atr_1.0x rule (highest close since
+#                  entry, minus 1.0x Wilder ATR14) beat every original
+#                  rule once known outlier trades were excluded, and was
+#                  chosen over a marginally-higher-return 1.5x ATR variant
+#                  for its meaningfully better, steadier win rate (41.5
+#                  percent vs 35.7 percent) -- Dave's explicit preference.
+#   - take_partial = False -- UNCHANGED from 2026-09-03. NOT yet
+#                  re-tested against the new atr_1.0x rule specifically
+#                  (still an open item).
 # These are now the DEFAULTS in simulate_trail() above (rule and
 # take_partial), and RECOMMENDED_CAP_PCT / compute_risk_per_share() below
 # enforce the cap_pct recommendation in actual code, not just a comment,
