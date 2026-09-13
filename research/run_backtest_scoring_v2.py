@@ -1,18 +1,40 @@
 """
 Batch-scores every touch event in Historical_Touches_WideUniverse_v1.csv
-using scorecard.py's score_trade(), then feeds each scored trade through
-sim.py's simulate_trail() to get real simulated trade outcomes.
+using scorecard.py's score_total_v2() -- the VALIDATED 2-attribute MVP
+score -- then feeds each scored trade through sim.py's simulate_trail()
+to get real simulated trade outcomes.
+
+FIX (2026-09-13) -- WRONG SCORER. Both this script and its v1 predecessor
+called scorecard.score_trade(), which sums NINE attributes on a 0-45
+scale. That is NOT the validated score. The MVP score adopted on
+2026-09-03 is score_total_v2(): the average of MA Respect v5 and
+Relative Strength v2 only, on a 0-5 scale. score_trade() still includes
+Trend Efficiency (demoted 2026-09-03 for near-zero outcome correlation),
+six further attributes never individually validated, and -- in this
+wide-universe run specifically -- a CONSTANT 5/5 earnings-proximity
+score, because earnings data is unavailable and score_earnings_proximity()
+assumes ample runway when passed None.
+
+Consequence: every score-tier cut previously drawn from this output
+(including the unexplained top-quartile inversion in the ADR-band
+analysis) rests on a retired scorer and must be re-run against
+total_score_v2 before any conviction-sizing work is built on it. The
+sizing skip threshold of 2.5 is on the 0-5 scale, so it is only
+meaningful against total_score_v2.
+
+score_trade() is still called alongside, purely so the nine individual
+attribute scores stay available for attribute-level research. Its sum is
+written as legacy_total_score_9attr and must NOT be used for tiering.
 
 This is the connector between the new wide-universe touch dataset and the
 existing scoring/simulation engine -- the actual prerequisite for
 revisiting Phase 2 tuning items (trail rules, conviction sizing, 7% cap,
 etc.) with a much larger sample than the original 456 events.
 
-Earnings data is NOT available for this wide-universe backtest run --
-score_trade()/score_earnings_proximity() already handles this gracefully
-(assumes ample runway, scores 5/5, flags it) when passed None for both
-prior_earnings and next_earnings, so this is passed through as a known,
-accepted limitation rather than a blocker.
+Earnings data is NOT available for this wide-universe backtest run. That
+is harmless for total_score_v2 (which does not use earnings at all) but
+is precisely why the legacy 9-attribute total is unusable for tiering:
+one of its nine components is pinned at 5/5 for every single event.
 
 Note: scorecard.py and sim.py each have their OWN OHLCV loader
 (load_ohlcv vs load_ticker) with slightly different column conventions
@@ -27,10 +49,12 @@ Inputs (expected in the working directory):
     SPY_1d_data.csv                           -- SPY OHLCV for relative strength
 
 Output:
-    Historical_Backtest_Scored_Trades_v1.csv  -- one row per touch event,
-    with full scorecard breakdown + simulated trade outcome (using the
-    recommended rule='20ma', take_partial=False, cap_pct=7%, per
-    Cap_Percent_and_Trail_Rule_Resweep_Findings_v1.md)
+    Historical_Backtest_Scored_Trades_v3_scorev2.csv -- one row per touch
+    event, with total_score_v2 (0-5, THE tiering column), its two
+    component attribute scores, the legacy 9-attribute total for
+    reference only, and the simulated trade outcome (rule='atr_1.0x',
+    take_partial=False, cap_pct=7%, per
+    Cap_Percent_and_Trail_Rule_Resweep_Findings_v1.md).
 """
 
 import os
@@ -46,9 +70,13 @@ import sim
 TOUCHES_FILE = "Historical_Touches_WideUniverse_v1.csv"
 DATA_DIR = "historical_data"
 SPY_FILE = "SPY_1d_data.csv"
-OUTPUT_FILE = "Historical_Backtest_Scored_Trades_v2_with_attributes.csv"
+OUTPUT_FILE = "Historical_Backtest_Scored_Trades_v3_scorev2.csv"
 
-RECOMMENDED_RULE = "20ma"
+# FIX (2026-09-13): was "20ma". The locked production trail rule is
+# atr_1.0x (adopted after the resweep: +0.528R, 41.5% win rate, outliers
+# excluded) and is already the default in sim.simulate_trail(). Pinning
+# "20ma" here silently backtested a retired rule.
+RECOMMENDED_RULE = "atr_1.0x"
 RECOMMENDED_TAKE_PARTIAL = False
 RECOMMENDED_CAP_PCT = sim.RECOMMENDED_CAP_PCT
 
@@ -80,7 +108,16 @@ def main():
             continue
 
         try:
-            # --- Scoring stage: scorecard.py uses its own loader internally ---
+            # --- Scoring stage ---
+            # FIX (2026-09-13): total_score_v2 is now THE score. It needs
+            # the dataframe itself, so load via scorecard's own loader
+            # (score_trade() did that internally; score_total_v2() does
+            # not).
+            score_df = sc.load_ohlcv(ohlcv_path)
+            scored_v2 = sc.score_total_v2(score_df, entry_date, spy_df)
+
+            # Legacy 9-attribute scorer, retained ONLY to keep the
+            # individual attribute breakdowns available for research.
             earnings_row = {"prior_earnings": None, "next_earnings": None}
             scored = sc.score_trade(ticker, entry_date, ohlcv_path, spy_df, earnings_row)
 
@@ -111,7 +148,15 @@ def main():
             row = {
                 "ticker": ticker,
                 "entry_date": entry_date.date(),
-                "total_score": scored["total_score"],
+                # THE tiering column (0-5). May be None when either
+                # component attribute could not be computed.
+                "total_score_v2": scored_v2.get("total_score_v2"),
+                "ma_respect_score": scored_v2.get("ma_respect_score"),
+                "relative_strength_score": scored_v2.get("relative_strength_score"),
+                "score_v2_note": scored_v2.get("note"),
+                # Reference only -- do NOT tier on this. See module
+                # docstring.
+                "legacy_total_score_9attr": scored["total_score"],
                 "n_missing_attributes": scored["n_missing_attributes"],
                 "entry_price": entry_price,
                 "risk_per_share": risk_per_share,
@@ -142,6 +187,14 @@ def main():
     results_df.to_csv(OUTPUT_FILE, index=False)
 
     print(f"\nScored and simulated {len(results_df)} trades.")
+    if len(results_df):
+        n_null = results_df["total_score_v2"].isna().sum()
+        print(f"total_score_v2 unavailable for {n_null} of them "
+              f"(excluded from any score-tier analysis).")
+        valid = results_df["total_score_v2"].dropna()
+        if len(valid):
+            print(f"total_score_v2 range: {valid.min():.2f} to "
+                  f"{valid.max():.2f}, mean {valid.mean():.2f} (0-5 scale).")
     print(f"Skipped {len(skipped)} touch events.")
     if skipped:
         from collections import Counter
