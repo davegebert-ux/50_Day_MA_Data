@@ -1520,3 +1520,706 @@ which could be a substantially simpler execution path than a raw
 TradeStation/other-broker API integration built from zero. Not
 evaluated or researched yet this session -- purely logged as a lead for
 the dedicated Phase 3 planning session.
+
+
+---
+
+## 2026-09-10 -- `tradingview-screener` Live Prototyping: CONFIRMED WORKING
+
+**Environment used:** Google Colab (colab.research.google.com), chosen
+over Claude Code as the local-testing environment because Dave has not
+installed Claude Code and is not comfortable with a terminal-based
+workflow. Colab requires no installation -- Dave opened a new notebook
+in-browser, pasted code cells, and ran them with Shift+Enter. This
+worked well and gave real internet/pip access, resolving the sandbox
+limitation from the prior two sessions.
+
+**Result: the full 8-criterion momentum screen has been confirmed
+achievable in a single live bulk query against real TradingView data.**
+This directly closes the gap flagged on 2026-09-09 (market cap, TTM
+revenue growth, and primary listing were previously unenforced in
+code).
+
+**Package confirmed:** `tradingview-screener` v3.2.1, installed via
+`pip install tradingview-screener` in Colab. Real API surface confirmed
+as `from tradingview_screener import Query, Column`, with `.select()`,
+`.where()`, `.limit()`, and `.get_scanner_data()` returning
+`(count, dataframe)`.
+
+**Field-name discovery process:** Two of the eight fields initially
+guessed incorrectly (came back as blank `None` columns on the first
+live test: 215 matches, but `primary_listing` and
+`revenue_yoy_growth_ttm` both empty). Rather than guessing again,
+Dave's live Colab session was used to fetch and regex-search
+TradingView's own published field-name reference page
+(`https://shner-elmo.github.io/TradingView-Screener/fields/stocks.html`)
+directly -- this is the correct way to resolve unknown/uncertain field
+names going forward, since guessing from the package's general naming
+convention is unreliable given 3000+ fields. This surfaced the correct
+names:
+- **`is_symbol_primary_listing`** (boolean) -- for the primary-listing
+  filter.
+- **`total_revenue_yoy_growth_ttm`** -- for trailing-twelve-month
+  year-over-year revenue growth, matching Dave's screen criterion
+  exactly.
+
+**Confirmed working query, mapping all 8 of Dave's live TradingView
+screen criteria in one bulk call:**
+
+```python
+from tradingview_screener import Query, Column
+
+query = (
+    Query()
+    .select(
+        'name', 'close', 'market_cap_basic', 'volume', 'average_volume_10d_calc',
+        'Perf.6M', 'SMA50', 'SMA100', 'SMA200', 'ADX',
+        'is_symbol_primary_listing', 'total_revenue_yoy_growth_ttm'
+    )
+    .where(
+        Column('market_cap_basic') > 100_000_000,
+        Column('Perf.6M').between(30, 500),
+        Column('SMA50') < Column('close'),
+        Column('SMA100') > Column('SMA200'),
+        Column('average_volume_10d_calc') > 1_000_000,
+        Column('is_symbol_primary_listing') == True,
+        Column('total_revenue_yoy_growth_ttm') > 0,
+    )
+    .limit(50)
+)
+
+count, df = query.get_scanner_data()
+```
+
+**Live test result (2026-09-10, during market hours):** 154 matches
+returned (vs. 215 with only the technical filters, and 49 in an
+earlier narrower test), all fields populated with real, distinct,
+correct-looking values -- `is_symbol_primary_listing` = True across the
+board, `total_revenue_yoy_growth_ttm` showing a real spread from ~1%
+up to 460%+, ADX/SMA-stack/volume/market-cap all matching the earlier
+confirmed-working technical fields. No blank/None columns remained.
+Sample tickers returned: MU, AMD, INTC, DELL, MUFG, SFTBY, SNDK, ANET,
+C, SAN, CRWD, MRVL, STX, QCOM, SMFG, MFG, SNOW, VLO, NET, BNY, MPC,
+EQNR, PSX, ING, ABNB, ELV, ASX, LITE, and others.
+
+**One caveat noted, not yet resolved:** `.limit(50)` was used during
+testing; the real pipeline will need to either raise the limit or
+paginate to make sure ALL qualifying tickers are captured on a given
+day, not just the first 50 by whatever default sort order the API
+uses. Needs explicit handling before this goes into production code.
+
+**Conclusion / recommended path forward per the 2026-09-09 sequencing
+plan:** Step 2 (prototype live) is now DONE and successful. Recommend
+proceeding to steps 3 and 4 in a dedicated follow-up session: relocate
+the SMA-stack/ADX checks out of
+`touch_scan_and_momentum_screen.py`'s reactive re-derivation-from-raw-
+price-data logic and into this upfront TradingView query instead (since
+TradingView's own calculated values are now confirmed retrievable
+directly), source market cap/revenue growth/primary listing from this
+same query rather than leaving them unenforced, and retire the
+Wikipedia S&P 400/600 scrape in favor of whatever universe-scope
+decision is made (still open: S&P 1500 vs. broader, per the
+2026-09-09 sequencing item #1, not yet decided). The open-positions-
+union requirement (data pull must cover screen-passing tickers UNION
+open positions, never gate on screen result alone) remains a must-have
+in whatever implementation replaces the current logic. Throttling
+behavior on repeated/larger daily pulls was not yet stress-tested this
+session (only a couple of manual one-off queries were run) -- worth
+deliberately testing before relying on this in the daily automated
+pipeline.
+
+
+---
+
+## 2026-09-10 (continued) -- Universe Scope: DECIDED
+
+**Decision (Dave, confirmed):** The ticker universe will no longer be
+defined by index membership (not S&P 400/600, not S&P 1500, not
+NASDAQ-only, etc.) at all. Instead, **the TradingView screen itself
+IS the universe** -- whatever set of tickers passes all 8 live screen
+criteria (market cap, TTM revenue growth, 6-month performance,
+primary listing, SMA50/SMA100/SMA200 stack, ADX, average volume) on a
+given day becomes that day's candidate list, full stop. This
+resolves/closes the "S&P 1500 vs. broader" open question from the
+2026-09-09 sequencing plan (step 1) -- no separate index-membership
+filter layer is needed at all once the TradingView-screener migration
+happens. This also better matches how Dave has always traded manually
+-- his live TradingView screen was never index-restricted either.
+
+**Still firmly required regardless of this decision:** the
+open-positions-union rule stands unchanged and is not superseded by
+this -- daily data collection must still be the UNION of
+(that day's screen-passing tickers) and (all currently open
+positions), never gated on the screen result alone. An open position
+can legitimately fall out of the screen on a later day (momentum
+fades, a filter threshold is no longer met) without the trade itself
+being closed; losing price data for it would silently break
+`check_open_positions_for_exits()`. This remains a standalone,
+independent fix that should happen even before/separately from the
+full TradingView migration -- see next section.
+
+
+
+---
+
+## 2026-09-11 -- Wide-Universe Historical Backtesting Sample: BUILT, plus OPEN ITEM found and fixed
+
+**Context:** Dave flagged a real structural problem with forward-testing
+the new TradingView-screener-as-universe pipeline live: at an observed
+rate of roughly 49 tickers/day passing the screen but only a handful
+actually producing scorecard-eligible touches, getting a usable sample
+size for Phase 2 tuning (trail rules, conviction sizing, 7% cap, etc.)
+via pure forward-testing would take 6+ months. Falling back to S&P
+400/600 for backtesting purposes was rejected, since index membership
+itself silently encodes assumptions (min market cap, profitability,
+etc.) that the wider TradingView screen deliberately does not require --
+using it would reintroduce the very bias being removed.
+
+**Decision:** Build a one-time (or occasionally-rerun) historical
+research sample instead, covering 5 of the 8 live screen criteria that
+can be computed accurately from historical daily OHLCV alone (SMA50 <
+Close, SMA100 > SMA200, ADX(50) 20-40, avg 10-day volume > 1,000,000,
+6-month performance 30-500%), plus a STATIC approximation for market cap
+(today's market cap > $100M used as a rough proxy across all historical
+dates, per Dave: "something that has a $5M market cap is really not
+applicable to us at all... it doesn't have to be exactly right, it's
+just kind of the idea that we don't want to be taking trades on things
+that are super small and illiquid"). Primary-listing and TTM revenue
+growth YoY are NOT included historically (too unreliable/unavailable
+going back years across a wide universe). Tickers with incomplete
+3-year price history (recent IPOs, etc.) are excluded entirely from the
+sample, per Dave's explicit decision, to keep the sample clean rather
+than mixing partial-history tickers in.
+
+**This work is intentionally isolated from the live TradingView-screener
+branch** -- it's a standalone research script, not part of the
+production daily pipeline, and lives on its own separate branch
+(`historical-universe-backtest` or similar), branched off the main
+working branch, not off `tradingview-screener-integration`. No GitHub
+Actions involvement -- run on demand in Colab.
+
+**Pipeline built and run this session (all in /mnt/user-data/outputs/):**
+1. `build_wide_universe.py` -- live TradingView query, broad universe
+   (market cap > $100M, avg 10-day volume > 1M, primary listing only,
+   NO trend/momentum filters). Run live in Colab: **1,593 tickers**
+   matched (roughly 30x wider than the S&P 400/600-constrained
+   approach). Saved as `wide_universe_snapshot.csv`.
+2. `pull_historical_universe_prices.py` -- bulk yfinance download, 3
+   years of daily OHLCV for all 1,593 tickers, chunked (60 tickers/
+   batch) to avoid rate limiting. Run live in Colab: **1,591 of 1,593
+   tickers succeeded** (2 failures: `PCG/PX` and `ORCL/PD`, both
+   preferred-stock tickers with slash-formatted symbols yfinance
+   doesn't recognize -- acceptable, not worth chasing). Saved as
+   `historical_prices_3yr.csv`, ~1.13M rows.
+3. `build_historical_sample.py` -- computes rolling SMA50/100/200,
+   Wilder ADX(50), 10-day avg volume, and 6-month performance from the
+   price history, drops the 138 tickers with <700 rows of history
+   (incomplete 3-year window), then checks the 5 historical criteria +
+   static market cap filter at monthly snapshot dates (first trading
+   day of each month). Result: **1,453 tickers retained**, checked
+   across **37 monthly snapshots** (2023-09 through 2026-09), producing
+   **2,024 ticker-month candidate hits**. Monthly candidate counts
+   range from 8 (May 2025, quiet month) to 135 (October 2025, strong
+   month), averaging roughly 75-80/month -- confirms Dave's instinct
+   that the S&P 400/600 constraint was severely starving the system
+   (was producing something like ~4 candidates/month by comparison).
+   Saved as `historical_candidates_sample.csv`.
+
+**OPEN ITEM FOUND AND FIXED this session:** while reconnecting this new
+candidate sample to the existing touch-detection/scoring pipeline,
+re-discovered and this time actually FIXED a previously-flagged-but-left
+bug in `touch_scan_and_momentum_screen.py`: the script computed
+`price_above_50ma = row['Close'] > row['SMA50']` but never included it
+in the actual filter condition deciding which days pass the screen --
+dead code, silently ignored. Since "price > 50-day MA" is one of the 8
+documented screen criteria, this meant the touch-detection script could
+have been counting touches/trades on days that would not have actually
+qualified in real trading, which would distort backtest statistics
+(win rate, average gain/loss, etc.) -- exactly the numbers this whole
+historical-sample effort exists to produce reliably. Dave confirmed
+this needed to be fixed rather than left for consistency with prior
+runs: "if it's having us take trades that wouldn't have happened in
+reality, then we probably need to get that corrected." Fixed 2026-09-11
+by adding `price_above_50ma` into the filter condition. This means
+historical touch counts from any future run of this script will differ
+(likely be somewhat lower) than prior runs, including the original
+456-event dataset this project was originally tuned against --
+**this is a live open item**: existing scorecard/sim tuning that was
+validated against the old (buggy) touch dataset may need to be
+re-validated once the full pipeline is rerun against the corrected
+touch logic. Flagging this explicitly rather than letting it pass
+quietly, since it could affect the credibility of prior tuning results.
+
+**Next steps (not yet done):**
+- Regenerate per-ticker OHLCV files from `historical_prices_3yr.csv`
+  (currently one combined file; touch-scan script expects one CSV per
+  ticker) so the FIXED `touch_scan_and_momentum_screen.py` can be rerun
+  against the full wide-universe 3-year dataset.
+- Rerun the (now-fixed) touch scan against the new wide-universe price
+  data to regenerate a much larger touch-event dataset than the
+  original 456 events.
+- Feed the resulting touch events through `scorecard.py` and `sim.py`
+  to get real simulated trade outcomes at scale -- this is the actual
+  prerequisite for revisiting the tabled Phase 2 items (Trend
+  Efficiency redesign, trail rule segmentation, smoothness metric,
+  conviction sizing, 7% cap confirmation, VSAT/HL/ICHR outlier subset).
+- Decide whether/how to re-validate prior tuning conclusions that were
+  based on the old (buggy) 456-event dataset, now that the underlying
+  touch logic has changed.
+
+
+---
+
+## 2026-09-11 (continued) -- Wide-Universe Backtest Pipeline: CONNECTOR BUILT, FIRST FULL RUN, and ADR/VOLATILITY FINDING
+
+**Context:** Continuing directly from the wide-universe historical
+candidate/touch-event work above. This session built the actual
+connector wiring `Historical_Touches_WideUniverse_v1.csv` (2,310 touch
+events, 567 tickers, produced by the FIXED touch-scan script) into the
+existing `scorecard.py` scoring engine and `sim.py` trade simulator, ran
+it end to end for the first time at this scale, and used the result to
+investigate a live open question: does entry-time volatility (ADR10 percent)
+predict trade outcome, and if so, how does it relate to the existing
+attribute scores?
+
+**Data format fix required:** `sim.py`'s `load_ticker()` expects
+comma-formatted whole-integer volume strings (its parser does
+`str -> int`). The wide-universe per-ticker CSVs (produced by
+`split_historical_prices.py` from `historical_prices_3yr.csv`, sourced
+via yfinance) had decimal-formatted volume (e.g. "20957900.0"), which
+crashed that parser. Fixed in `split_historical_prices.py` by rounding
+and casting volume to integer at split time, rather than touching
+`sim.py` itself -- keeps the core simulator file untouched. All 1,591
+per-ticker files regenerated with this fix.
+
+**Connector script:** `run_backtest_scoring.py` (and a variant,
+`run_backtest_scoring_v2.py`, which additionally captures each
+individual attribute's 0-5 score, not just the total, for the
+attribute-level analysis below). For each touch event: loads the
+ticker's OHLCV via `scorecard.load_ohlcv()` and scores it with
+`scorecard.score_trade()` (earnings data unavailable for this
+wide-universe run -- passed as `None`/`None`, which `score_earnings_proximity()`
+already handles gracefully, assuming ample runway and scoring 5/5,
+flagged as a known limitation, not a blocker); separately loads via
+`sim.load_ticker()` (which adds the MA50/ADR10 columns `sim.py` needs)
+and simulates the trade with `sim.simulate_trail()` using the
+recommended settings (`rule='20ma'`, `take_partial=False`,
+`cap_pct=0.07`, i.e. the CURRENT 7 percent cap, confirmed still in use
+this session, not the older 5 percent default).
+
+**First full run result: all 2,310 trades scored and simulated
+successfully, 0 skipped.** Headline numbers across the full sample:
+mean realized outcome +0.58R per trade, median -1.0R, win rate ~40.7
+percent (consistent with a trend-following system where losers are
+capped at -1R but winners run well past +1R). Exit reason breakdown:
+1,065 exited via the 20-day MA trail, 1,062 hit the initial stop on a
+later day, 152 hit the initial stop on the ENTRY DAY itself (~6.6
+percent of all trades), 27 still open at end of data, 4 an edge-case
+"stop" exit reason.
+
+**Entry-day stop investigation:** Spot-checked several of the 152
+entry-day-stop trades directly against raw OHLC bars -- confirmed these
+are genuine, mechanically correct outcomes, not a bug: the day's low
+price actually traded through the calculated initial stop (entry price
+minus risk-per-share) intraday, meaning a resting limit order at the
+50-day MA would have filled and then been stopped out in the very same
+session on a sufficiently volsilatile/wide-range day. This is an
+inherent, real risk of MA-pullback limit entries on volatile names, not
+a data or simulator defect -- and is a case the entry-day-stop-check fix
+from 2026-09-03 (see `sim.py` changelog) is correctly catching, which an
+older buggy version would have silently missed.
+
+**ADR/volatility-vs-outcome finding (the main result of this session):**
+Dave's framing question -- do the high-volatility names that get stopped
+out more often actually make up for it when they win, or should they be
+screened out -- was tested directly by bucketing all 2,310 trades by
+ADR10 percent at entry:
+  - Low ADR (0-3 percent): 357 trades, 39.2 percent win rate, +0.42R mean
+  - Moderate ADR (3-5 percent): 680 trades, 41.8 percent win rate, +0.47R mean
+  - **Elevated ADR (5-7 percent): 547 trades, 42.8 percent win rate,
+    +0.86R mean -- clearly the best-performing bucket**
+  - High ADR (7 percent+): 726 trades, 39.0 percent win rate, +0.56R
+    mean -- still net positive, and with the highest entry-day-stop rate
+    (~9.8 percent, vs ~5-6 percent for the calmer buckets), but not the
+    standout performer
+
+**Conclusion (Dave, confirmed):** Neither of the two hypothesized
+answers is quite right on its own. High-ADR names should NOT be
+screened out (they remain net profitable), but they are also not simply
+"the cost of doing business" bought back by equal upside -- the real
+edge concentrates specifically in the 5-7 percent ADR band, which
+outperforms both calmer and more extreme volatility names. **Decision:
+do not narrow the screen** (Dave: "I don't want to cut off the screen...
+I don't think we should be in the business of cutting out profitable
+setups") -- instead this becomes an input to CONVICTION-BASED POSITION
+SIZING (larger size for higher-conviction setups), not a pass/fail
+filter. This directly extends the existing (currently shelved/MVP-flat)
+conviction sizing work in `Conviction_Sizing_Model_v2.md`, adding ADR
+band as a second, independent sizing signal alongside the existing
+2-attribute score.
+
+**Score-tier x ADR-band interaction (important nuance, not a clean
+stacking effect):** Cutting the sample by both total scorecard score
+(quartiles) AND the 5-7 percent ADR band at once showed the two signals
+do NOT simply combine additively. In the bottom two score quartiles,
+being in the 5-7 percent ADR band produces a large, consistent
+improvement (e.g. Q2: +1.31R in-band vs +0.33R outside-band -- the best
+cell in the whole table). But in the TOP score quartile, the pattern
+inverts -- trades outside the 5-7 percent band actually outperform
+those inside it (+0.61R vs +0.43R). Working theory discussed with Dave:
+his scorecard's "smoothness"-flavored attributes (Trend Efficiency, MA
+Respect, ATR Variability) might be structurally penalizing volatile
+names, meaning a high-ADR name that STILL scores well overall is a
+rarer, different kind of setup (strong on other attributes despite the
+smoothness penalty) than a merely-decent-scoring volatile name.
+
+**Attribute-level test of that theory (this ran, and partially
+confirmed / partially refined it):** Compared every individual
+attribute's mean score in-band vs outside-band -- found NO meaningful
+difference for most attributes, including, notably, MA Respect itself
+(3.01 vs 3.02) and most other attributes. The broad "smoothness
+attributes generally penalize volatility" theory does NOT hold up as
+originally framed. However, a correlation pass (ADR10 percent vs each
+attribute score, full sample) found two clear exceptions:
+  - **Relative Strength: -0.48 correlation with ADR** (the strongest
+    relationship found)
+  - **Trend Efficiency: -0.44 correlation with ADR**
+  - All other attributes: weak correlations, mostly under 0.19 in
+    magnitude, several near zero (MA Respect: -0.06, Trend Character:
+    -0.01, ADX Trend Strength: +0.01)
+
+**Refined finding, splitting each of those two attributes by
+high/low (median split) and ADR band:**
+  - Relative Strength: ADR band helps regardless of whether Relative
+    Strength is high or low (+0.35 to +0.38R improvement in-band either
+    way) -- behaves like a genuinely independent, additive signal.
+  - Trend Efficiency: behaves very differently. Trades with a LOW Trend
+    Efficiency score that are ALSO in the 5-7 percent ADR band actually
+    performed BEST of all four cells tested (+0.95R), outperforming even
+    the high-Trend-Efficiency/in-band cell (+0.82R). This suggests ADR
+    band membership may be capturing much of the same real signal Trend
+    Efficiency is trying to measure, and may be compensating for (or
+    partly duplicating) it, rather than the two being independent.
+
+**Working conclusion, not yet finalized:** Relative Strength and ADR
+band look like two separate, stacking edges -- worth combining them
+directly in a future conviction-sizing scheme. Trend Efficiency and ADR
+band look like overlapping signals -- this is a new, concrete data
+point for the already-open "Trend Efficiency metric redesign" Phase 2
+item, and should be considered directly alongside that redesign rather
+than as a separate question.
+
+**Files produced this session (all in /mnt/user-data/outputs/):**
+- `split_historical_prices.py` -- splits the combined 3-year price file
+  into 1,591 per-ticker CSVs matching `sim.py`'s expected format
+  (fixed for integer volume, see above).
+- `run_wide_universe_touch_scan.py` -- one-off runner that points the
+  FIXED `touch_scan_and_momentum_screen.py` at the new wide-universe
+  per-ticker data without modifying that file's own hardcoded defaults.
+- `Historical_Touches_WideUniverse_v1.csv` -- 2,310 touch events, 567
+  tickers, 2024-06-27 through 2026-09-10 (output of the fixed touch scan
+  against the wide universe).
+- `run_backtest_scoring.py` / `run_backtest_scoring_v2.py` -- the
+  scorecard/sim connector scripts described above.
+- `Historical_Backtest_Scored_Trades_v1.csv` -- 2,310 scored + simulated
+  trades, total score only.
+- `Historical_Backtest_Scored_Trades_v2_with_attributes.csv` -- same
+  2,310 trades, with each of the 9 individual attribute scores broken
+  out as separate columns (used for the ADR/attribute analysis above).
+
+**Next steps (not yet done):**
+- Design and test an actual conviction-sizing scheme that incorporates
+  ADR band as a second signal alongside the existing scorecard total (or
+  Relative Strength specifically, given it stacks cleanly) -- current
+  conviction sizing model (`Conviction_Sizing_Model_v2.md`) predates this
+  finding entirely and only considers the 2-attribute score.
+- Revisit the Trend Efficiency redesign (already an open Phase 2 item)
+  with this session's finding in hand -- specifically, check whether
+  Trend Efficiency's formula is implicitly penalizing exactly the kind
+  of volatility that the 5-7 percent ADR band captures as a positive.
+- The score-tier x ADR-band interaction (clean additive help in low/mid
+  score tiers, inversion in the top tier) is not yet explained and
+  should be dug into further before finalizing any sizing scheme.
+- Still outstanding from the prior entry: re-validate old tuning
+  conclusions (cap percent, trail rule choice) that were based on the
+  original 456-event dataset now that a much larger, bug-fixed sample
+  exists -- this session's runs already used the current recommended
+  settings (7 percent cap, 20-day MA trail, no partial) but did not
+  yet re-test whether those specific choices still win on this larger
+  sample versus the alternatives originally tested against 253/456
+  events.
+
+
+---
+
+## 2026-09-11 (continued further) -- Trail Rule Resweep on Wide-Universe Sample: 3 New Rules Tested, ATR-Multiple Outlier Check
+
+**Context:** Dave questioned whether the 20-day MA trail (the standing
+recommendation from the 2026-09-03 resweep, chosen because it beat all
+4 alternatives on the 253-event sample at every cap level tested) is
+really still correct now that a much larger, wider-universe sample
+exists. Two specific instincts prompted this: (1) faster-moving stocks
+might need a tighter trail than slower ones, or vice versa, and (2) a
+trade might benefit from starting with a tight trail early on, then
+loosening once it has proven itself. Separately, Dave also asked about
+testing an ATR-multiple trailing stop (a technique referenced by SMB
+Capital-style trading educators), initially proposing a tight 1x to
+1.25x multiplier.
+
+**Step 1 -- re-ran the 5 EXISTING trail rules on the full 2,310-event
+wide-universe sample** (`rerun_all_trail_rules.py`), all at the current
+recommended cap_pct=7 percent, take_partial=False, for a clean baseline
+before testing anything new:
+
+  - 10ma:           mean +0.611R, 41.9% win rate
+  - 20ma (current recommendation): mean +0.584R, 40.7% win rate
+  - hybrid_tight:   mean +0.603R, 42.9% win rate
+  - adr_adaptive:   mean +0.601R, 41.6% win rate
+  - swing_low:      mean +0.635R, 30.7% win rate (highest average, but
+    much lower win rate -- fewer, bigger wins)
+
+**Notable: 20-day MA, the clear historical winner on the 253-event
+sample, is now the WEAKEST of the 5 original rules on this 5x-larger,
+much wider (more small/mid-cap) sample.** This on its own justified
+Dave's instinct to question it.
+
+**Step 2 -- tested whether the 10ma vs 20ma gap is explained by market
+cap / "speed."** Dave's own hypothesis, offered explicitly as "just an
+idea, we don't need to prove it": since the wide universe now includes
+many more small/mid-caps than the old S&P 400/600-constrained approach,
+and smaller caps tend to move faster, maybe that's why 20ma no longer
+wins outright. Bucketed all 2,310 trades by market cap (via
+`wide_universe_snapshot.csv`) and compared all 5 rules within each
+bucket:
+
+  - Small cap (under $2B, n=634, mean ADR10 ~8.2%): all 5 rules
+    clustered tightly (+0.46R to +0.52R) -- no rule dominates.
+  - Mid cap ($2B-$10B, n=825, mean ADR10 ~6.0%): swing_low notably
+    best (+1.06R); other 4 rules clustered +0.77R to +0.86R.
+  - Large cap ($10B+, n=851, mean ADR10 ~4.6%, the calmest group):
+    **20ma is clearly the WORST rule here (+0.37R)**, while 10ma and
+    adr_adaptive are the best (+0.54R each).
+
+**Refined conclusion (confirmed with Dave):** the mechanism is real but
+inverted from Dave's first guess. It is not that fast/volatile small
+caps need a tighter trail -- those names don't show a strong rule
+preference at all. It's that CALM, low-volatility, large-cap names are
+specifically hurt by the slower 20-day MA, because on a low-volatility
+stock the 20-day average barely moves day to day, so the trail lags far
+behind price and gives back more profit before finally triggering. This
+is a genuinely actionable, mechanistically-explained finding, not
+speculation.
+
+**Step 3 -- built and tested 3 new trail rules Dave proposed**, in a
+new standalone module `experimental_trail_rules.py` (does not modify
+`sim.py`; mirrors its exact entry-day-stop-check and grace-period-arming
+control flow via a new `simulate_trail_extended()` so results are
+directly comparable):
+
+  1. **speed_adaptive** -- per the refined finding above, LOWER ADR10 at
+     entry (calmer stock) -> tighter trail (10ma); HIGHER ADR10 ->
+     looser trail (20ma). Threshold checked once at entry only (5%
+     threshold used), matching how the existing `adr_adaptive` rule
+     already works.
+  2. **graduated_tighten** -- Dave's "start tight, loosen once proven"
+     idea: uses 10ma as the trail until the trade has closed at/above
+     1.5R gain (the same grace_R threshold `sim.py` already uses to arm
+     the trail at all), then switches to 20ma after that point.
+  3. **atr_multiple** (4 variants: 1.0x, 1.5x, 2.0x, 3.0x) -- stop line =
+     highest CLOSE since entry, minus (multiplier x ATR14, Wilder's
+     14-day Average True Range -- the standard "Chandelier Exit" style
+     construction). Web research pulled in before building this: Dave's
+     originally-proposed 1x-1.25x multiplier is notably TIGHTER than
+     common published practice, which typically uses 2x-3.5x for swing
+     trading (3x is the most commonly cited default) -- flagged to Dave
+     as a reference point, not a reason to avoid testing his own number.
+
+**First-pass full-sample result (before outlier check) -- ALL 11 rules
+(5 existing + 6 new/variants), full 2,310-event sample, sorted best to
+worst:**
+
+  - atr_3.0x:          +0.754R, 26.5% win rate (NEW) -- best average
+  - atr_1.5x:           +0.649R, 36.3% win rate (NEW)
+  - swing_low:          +0.635R, 30.7% win rate
+  - atr_2.0x:           +0.631R, 32.0% win rate (NEW)
+  - atr_1.0x:           +0.625R, 42.0% win rate (NEW)
+  - speed_adaptive:     +0.611R, 41.2% win rate (NEW)
+  - 10ma:               +0.611R, 41.9% win rate
+  - hybrid_tight:       +0.603R, 42.9% win rate
+  - adr_adaptive:       +0.601R, 41.6% win rate
+  - 20ma:               +0.584R, 40.7% win rate
+  - graduated_tighten:  +0.584R, 40.7% win rate (NEW) -- statistically
+    identical to plain 20ma; as built, does not appear to add value
+    over the simpler rule
+
+**Outlier check on the apparent atr_3.0x winner (Dave specifically
+requested this, drawing on the same lesson from the earlier
+cap-percent-resweep outlier caveat):** confirmed atr_3.0x's headline
+result is substantially outlier-driven. The top 10 of 2,310 trades
+contribute 17.5 percent of its total R; the top 20 contribute 31.9
+percent, concentrated in just 5 tickers (COGT, VNET, NB, SSRM, RCAT --
+VNET alone appears 8 times in the top 15, from the touch-scan
+re-triggering repeatedly during one sustained run). **Re-computing all
+rules with these 5 tickers excluded entirely (2,259 remaining trades)
+collapses atr_3.0x to a middling +0.488R, 25.7% win rate -- no longer
+distinguishable from 10ma/20ma/hybrid_tight/swing_low, which all cluster
++0.48R to +0.50R on this cleaned subset.**
+
+**On the same cleaned (outlier-excluded) subset, the TIGHTER ATR
+multiples actually come out AHEAD, and hold up as broad, not
+outlier-driven, results:**
+  - atr_1.5x: +0.535R (best on the cleaned subset)
+  - atr_1.0x: +0.528R
+  - atr_2.0x: +0.506R
+  - swing_low: +0.501R
+  - 10ma: +0.497R
+  - hybrid_tight: +0.488R
+  - atr_3.0x: +0.488R (fell from 1st to tied-last once outliers removed)
+  - 20ma: +0.479R
+
+**Conclusion (this session, not yet final):** the honest finding
+inverts the naive first read of the data. The wide, "textbook standard"
+3x ATR multiplier is fragile and driven by a handful of huge individual
+runners, not a broad edge. The tighter 1x-1.5x ATR multiples Dave
+originally proposed -- closer to what he recalled from SMB-style
+trading discussions -- hold up BETTER as a broad, reliable improvement
+over the current 20ma default once outliers are excluded. This is a
+genuinely promising, evidence-backed candidate to replace the 20ma
+default, though it has not yet been cross-checked against varying the
+cap_pct simultaneously (all of this session's trail-rule testing used
+the fixed 7 percent cap; the two were not re-swept together).
+
+**Files produced this session (all in /mnt/user-data/outputs/):**
+- `rerun_all_trail_rules.py` -- baseline resweep of the 5 existing rules
+  on the full wide-universe sample.
+- `Trail_Rule_Resweep_WideUniverse_v1.csv` -- output of the above.
+- `experimental_trail_rules.py` -- standalone module implementing the 3
+  new rules (does not modify `sim.py`).
+- `test_new_trail_rules.py` -- runner testing all 11 rules together.
+- `Trail_Rule_Extended_Test_v1.csv` -- output of the above; used for the
+  outlier check.
+
+**Next steps (not yet done):**
+- Re-sweep cap_pct (3/5/7 percent, or a finer grid) together with the
+  best-performing trail rules found here (1.0x-1.5x ATR, 10ma,
+  hybrid_tight), since the 2026-09-03 cap_pct conclusion was reached
+  using 20ma as the trail and may not generalize now that 20ma itself
+  no longer looks optimal.
+- Decide whether `graduated_tighten` deserves a second attempt with a
+  different design (e.g. a different loosening trigger than the 1.5R
+  grace threshold) before concluding it adds no value, since the first
+  version tested was a fairly direct, simple implementation of Dave's
+  idea.
+- If 1.0x-1.5x ATR is adopted as a new candidate default, decide whether
+  to formally add it into `sim.py` itself (as a 6th named rule) rather
+  than keeping it in the standalone experimental module.
+- This trail-rule work and the earlier-this-session ADR-band conviction
+  sizing finding both touch position/trade management -- worth
+  eventually reconciling into one coherent Phase 2 tuning pass rather
+  than two separate threads.
+
+
+---
+
+## 2026-09-11 (continued further) -- Cap Percent x Trail Rule Cross-Sweep: NEW RECOMMENDATION CONFIRMED
+
+**Context:** Directly addressing Dave's repeated concern that the
+2026-09-03 cap_pct recommendation (7 percent) might not be trustworthy,
+since it was originally validated using ONLY the 20-day MA trail rule --
+and this session already showed 20ma is no longer the best-performing
+trail rule on the larger wide-universe sample. Ran a full cross-sweep:
+3 cap percentages (3 percent, 5 percent, 7 percent) x 6 trail rules
+(10ma, 20ma, hybrid_tight, swing_low, atr_1.0x, atr_1.5x -- the original
+plus the strongest candidates from the outlier-cleaned trail-rule test
+earlier this session) = 18 combinations, each run across all 2,310
+wide-universe events. Script: `cap_trail_cross_sweep.py`. Output:
+`CapPct_TrailRule_CrossSweep_v1.csv`. Results reported both on the full
+sample and with the 5 known outlier tickers (COGT, VNET, NB, SSRM, RCAT
+-- see the atr_3.0x outlier finding earlier this session) excluded, for
+an honest, non-outlier-driven read.
+
+**Result -- clean and consistent across both views:**
+
+Outlier-excluded (the trustworthy view), top of the table:
+  - cap=7%, atr_1.5x: +0.535R, 35.7% win rate -- best average return
+  - cap=7%, atr_1.0x: +0.528R, 41.5% win rate -- best win rate among
+    the top performers
+  - cap=3%, atr_1.5x: +0.525R, 25.5% win rate
+  - cap=7%, swing_low: +0.501R, 30.1% win rate
+  - cap=7%, 10ma: +0.497R, 41.3% win rate
+  - ... 20ma (the OLD default) trails the pack at every cap level tested
+    on this view: best case (5 percent cap) only +0.485R.
+
+Full sample (outliers included) shows the same top combination winning
+again (cap=7%, atr_1.5x: +0.677R at 3% cap was marginally higher here,
+but 7%+atr_1.5x is a close second and the more broadly consistent
+performer across both views) -- importantly, 7 percent cap is the best
+cap level for nearly every rule on BOTH tables, so unlike the trail-rule
+question, **the cap_pct piece of the 2026-09-03 recommendation holds up
+and is NOT overturned by this larger sample.**
+
+**FINAL DECISION (Dave, confirmed):** Keep the 7 percent cap (unchanged
+from 2026-09-03). Replace the trail rule: retire the 20-day MA default
+in favor of an ATR-based trailing stop, specifically **1.0x ATR(14)**
+(stop = highest close since entry, minus 1.0 x 14-day Wilder ATR).
+Chosen over the marginally-higher-average 1.5x ATR variant specifically
+for its notably better win rate (41.5 percent vs 35.7 percent) --
+Dave's own reasoning: a steadier, more frequently-winning rule is
+preferable given his stated preference for disciplined, rules-based
+frameworks that are simple to run day to day, and the average-return gap
+between 1.0x and 1.5x was judged too small to be worth the extra
+variance.
+
+**NEW RECOMMENDED CONFIGURATION (supersedes the 2026-09-03 recommendation):**
+  - cap_pct = 7 percent (UNCHANGED)
+  - trail rule = 1.0x ATR(14), highest-close-since-entry basis (CHANGED
+    from 20-day MA)
+  - take_partial = False (UNCHANGED, not re-tested this session but no
+    reason found to revisit it)
+
+**Not yet done:**
+- The 1.0x ATR rule currently only exists in the standalone
+  `experimental_trail_rules.py` module, not in `sim.py` itself. Formally
+  promoting it into `sim.py` as a 6th named rule (with its own ATR14
+  column added to `load_ticker()`) is the next mechanical step before
+  this can be used as the actual production default anywhere.
+- take_partial was not re-swept against the new ATR-based rule -- the
+  2026-09-03 finding that no-partial beats with-partial was established
+  under 20ma and has not been re-confirmed under atr_1.0x specifically.
+- This new trail rule recommendation should be reconciled with the
+  earlier-this-session ADR-band conviction-sizing finding and the
+  Trend-Efficiency-vs-ADR overlap finding -- all three are now open,
+  related Phase 2 threads from this same session's backtesting work.
+
+
+---
+
+## 2026-09-12 -- New Open Item: Trade Duration / Holding-Period Analysis (not yet run)
+
+**Context:** Raised by Dave as a next testing priority, separate from the
+R-multiple and win-rate work done so far. All of this session's and prior
+sessions' backtest analysis (trail-rule sweeps, cap-percent sweeps,
+ADR-band conviction sizing, score-tier cross-cuts) has focused on
+per-trade R-multiple outcomes and win rates, but has NOT yet looked at
+how long trades typically stay open -- i.e. capital efficiency /
+holding-period duration.
+
+**Proposed next analysis (not yet built):**
+- Compute holding period (calendar days and/or trading days) from entry
+  to exit for every trade in the wide-universe scored/simulated dataset
+  (Historical_Backtest_Scored_Trades_v1.csv or v2, 2,310 trades).
+- Report average and median holding time overall, and worth breaking
+  down by exit_reason (does an atr_1.0x_trail exit take longer to
+  trigger than an initial_stop exit, for instance?), and potentially by
+  the same ADR-band and score-tier cuts already used elsewhere in this
+  research, to see whether faster- or slower-resolving trades cluster
+  with any of the same variables already investigated.
+- Natural output: mean/median days held, and possibly a distribution
+  (e.g. histogram or simple bucket counts) -- useful both for its own
+  sake (capital efficiency, how many concurrent positions realistically
+  needed) and as a possible new input to conviction sizing alongside the
+  ADR-band finding already on file.
+
+**Status:** Not yet started. Logged here as an explicit open item ahead
+of the GitHub branch/upload work this session, to be picked up in an
+upcoming session.
