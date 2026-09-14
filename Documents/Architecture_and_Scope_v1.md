@@ -2602,3 +2602,221 @@ the holding-period analysis is done.
    in question, since the ADR band effect was an outlier artifact.
 5. Refactor the duplicated momentum screen so `orchestrator.py` imports
    `touch_scan_and_momentum_screen.py` rather than re-implementing it.
+
+---
+
+## 2026-09-14 (later) -- Session: The Staged Backtest Harness, Overhead Resistance v3, and a Stop-Ordering Bug
+
+### THE METHODOLOGY CHANGE (Dave's call -- this is the important part)
+
+Every backtest before today tested ONE criterion against an open,
+unfiltered sample of touch events. Dave's objection, stated directly:
+
+> "We can't just take a complete open sample, put one criteria on it,
+> and then say whether it's good or bad. It needs to use the whole
+> pipeline. Otherwise we're really just not even testing our system.
+> We're just kind of randomly checking a few things here and there that
+> are uncorrelated."
+
+He is right, and two findings from earlier the same day were already
+casualties of the old approach:
+
+- "Unscorable trades outperform scorable ones" -- TRUE on raw touches
+  (0.540R vs 0.416R), FALSE once overhead resistance ran first.
+- "The 5-7% ADR band carries +0.86R" -- an outlier artifact, withdrawn.
+
+**RULE ADOPTED: build the sample ONCE at the top of the funnel, then
+apply the gates IN PRODUCTION ORDER, measuring after each one.** Every
+figure is then conditional on everything upstream. Single-criterion
+tests against open samples are no longer evidence for anything.
+
+### NEW FILE: research/staged_pipeline_backtest.py
+
+The harness that enforces the above. Stages, mirroring
+`orchestrator.py`'s live path:
+
+  0. Universe (current snapshot -- see survivorship note)
+  1. Momentum screen, 8 criteria, point-in-time
+  2. Touch detection (Low <= SMA50 <= High)
+  3. Overhead resistance
+  4. ADR ceiling
+  5. Score gate
+  6. Simulate
+
+It reports after every stage AND reports what each gate REJECTED, with
+the counterfactual outcome of those rejected trades -- which is how the
+overhead-resistance problem below was caught. A `dropped_at` column
+records the first gate that rejected each event.
+
+Lives on `historical_backtest_research`. It imports `scorecard`, `sim`
+and `overhead_resistance_and_smoothness_checks` -- take all three from
+`main`.
+
+**Two known limits are documented in the file header, deliberately, so
+the numbers are never read naively:**
+
+1. **Survivorship bias.** The 1,591-ticker universe is a CURRENT
+   snapshot. The 8 criteria ARE evaluated point-in-time, so this is not
+   lookahead on the rules -- it is a hole in the ticker list. Names
+   delisted, acquired, or dropped below the liquidity floor never enter
+   the sample even if they would have passed historically. Estimated
+   impact modest (order of -0.1R or less) because the stop caps
+   per-trade downside, but it flatters results and is not zero.
+   `historical_candidates_sample.csv` (664 tickers, 27 monthly
+   point-in-time snapshots) exists if a cross-check is ever wanted.
+2. **Overnight gap risk is not modelled.** `sim.py` assumes a stop fills
+   AT the stop price; real gaps fill at the open. Dave took a -5R gap
+   loss in live trading in Sept 2026. Every expectancy figure here is
+   therefore slightly optimistic.
+
+### [BUG FIXED] sim.py checked the trail line before the hard stop
+
+`simulate_trail()` evaluated the trail line first and the hard stop in
+an `elif`. On any day where price broke the stop intraday AND closed
+below the trail, the simulation recorded an exit AT THE CLOSE and
+ignored the stop entirely -- a resting stop order would have filled
+first in reality.
+
+Symptom: all 40 trades in the sample worse than -1R were labelled
+`atr_1.0x_trail`, none `initial_stop`. Worst case RZLT 2025-12-04 showed
+**-13.37R** where a filled stop gives roughly -1R.
+
+Scale: 40 of 2,310 trades (1.73%), averaging -2.90R when it happened,
+total excess loss 75.8R, dragging average R per trade by -0.033R. Real
+but not material to any conclusion drawn.
+
+FIXED: stop check now runs BEFORE the trail check. Pushed to `main`.
+Note this is production code, not just backtest code.
+
+### [REPLACED] Overhead resistance v2 -> v3 (proximity-based)
+
+**v2 was tested against outcomes for the first time today and found to
+be removing value.** Inside the full staged pipeline, outliers excluded:
+
+| | n | avg R | win % |
+|---|---|---|---|
+| rejected by v2 | 1,055 | +0.483 | 40.7 |
+| kept by v2 | 1,255 | +0.410 | 42.0 |
+
+It threw away better trades than it kept, and discarded 46% of the
+sample to do it. Headroom-to-old-high showed no monotonic relationship
+with outcome at any distance band (-30% through +15%), so v2 was not
+mistuned -- as written it measured something that does not predict
+outcome in this data.
+
+**Root cause: the code was broader than the intent.** Dave's rationale,
+stated today, was always narrow -- remove setups that run straight into
+prominent resistance immediately after entry. v2 excluded on ANY
+unresolved high in a 2-year window, however far above. A high 30%
+overhead and 18 months old will not reject next week's trade, but v2
+failed the stock anyway.
+
+**Dave's refinement, which is what made v3 work:** measure the distance
+in R, not percent -- "it's kind of a question of do you get to the 1.5R
+or 2R, something that makes the trade profitable." What matters is
+whether the old high sits between the entry and the point where the
+trade becomes profitable. Expressing it in R also makes it comparable
+across volatility regimes.
+
+Sweep inside the full pipeline (ADR ceiling + score gate on):
+
+| Rule | n | avg R | win % | kept |
+|---|---|---|---|---|
+| no overhead gate at all | 1,111 | 0.545 | 44.5 | 100% |
+| **exclude within 0.5R** | **1,011** | **0.576** | **45.6** | **91%** |
+| exclude within 1.0R | 928 | 0.517 | 45.4 | 83.5% |
+| exclude within 1.5R | 893 | 0.506 | 45.5 | 80.4% |
+| exclude within 2.0R | 861 | 0.492 | 45.1 | 77.5% |
+| exclude within 3.0R | 842 | 0.486 | 45.1 | 75.8% |
+| v2 (any high, 2yr) | 753 | 0.518 | 44.6 | 67.8% |
+
+**[ADOPTED] 0.5R.** Beats both v2 and no-gate-at-all on expectancy AND
+win rate, while keeping 91% of trades. Degrades monotonically as the
+window widens, consistent with the mechanism: resistance only hurts
+before the trade has built any cushion.
+
+Implemented as `OVERHEAD_PROXIMITY_R = 0.5` in `orchestrator.py` and
+`proximity_R=0.5` in `overhead_resistance_check()`.
+
+**IMPORTANT -- ordering dependency.** v3 needs `entry_price` and
+`risk_per_share`, which in `orchestrator.py` were computed AFTER the
+overhead check. The call has been REORDERED so they are computed first.
+If they are not passed, v3 silently falls back to v2 behaviour -- i.e.
+back to the rule just shown to remove value. Kept deliberately for
+backward compatibility with older research scripts; production must
+always pass both.
+
+### Full pipeline, before and after (outliers excluded)
+
+| Stage | n | avg R | win % |
+|---|---|---|---|
+| 0-2. raw touch events | 2,310 | 0.443 | 41.4 |
+| 3. + overhead resistance v3 | 2,121 | 0.456 | 41.7 |
+| 4. + ADR ceiling 10% | 1,878 | 0.510 | 43.6 |
+| 5a. + scorable | 1,279 | 0.459 | 43.4 |
+| 5b. + score >= 2.5 | 1,023 | **0.588** | **45.7** |
+
+End-to-end expectancy improved from 0.533R / 44.7% (v2 pipeline) to
+**0.588R / 45.7%** (v3 pipeline), on a 34% larger surviving sample.
+
+### Gate-by-gate verdict: does each one earn its keep?
+
+What each gate REJECTED, outliers excluded:
+
+| Gate | rejected n | avg R of rejected | win % | verdict |
+|---|---|---|---|---|
+| 3. overhead resistance v3 | 189 | +0.312 | 38.5 | EARNS ITS KEEP (vs 0.456 kept) |
+| 4. ADR ceiling 10% | 243 | +0.056 | 27.1 | EARNS ITS KEEP |
+| 5. score < 2.5 | 256 | -0.096 | 34.0 | EARNS ITS KEEP |
+| 5. unscorable | 599 | **+0.637** | 44.0 | **DOES NOT -- see below** |
+
+### [OPEN, NEXT UP] The unscorable rule is discarding the best group
+
+599 events (26% of the sample) are rejected because
+`score_total_v2` returns None, which happens when MA Respect's
+`_find_trend_start()` cannot find a qualifying anchor -- it requires a
+reclaim of the MA50 at least 40 days back that has held >=95% of days
+since. No anchor, no score, and `orchestrator.py` skips on
+`total_score is None`.
+
+Those 599 trades averaged **+0.637R at 44.0% win** -- the best-performing
+group anywhere in the funnel, better than the 0.588R of trades that pass
+everything.
+
+Note this REVERSES the earlier same-day finding in the opposite
+direction: on raw unfiltered touches the unscorable group looked
+better (0.540R vs 0.416R), then looked like an artifact once overhead
+resistance v2 ran first, and now under v3 looks strongly favourable
+again. The v2 result was the artifact -- it was v2 doing the damage.
+
+Relative Strength IS available for nearly all of them (775 of 781 in the
+earlier cut) and tiers sensibly on its own. An RS-only fallback score is
+the obvious candidate. NOT YET DESIGNED -- next item of work.
+
+### Promotion policy (agreed this session)
+
+A change earns its way from `historical_backtest_research` into `main`
+only if:
+
+1. It is validated INSIDE the full staged pipeline, not on an open
+   sample.
+2. The finding survives outlier exclusion (top and bottom 1%).
+3. The reasoning lands in THIS document at the same time the code lands
+   in `main`, so the two never drift apart again.
+
+Anything failing that bar stays on the research branch as a finding, not
+a rule. Note that some research-driven changes -- like the overhead
+rule -- are production changes, because the module runs live in
+`orchestrator.py`; the research branch only holds the sweep that
+justified them.
+
+### Files changed this session (later block)
+
+- `pipeline/sim.py` -- stop-before-trail ordering fix. PUSHED to `main`.
+- `pipeline/overhead_resistance_and_smoothness_checks.py` -- v3
+  proximity rule, v2 fallback retained. TO PUSH to `main`.
+- `pipeline/orchestrator.py` -- adds `OVERHEAD_PROXIMITY_R = 0.5`,
+  reorders entry/risk computation ahead of the overhead check. TO PUSH
+  to `main`.
+- `research/staged_pipeline_backtest.py` -- NEW. TO PUSH to
+  `historical_backtest_research`.
