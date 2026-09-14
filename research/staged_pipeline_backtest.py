@@ -83,6 +83,7 @@ OUTPUT_FILE = "Staged_Pipeline_Results.csv"
 # Gate parameters -- keep in sync with orchestrator.py
 ADR_CEILING_PCT = 10.0
 SKIP_SCORE_THRESHOLD = 2.5
+OVERHEAD_PROXIMITY_R = 0.5   # v3 overhead rule -- keep in sync with orchestrator.py
 
 TRAIL_RULE = "atr_1.0x"
 TAKE_PARTIAL = False
@@ -128,23 +129,40 @@ def main():
         if not os.path.exists(path):
             continue
         if ticker not in cache:
-            cache[ticker] = pd.read_csv(path, parse_dates=["Date"])
+            # sim.load_ticker() adds MA10/MA20/MA50/ADR10/ATR14, which the
+            # trail rules require -- a bare read_csv() is not enough.
+            cache[ticker] = sim.load_ticker(path)
         df_full = cache[ticker]
         df = df_full[df_full["Date"] <= entry_date].reset_index(drop=True)
 
         rec = {"ticker": ticker, "entry_date": entry_date,
                "dropped_at": None}
 
-        # --- STAGE 3: overhead resistance ---
-        try:
-            orr = overhead_resistance_check(df, entry_date)
-            rec["or_verdict"] = None if orr is None else orr.get("verdict")
-        except Exception:
-            rec["or_verdict"] = "ERROR"
+        # --- STAGE 4 inputs computed first: the v3 overhead rule needs
+        #     entry_price and risk_per_share to express distance in R.
+        #     Mirrors the same reordering made in orchestrator.py. ---
 
         # --- STAGE 4: ADR ceiling ---
-        adr10 = ((df["High"] / df["Low"] - 1) * 100).rolling(10).mean().iloc[-1]
+        adr10 = df_full["ADR10"].iloc[len(df) - 1]
         rec["adr10_pct_at_entry"] = round(float(adr10), 3) if pd.notna(adr10) else None
+
+        entry_price_pre = float(df_full["MA50"].iloc[len(df) - 1])
+        rps_pre = (sim.compute_risk_per_share(entry_price_pre, float(adr10), CAP_PCT)
+                   if pd.notna(adr10) and pd.notna(entry_price_pre) else None)
+
+        # --- STAGE 3: overhead resistance (v3, proximity in R) ---
+        try:
+            orr = overhead_resistance_check(
+                df, entry_date,
+                entry_price=entry_price_pre,
+                risk_per_share=rps_pre,
+                proximity_R=OVERHEAD_PROXIMITY_R,
+            )
+            rec["or_verdict"] = None if orr is None else orr.get("verdict")
+            rec["overhead_R"] = None if orr is None else orr.get("overhead_R")
+        except Exception:
+            rec["or_verdict"] = "ERROR"
+            rec["overhead_R"] = None
 
         # --- STAGE 5: score ---
         try:
@@ -159,11 +177,13 @@ def main():
 
         # --- STAGE 6: simulate (ALWAYS run, so dropped events still
         #     carry a counterfactual outcome for gate evaluation) ---
-        entry_price = float(df["SMA50"].iloc[-1]) if "SMA50" in df.columns \
-            else float(df["Close"].rolling(50).mean().iloc[-1])
+        entry_price = float(df_full["MA50"].iloc[len(df) - 1])
         try:
+            # simulate_trail() wants the INTEGER ROW INDEX of the entry day
+            # within df_full, not the date itself.
+            entry_idx = len(df) - 1
             rps = sim.compute_risk_per_share(entry_price, float(adr10), CAP_PCT)
-            out = sim.simulate_trail(df_full, entry_date, entry_price, rps,
+            out = sim.simulate_trail(df_full, entry_idx, entry_price, rps,
                                      rule=TRAIL_RULE, take_partial=TAKE_PARTIAL)
             rec["entry_price"] = round(entry_price, 4)
             rec["risk_per_share"] = round(rps, 4)
