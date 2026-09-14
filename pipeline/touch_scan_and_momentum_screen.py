@@ -155,6 +155,75 @@ def wilder_adx(df, period=50):
     return adx
 
 
+# =========================================================================
+# THE MOMENTUM SCREEN -- SINGLE SOURCE OF TRUTH  (ADDED 2026-09-14)
+# =========================================================================
+# Until today these eight criteria were written out TWICE: once in
+# run_full_historical_scan() below, and again inline in orchestrator.py's
+# find_new_signals_for_date(). That duplication is exactly how the
+# price_above_50ma bug survived -- it was fixed here on 2026-09-11, but the
+# orchestrator carried its own copy and went on running the unfixed screen
+# in production until 2026-09-14. The backtest enforced a rule that live
+# trading did not.
+#
+# Both callers now go through passes_momentum_screen(). There is one copy
+# of the rules. Do not reintroduce a second.
+#
+# The caller is responsible for producing a row that already has SMA50,
+# SMA100, SMA200, AvgVol10, ADX50, Perf6mo and SMA50_prior5 computed --
+# how those columns get there differs between the full historical sweep
+# (vectorised over the whole frame) and the single-date live check
+# (trailing window up to target_date), and that difference is legitimate.
+# The SCREEN ITSELF is what must not differ.
+
+MOMENTUM_SCREEN_COLUMNS = ["SMA50", "SMA100", "SMA200", "AvgVol10",
+                           "ADX50", "Perf6mo", "SMA50_prior5"]
+
+# Screen thresholds -- named so they can be referenced in the architecture
+# doc and changed in exactly one place.
+ADX50_MIN, ADX50_MAX = 20, 40
+AVG_VOL10_MIN = 1_000_000
+PERF6MO_MIN, PERF6MO_MAX = 30, 500
+
+
+def momentum_screen_detail(row):
+    """
+    Evaluate the 8-criterion momentum screen for a single prepared row.
+    Returns a dict of criterion name -> bool. Useful for diagnosing why a
+    given ticker/date passed or failed (e.g. the CLSK/NFLX/CLOV
+    verification run).
+    """
+    return {
+        "sma50_rising":    bool(row["SMA50"] > row["SMA50_prior5"]),
+        "price_above_50ma": bool(row["Close"] > row["SMA50"]),
+        "stack_ok":        bool(row["SMA100"] > row["SMA200"]),
+        "adx_ok":          bool(ADX50_MIN <= row["ADX50"] <= ADX50_MAX),
+        "vol_ok":          bool(row["AvgVol10"] > AVG_VOL10_MIN),
+        "perf_ok":         bool(PERF6MO_MIN <= row["Perf6mo"] <= PERF6MO_MAX),
+    }
+
+
+def screen_inputs_ready(row):
+    """True if every column the screen depends on is present and non-NaN."""
+    return not pd.isna([row[c] for c in MOMENTUM_SCREEN_COLUMNS]).any()
+
+
+def passes_momentum_screen(row):
+    """
+    The screen itself. Returns False if the inputs aren't ready yet
+    (insufficient history for one of the moving averages), so callers can
+    use this as a single guard.
+    """
+    if not screen_inputs_ready(row):
+        return False
+    return all(momentum_screen_detail(row).values())
+
+
+def touched_50ma(row):
+    """Touch definition: the day's range contains the 50-day MA."""
+    return bool(row["Low"] <= row["SMA50"] <= row["High"])
+
+
 def run_full_historical_scan():
     """
     FULL multi-year historical scan -- reproduces the original 456/1,476-event
@@ -216,39 +285,18 @@ def run_full_historical_scan():
         n = len(df)
         for i in range(200, n):
             row = df.iloc[i]
-            if pd.isna(row['SMA50']) or pd.isna(row['SMA100']) or pd.isna(row['SMA200']) or pd.isna(row['ADX50']) or pd.isna(row['AvgVol10']) or pd.isna(row['Perf6mo']) or pd.isna(row['SMA50_prior5']):
-                continue
 
-            # Condition: SMA50 rising
-            sma50_rising = row['SMA50'] > row['SMA50_prior5']
-            # Condition: price > 50MA (screen requirement, checked at screen
-            # time - general uptrend context)
-            # *** FOUND BUG: this is computed but NEVER included in the filter
-            # below -- see "FOUND BUG" note in the file header. As written,
-            # this condition is NOT enforced. ***
-            price_above_50ma = row['Close'] > row['SMA50']
-            # Condition: SMA100 > SMA200 (long-term stack)
-            stack_ok = row['SMA100'] > row['SMA200']
-            # Condition: ADX(50) between 20 and 40
-            adx_ok = 20 <= row['ADX50'] <= 40
-            # Condition: avg 10-day volume > 1,000,000
-            vol_ok = row['AvgVol10'] > 1_000_000
-            # Condition: 6-month perf between 30% and 500%
-            perf_ok = 30 <= row['Perf6mo'] <= 500
-
-            # FIXED 2026-09-11: price_above_50ma is now included in the
-            # filter below. Previously computed but silently ignored -- see
-            # "FOUND BUG" note in the file header for the original context.
-            # This fix changes historical touch counts vs. any prior run of
-            # this script -- expect fewer touches than before.
-            if not (sma50_rising and price_above_50ma and stack_ok and adx_ok and vol_ok and perf_ok):
+            # REFACTORED 2026-09-14: the eight criteria were written out
+            # here AND again inline in orchestrator.py. Both now call
+            # passes_momentum_screen() above -- one copy of the rules.
+            # (This also subsumes the NaN-readiness guard and the
+            # 2026-09-11 price_above_50ma fix.)
+            if not passes_momentum_screen(row):
                 continue
 
             # Touch definition: low of day <= SMA50 <= high of day (price
-            # touched the MA intraday), OR close within a small tolerance
-            # band of the MA (since we only have OHLC, not exact touch
-            # confirmation)
-            touched = (row['Low'] <= row['SMA50'] <= row['High'])
+            # touched the MA intraday).
+            touched = touched_50ma(row)
 
             if touched:
                 all_touches.append({

@@ -239,6 +239,40 @@ def update_swing_low(df, i, swing_state):
                 swing_state['confirmed_low'] = candidate_low
 
 
+# =========================================================================
+# GAP-AWARE STOP FILLS  (ADDED 2026-09-14)
+# =========================================================================
+# A resting stop order does NOT fill at the stop price when the stock gaps
+# through it overnight -- it becomes a market order and fills at (roughly)
+# the next open. Before this change sim.py assumed every stop filled AT the
+# stop price, which quietly understated the left tail of the distribution.
+# Dave took a real -5R overnight gap loss in live trading in Sept 2026 that
+# the simulator, as written, could not have produced.
+#
+# MODELLING CHOICE: fill at min(stop, Open). If the open is below the stop,
+# the gap already blew through it and the fill is the open; otherwise the
+# stop fills normally at the stop price intraday. This is still slightly
+# optimistic -- it ignores slippage past the open in a fast tape -- but it
+# is the honest, defensible approximation and it requires no data beyond
+# what is already loaded.
+#
+# NOT applied on the ENTRY day: entry is a resting limit at the 50-day MA,
+# which fills intraday, so that day's open precedes the position existing.
+# An entry-day stop-out is an intraday move through the stop and fills at
+# the stop.
+MODEL_GAP_FILLS = True
+
+
+def stop_fill_price(row, stop):
+    """Price a stop actually fills at on a given bar, accounting for gaps."""
+    if not MODEL_GAP_FILLS:
+        return stop
+    open_px = row['Open']
+    if pd.notna(open_px) and open_px < stop:
+        return float(open_px)
+    return stop
+
+
 def simulate_trail(df, entry_idx, entry_price, risk_per_share, rule='atr_1.0x', take_partial=False,
                           adr_threshold=10.0, grace_R=1.5):
     """
@@ -330,7 +364,7 @@ def simulate_trail(df, entry_idx, entry_price, risk_per_share, rule='atr_1.0x', 
                 trail_unlocked = True
             if not partial_taken:
                 if low <= stop:
-                    exit_price = stop
+                    exit_price = stop_fill_price(row, stop)
                     realized_R += (exit_price - entry_price) / risk_per_share
                     return dict(exit_date=row['Date'], exit_reason='initial_stop',
                                 realized_R=round(realized_R, 3))
@@ -340,7 +374,7 @@ def simulate_trail(df, entry_idx, entry_price, risk_per_share, rule='atr_1.0x', 
                 trail_unlocked = True
             if not trail_unlocked:
                 if low <= stop:
-                    exit_price = stop
+                    exit_price = stop_fill_price(row, stop)
                     realized_R += (exit_price - entry_price) / risk_per_share
                     return dict(exit_date=row['Date'], exit_reason='initial_stop',
                                 realized_R=round(realized_R, 3))
@@ -360,7 +394,7 @@ def simulate_trail(df, entry_idx, entry_price, risk_per_share, rule='atr_1.0x', 
         # real effect and are NOT modelled here (see the gap-risk open
         # item in Architecture_and_Scope_v1.md).
         if low <= stop:
-            exit_price = stop
+            exit_price = stop_fill_price(row, stop)
             frac = remaining if take_partial else 1.0
             realized_R += frac * (exit_price - entry_price) / risk_per_share
             return dict(exit_date=row['Date'], exit_reason='stop',

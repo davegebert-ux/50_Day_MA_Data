@@ -214,7 +214,8 @@ def find_new_signals_for_date(target_date, already_open_tickers):
     importable function later, this should call that function instead of
     reimplementing the checks here.
     """
-    from touch_scan_and_momentum_screen import wilder_adx
+    from touch_scan_and_momentum_screen import (
+        wilder_adx, passes_momentum_screen, touched_50ma)
 
     target_date = pd.Timestamp(target_date)
     spy_df = sim.load_ticker(SPY_PATH) if os.path.exists(SPY_PATH) else None
@@ -242,28 +243,15 @@ def find_new_signals_for_date(target_date, already_open_tickers):
         df["SMA50_prior5"] = df["SMA50"].shift(5)
 
         row = df.iloc[-1]
-        if pd.isna(row[["SMA50", "SMA100", "SMA200", "ADX50", "AvgVol10",
-                         "Perf6mo", "SMA50_prior5"]]).any():
+
+        # REFACTORED 2026-09-14: this function used to re-implement the
+        # eight screen criteria inline, which is how the price_above_50ma
+        # fix reached the backtest on 2026-09-11 but not production until
+        # 2026-09-14. The screen now lives in exactly one place.
+        if not passes_momentum_screen(row):
             continue
 
-        sma50_rising = row["SMA50"] > row["SMA50_prior5"]
-        price_above_50ma = row["Close"] > row["SMA50"]
-        stack_ok = row["SMA100"] > row["SMA200"]
-        adx_ok = 20 <= row["ADX50"] <= 40
-        vol_ok = row["AvgVol10"] > 1_000_000
-        perf_ok = 30 <= row["Perf6mo"] <= 500
-        # FIXED 2026-09-14: price_above_50ma was missing from this inline
-        # copy of the screen. The same bug was fixed in
-        # touch_scan_and_momentum_screen.py on 2026-09-11, but THIS function
-        # deliberately re-implements the screen rather than importing it, so
-        # that fix never reached the live daily run -- the backtest enforced
-        # the rule and production did not. Keep the two in sync until this
-        # duplication is refactored away.
-        if not (sma50_rising and price_above_50ma and stack_ok and adx_ok
-                and vol_ok and perf_ok):
-            continue
-
-        touched = row["Low"] <= row["SMA50"] <= row["High"]
+        touched = touched_50ma(row)
         if not touched:
             continue
 
