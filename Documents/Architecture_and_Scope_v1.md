@@ -2400,3 +2400,205 @@ genuine test. Some residual errors are accepted as possible.
   strip it back to the `research/` folder and its findings documents
   only. It must not carry a second copy of `pipeline/`; that duplication
   is what allowed item 2 to go unnoticed.
+
+---
+
+## 2026-09-14 -- Session: Corrected Scoring Re-Run, ADR Ceiling, and Two Fixes That Never Reached Production
+
+### What this session did
+
+Executed the pending scoring re-run against the wide-universe sample,
+re-derived every score-tier result on the corrected 0-5 scale, tested and
+adopted a volatility ceiling, and -- unexpectedly -- found two validated
+fixes that had never actually reached the production code path.
+
+The whole run was performed in Claude's sandbox from four uploaded CSVs
+(`SPY_1d_data.csv`, `historical_candidates_sample.csv`,
+`historical_prices_3yr.csv`, `wide_universe_snapshot.csv`) plus the
+scripts recovered from the branch zips. No Colab run was needed.
+
+### Reproduction of the touch scan
+
+`historical_prices_3yr.csv` (1,134,048 rows, 1,591 tickers,
+2023-09-11 to 2026-09-10) was split into per-ticker files using
+`research/split_historical_prices.py`, then scanned with the FIXED
+`touch_scan_and_momentum_screen.py`. Result: **2,310 qualifying touches
+across 567 tickers, 66 tickers skipped for insufficient history** -- an
+exact reproduction of the documented wide-universe sample.
+
+### FINDING: two validated fixes existed only on the deleted branch
+
+When `pipeline/` was deleted from `historical_backtest_research` during
+the 2026-09-13 consolidation, it was assumed to be a redundant copy of
+`main`. A file-by-file diff showed it was not. Three files differed, and
+in two of them the BACKTEST copy was the correct one:
+
+- `touch_scan_and_momentum_screen.py` -- `main` still had the UNFIXED
+  screen, where `price_above_50ma` is computed and then silently omitted
+  from the filter. The 2026-09-11 fix lived only on the research branch.
+- `scorecard.py` -- `main`'s `score_total_v2()` still averaged THREE
+  attributes including Trend Efficiency. The 2026-09-03 demotion had
+  never been applied to `main`.
+- `sim.py` -- `main` had no knowledge of `atr_1.0x` at all (0 references).
+  This was already resolved, by luck: the 2026-09-13 item-4 fix was built
+  on the backtest copy, so pushing it carried the locked trail rule over.
+
+Both remaining files were recovered from the branch zip and pushed to
+`pipeline/` on `main` this session.
+
+**Root-cause lesson:** the duplicated `pipeline/` folder did not merely
+risk divergence -- it had already diverged, in the direction of
+production running older code than research. Validated changes were
+being made on the research branch and never propagated. The branch
+policy adopted on 2026-09-13 is what prevents a recurrence; this session
+is the evidence for why it was needed.
+
+### FINDING: the orchestrator re-implements the screen and missed the fix too
+
+Pushing the corrected `touch_scan_and_momentum_screen.py` does NOT by
+itself fix the live daily run. `orchestrator.py`'s
+`find_new_touch_events()` deliberately re-implements the momentum screen
+inline for a single date rather than importing the scan module (a
+known-and-noted shortcut, flagged in its own docstring). That inline copy
+also omitted `price_above_50ma`.
+
+So between 2026-09-11 and 2026-09-14 the backtest enforced the
+close-above-the-50-day-MA criterion and production did not. Fixed this
+session directly in `orchestrator.py`, with a comment tying the two
+copies together until the duplication is refactored away.
+
+### Corrected score-tier results (the item-2 re-run)
+
+`run_backtest_scoring_v2.py` run over all 2,310 events, producing
+`Historical_Backtest_Scored_Trades_v3_scorev2.csv`. Zero events skipped.
+
+**Scorability:** `total_score_v2` was unavailable for **793 of 2,310
+events (34%)**. Cause is almost entirely MA Respect (787 cases) returning
+`{'score': None, 'note': 'no clean trend-start found'}` from
+`_find_trend_start()`. The unscorable share is spread evenly across every
+quarter from 2024Q2 to 2026Q3 (ranging 25-42%), so this is STRUCTURAL, not
+a data-coverage artifact or a bug. Expect roughly a third of live
+candidates to be unscorable, and therefore skipped by the orchestrator's
+`total_score is None` guard. Whether that guard is the right behaviour is
+an OPEN QUESTION -- it currently discards a third of all touch events
+without evaluation.
+
+**Score tiers (1,517 scored trades with outcomes, all outliers included):**
+
+| Score tier | n | avg R | win % |
+|---|---|---|---|
+| under 2.0 | 340 | 0.165 | 33.8 |
+| 2.0 - 2.5 | 294 | 0.361 | 39.1 |
+| 2.5 - 3.0 | 350 | 0.749 | 45.1 |
+| 3.0 - 3.5 | 273 | 0.718 | 45.1 |
+| 3.5+ | 260 | 0.687 | 46.9 |
+
+**[VALIDATED] The 2.5 skip threshold holds.** Below it, 0.17-0.36R at
+34-39% win. At or above it, ~0.69-0.75R at 45-47%. Clean separation.
+
+**[DECISION] The score is a GATE, not a sizing dial.** Above 2.5 the
+score stops discriminating -- avg R is flat (0.75 / 0.72 / 0.69) and only
+win rate creeps up. A 3.9 does not earn a larger position than a 2.6. Do
+not build conviction sizing on `total_score_v2` magnitude.
+
+**Correlation with outcome: 0.058** on the wide universe (legacy 9-attr
+sum: 0.055 -- i.e. the two scorers are near-indistinguishable in raw
+correlation terms, though the v2 tier separation above is real). This
+compares to **0.238 on the old 253-event set**. The earlier figure was a
+small-sample effect and should not be quoted going forward.
+
+### [REVERSED] The 5-7% ADR band finding does not survive
+
+The 2026-09-11 finding that the 5-7% ADR10 band carried a standout
++0.86R, and the plan to feed ADR band into conviction sizing, are
+WITHDRAWN. The effect was driven by a small number of extreme winners.
+
+All 2,310 trades, by ADR10 band at entry:
+
+| ADR band | n | avg R (all) | avg R (1-99 pct) | win % (excl) |
+|---|---|---|---|---|
+| under 3% | 357 | 0.574 | 0.551 | 43.7 |
+| 3 - 5% | 680 | 0.424 | 0.431 | 42.5 |
+| 5 - 7% | 547 | 0.796 | 0.509 | 44.3 |
+| 7%+ | 726 | 0.709 | 0.402 | 38.5 |
+
+Excluding the top and bottom 1% of outcomes flattens the bands to
+0.55 / 0.43 / 0.51 / 0.40. The 5-7% "sweet spot" collapses from 0.796 to
+0.509 -- in line with every other band. The most volatile band has the
+WORST win rate.
+
+**Consequence:** conviction sizing on ADR band is off the table.
+`Conviction_Sizing_Model_v2.md` is now known to be built on a withdrawn
+finding and must not be implemented as written.
+
+### [ADOPTED] ADR ceiling of 10%
+
+Testing a ceiling rather than a band. Outliers excluded, all trades:
+
+| Ceiling | n | avg R | win % | % of trades kept |
+|---|---|---|---|---|
+| none | 2,262 | 0.459 | 41.9 | 100% |
+| 12% | 2,122 | 0.460 | 42.7 | 93.8% |
+| **10%** | **2,010** | **0.494** | **43.6** | **88.9%** |
+| 9% | 1,898 | 0.490 | 43.6 | 83.9% |
+| 8% | 1,749 | 0.466 | 43.2 | 77.3% |
+| 7% | 1,551 | 0.485 | 43.4 | 68.6% |
+| 6% | 1,316 | 0.475 | 43.1 | 58.2% |
+| 5% | 1,016 | 0.472 | 42.9 | 44.9% |
+
+Combined with the 2.5 score gate, a 10% ceiling gives the best cell
+found: **0.568R at 45.1% win rate (n=1,095)**.
+
+**[DECISION -- Dave] Lock the 10% ADR ceiling.** Implemented as
+`ADR_CEILING_PCT = 10.0` in `orchestrator.py`, applied in
+`find_new_touch_events()` before sizing.
+
+Characterise this honestly: it is a **wildness cap, not an edge**. Every
+ceiling from 9% down to 5% sits flat near 0.47R, so there is no sweet
+spot being captured -- the 10% line simply removes names whose daily
+range makes position sizing unreliable (the sample's ADR10 runs as high
+as 34.65%). The gain is modest and the cost is low: ~11% of trades.
+
+ADR10 remains in the output as a logged column and continues to drive
+`compute_risk_per_share()` via `min(cap_pct, ADR10)`. Same measure,
+10-day lookback, read at entry -- so the 7% risk cap and the 10% ceiling
+are consistent with each other.
+
+### Exit-reason distribution (2,310 trades, `atr_1.0x`)
+
+| Exit reason | n |
+|---|---|
+| atr_1.0x_trail | 1,070 |
+| initial_stop | 1,062 |
+| initial_stop_entry_day | 152 |
+| still_open | 24 |
+| stop | 2 |
+
+152 trades (6.6%) stop out on the entry day itself -- worth a look when
+the holding-period analysis is done.
+
+### Files changed this session
+
+- `pipeline/scorecard.py` -- recovered 2-attribute `score_total_v2()`.
+  PUSHED to `main`.
+- `pipeline/touch_scan_and_momentum_screen.py` -- recovered
+  `price_above_50ma` fix. PUSHED to `main`.
+- `pipeline/orchestrator.py` -- adds `ADR_CEILING_PCT = 10.0` and its
+  enforcement; restores `price_above_50ma` in the inline screen. PENDING
+  PUSH.
+- `Historical_Touches_WideUniverse_v1.csv` (2,310 events) and
+  `Historical_Backtest_Scored_Trades_v3_scorev2.csv` regenerated.
+
+### Open items after this session
+
+1. **The unscorable third.** Decide whether `_find_trend_start()`
+   returning None should mean "skip" or "score by Relative Strength
+   alone". Currently a third of candidates are discarded silently.
+2. `Conviction_Sizing_Model_v2.md` needs rewriting -- its ADR-band basis
+   is withdrawn and score magnitude is now known not to discriminate
+   above 2.5. Conviction sizing may simply not have a validated input yet.
+3. Holding-period / trade-duration analysis -- still NOT STARTED.
+4. Trend Efficiency redesign -- the ADR-overlap rationale is now itself
+   in question, since the ADR band effect was an outlier artifact.
+5. Refactor the duplicated momentum screen so `orchestrator.py` imports
+   `touch_scan_and_momentum_screen.py` rather than re-implementing it.
