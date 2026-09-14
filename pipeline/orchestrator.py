@@ -93,9 +93,36 @@ ADR_CEILING_PCT = 10.0
 # (0.545R / 44.5%). See overhead_resistance_and_smoothness_checks.py.
 OVERHEAD_PROXIMITY_R = 0.5
 
+# ADDED 2026-09-14: maximum position COST as a fraction of the account,
+# independent of the risk rule. Reasoning (see architecture doc, "Position
+# Sizing: Two Constraints", 2026-09-14):
+#   Sizing off risk alone caps what a trade can LOSE but says nothing about
+#   what it COSTS. On tight-stop names (e.g. FBP 2026-09-02, ADR 1.60%) the
+#   risk maths yields a position costing ~60% of the account. Across the
+#   1,023 passing trades the median cost was ~22% of account, the 95th
+#   percentile ~46%, the worst ~93%. Two such trades commit the whole
+#   account and the third signal cannot be taken -- so WITHOUT this cap the
+#   number of positions the system can hold is decided by accident.
+#   A cost cap is NOT a drag on edge: return per dollar risked is unchanged.
+#   It only lowers how much is risked on the tightest-stop names, and in
+#   exchange buys a guaranteed minimum number of concurrent positions.
+#   10% chosen to match Dave's live practice (max ~10 concurrent positions);
+#   it is a concurrency decision, not a backtest-optimised number.
+# REJECTED ALTERNATIVE: flooring the stop distance (e.g. min 2%). It fixes
+# cost as a side effect but spends the strategy's core edge -- a tight stop
+# is what makes a large R multiple possible -- so it was ruled out.
+MAX_POSITION_COST_PCT = 0.10
+
 OPEN_POSITIONS_COLUMNS = [
     "ticker", "entry_date", "entry_price", "risk_per_share",
     "score_at_entry", "shares", "position_cost",
+    # ADDED 2026-09-14: which of the two constraints actually determined
+    # share count on this trade -- "risk", "cost", or "both". Logged
+    # because at the current settings (1% risk, 10% cost) the cost cap is
+    # expected to bind on essentially every trade, leaving the risk rule
+    # dormant. This column makes it visible at a glance if that ever
+    # changes (e.g. if max concurrent positions is revised to 8).
+    "sizing_constraint",
 ]
 CLOSED_TRADES_COLUMNS = OPEN_POSITIONS_COLUMNS + [
     "exit_date", "exit_reason", "exit_price", "realized_R", "realized_pnl",
@@ -308,11 +335,47 @@ def find_new_signals_for_date(target_date, already_open_tickers):
 # STEP 4: OPEN NEW TRADES (dollar sizing off the STATIC account balance)
 # ============================================================
 def size_and_open_trades(signals, open_df):
+    """Size each signal under BOTH constraints and open the position.
+
+    Two independent limits, added 2026-09-14 (see MAX_POSITION_COST_PCT):
+      RISK limit -- shares such that shares * risk_per_share <= 1% of account.
+                    Caps what the trade can LOSE.
+      COST limit -- shares such that shares * entry_price <= 10% of account.
+                    Caps what the trade TIES UP, and therefore guarantees the
+                    account can hold ~10 concurrent positions.
+    Share count is the LESSER of the two, always rounded down, so neither
+    limit can be breached. Both are kept even though the cost cap currently
+    binds first on virtually every trade: they express different things, and
+    if max concurrent positions is ever revised the risk rule is already in
+    place. Which one bound is recorded in "sizing_constraint".
+    """
     dollar_risk_per_trade = parameters.ACCOUNT_STARTING_BALANCE * parameters.RISK_PERCENT_PER_TRADE
+    max_position_cost = parameters.ACCOUNT_STARTING_BALANCE * MAX_POSITION_COST_PCT
     new_rows = []
     for sig in signals:
-        shares = int(dollar_risk_per_trade / sig["risk_per_share"]) if sig["risk_per_share"] > 0 else 0
+        shares_by_risk = int(dollar_risk_per_trade / sig["risk_per_share"]) if sig["risk_per_share"] > 0 else 0
+        shares_by_cost = int(max_position_cost / sig["entry_price"]) if sig["entry_price"] > 0 else 0
+        shares = min(shares_by_risk, shares_by_cost)
+
+        if shares_by_cost < shares_by_risk:
+            constraint = "cost"
+        elif shares_by_risk < shares_by_cost:
+            constraint = "risk"
+        else:
+            constraint = "both"
+
+        # A signal can size to zero shares if one share alone would exceed
+        # the cost cap (a very high-priced stock). Skip rather than open a
+        # zero-share row -- this is the sizing analogue of Dave's live
+        # decision to pass on DELL because the share price did not suit the
+        # position size.
+        if shares <= 0:
+            print(f"  SKIPPED {sig['ticker']}: sizes to 0 shares "
+                  f"(entry {sig['entry_price']:.2f} vs cost cap {max_position_cost:.2f})")
+            continue
+
         position_cost = round(shares * sig["entry_price"], 2)
+        actual_risk = round(shares * sig["risk_per_share"], 2)
         new_rows.append({
             "ticker": sig["ticker"],
             "entry_date": sig["entry_date"],
@@ -321,9 +384,11 @@ def size_and_open_trades(signals, open_df):
             "score_at_entry": sig["score_at_entry"],
             "shares": shares,
             "position_cost": position_cost,
+            "sizing_constraint": constraint,
         })
         print(f"  OPENED {sig['ticker']}: score {sig['score_at_entry']}, "
-              f"{shares} shares, {position_cost:.2f} dollars committed")
+              f"{shares} shares, {position_cost:.2f} dollars committed, "
+              f"{actual_risk:.2f} dollars at risk (limited by {constraint})")
 
     if new_rows:
         new_df = pd.DataFrame(new_rows, columns=OPEN_POSITIONS_COLUMNS)
