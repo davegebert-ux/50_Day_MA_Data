@@ -2820,3 +2820,235 @@ justified them.
   to `main`.
 - `research/staged_pipeline_backtest.py` -- NEW. TO PUSH to
   `historical_backtest_research`.
+
+---
+
+## 2026-09-14 (later still) -- CLOSED FINDING: The Unscorable Third Stays Excluded
+
+### The question
+
+599 of 2,310 touch events (26%) are rejected because `score_total_v2`
+returns None. Cause: MA Respect's `_find_trend_start()` cannot find a
+qualifying anchor -- it requires a reclaim of the MA50 at least 40 days
+back that has held >=95% of days since. No anchor, no score, and
+`orchestrator.py` skips on `total_score is None`.
+
+Those trades averaged **+0.637R at 44.0% win**, ostensibly better than
+the 0.588R of trades passing the full pipeline. That made the exclusion
+look like the single largest unforced error in the system, and an
+RS-only fallback score the obvious fix.
+
+### [RESOLVED -- the outperformance is not harvestable]
+
+**Concentration.** 10 tickers out of 208 produce 69% of the group's
+total R. Removing each group's own top-10 tickers by total R:
+
+| Group | n | avg R | win % |
+|---|---|---|---|
+| unscorable, excl its top 10 tickers | 523 | **0.224** | 40.7 |
+| passed pipeline, excl its top 10 tickers | 937 | **0.299** | 42.7 |
+
+The advantage does not merely shrink -- it REVERSES. The headline 0.637R
+is ten names, not a population effect.
+
+**Distribution.** Median R is -1.00 with a p90 of 3.84 and a max of
++22.53. These are lottery tickets: they mostly stop out, and
+occasionally one runs enormously. Compare the passing group, which has
+a similar median but a tighter right tail (p90 3.35, max 12.00) -- its
+expectancy comes from the body of the distribution, not the tail.
+
+**An RS-only fallback does not separate them.** RS was available for 587
+of 593. Tiering by RS shows no monotonic relationship (0.44 / 0.74 /
+0.71 / 0.58 / 0.88 across five tiers), and tightening the threshold
+makes concentration WORSE, not better:
+
+| Fallback rule | n | avg R | win % | avg R excl top-10 tickers |
+|---|---|---|---|---|
+| RS >= 2.0 | 442 | 0.705 | 46.6 | **0.223** |
+| RS >= 2.5 | 288 | 0.683 | 47.6 | **0.116** |
+| RS >= 3.5 | 115 | 0.640 | 48.7 | **-0.222** |
+
+Demanding stronger RS selects harder for lottery tickets. There is no
+setting at which the fallback earns its place.
+
+### Why this is the right answer on the merits, not just the numbers
+
+Dave's framing, which the data supports:
+
+> "This strategy really is to find things that are in a trend in a minor
+> pullback and capitalize on the next leg."
+
+A name with no clean trend start is choppy by definition -- there is no
+established trend for price to pull back INTO. Chop is where explosive
+moves come from and also where most attempts die, which is exactly the
+distribution observed. `_find_trend_start()` returning None is not a
+scoring failure; it is the scorer correctly reporting that this setup is
+not the setup this system trades. `MA_Respect_Redesign_Notes.txt` said
+as much when the anchor logic was written.
+
+These names are a candidate population for a SEPARATE breakout strategy
+with its own entry and risk rules -- not something to fold into the
+pullback system by relaxing its definition.
+
+### Decision and code impact
+
+**[DECISION] No fallback scoring. The unscorable set stays excluded. No
+code change required** -- the existing `total_score is None` guard in
+`orchestrator.py` already implements this correctly. The only change is
+that the behaviour is now INTENTIONAL and evidence-backed rather than
+incidental.
+
+**[METHOD NOTE -- reusable] Concentration testing is now part of the
+bar.** Any future finding based on a group average must also be reported
+with the top-10 contributing tickers removed. Three separate findings
+this session survived a headline average and died on concentration or
+outlier exclusion (the ADR band, "unscorable outperform", and RS
+fallback). A mean over a heavy-tailed distribution is not evidence of a
+tradable edge by itself.
+
+---
+
+## 2026-09-14 (final block) -- Gap-Aware Stop Fills, Entry-Day Stops, and the Screen Deduplication
+
+### [BUG FIXED] sim.py assumed every stop filled AT the stop price
+
+A resting stop does not fill at the stop price when the stock gaps through
+it overnight -- it becomes a market order and fills around the next open.
+`sim.py` priced every stop exit at the stop, so the left tail of the
+distribution was structurally understated. Dave took a real -5R overnight
+gap loss in live trading in Sept 2026 that the simulator, as written,
+could not have produced at all.
+
+**FIX:** new `stop_fill_price(row, stop)` helper in `sim.py`, applied at
+all three non-entry-day stop exits. Fill price is `min(stop, Open)`.
+
+- Still slightly optimistic: it ignores slippage PAST the open in a fast
+  tape. It is the honest approximation available without intraday data.
+- Deliberately NOT applied on the entry day. Entry is a resting limit at
+  the 50-day MA which fills intraday, so that bar's open precedes the
+  position existing. An entry-day stop-out is an intraday move through
+  the stop and fills at the stop.
+- Controlled by `MODEL_GAP_FILLS = True` so the old behaviour can be
+  reproduced if an older result ever needs checking.
+
+### Cost of modelling gap risk honestly
+
+Full pipeline, outliers excluded, before vs after:
+
+| Stage | n | avg R (stop fills) | avg R (gap-aware) |
+|---|---|---|---|
+| 0-2. raw touch events | 2,310 | 0.443 | 0.436 |
+| 3. + overhead resistance v3 | 2,121 | 0.456 | 0.450 |
+| 4. + ADR ceiling 10% | 1,878 | 0.510 | 0.501 |
+| 5a. + scorable | 1,279 | 0.459 | 0.442 |
+| 5b. + score >= 2.5 | 1,023 | **0.588** | **0.578** |
+
+**End-to-end cost: -0.010R per trade.** The edge survives gap risk
+comfortably. All prior conclusions stand -- no gate changed its verdict.
+
+But the tail is now visible and should be sized for:
+
+- 67 of 1,023 passing trades (6.55%) finish worse than -1R
+- those average **-1.84R**, worst **-6.21R**
+- total drag 56R, i.e. -0.055R per trade
+
+Dave's real -5R September gap sits squarely inside that distribution
+rather than being an impossible event. **[PRINCIPLE]** at the locked 1%
+risk per trade a -6.2R day costs ~6% of the account: uncomfortable,
+recoverable. At 3% risk the same trade takes ~19% and needs a 23% gain to
+recover. Dave's note: "the reason I was fine was because I didn't take an
+oversized position." Fixed fractional sizing is what makes the tail
+survivable -- this is now an argued position, not just a default.
+
+### Entry-day stop-outs -- examined, NO ACTION
+
+152 of 2,310 touch events (6.6%) stop out on the entry day itself: price
+reaches the 50-day MA, fills the limit, and keeps going straight through.
+Dave had one live the same day ("a straight slice through the 50... it
+really just showed no resistance at all").
+
+**Among trades that pass the full pipeline this falls to 40 of 1,023
+(3.9%)** -- the gates already halve the rate without being aimed at it.
+
+Rate by attribute (passing trades only):
+
+| ADR10 at entry | rate | | score | rate | | overhead_R | rate |
+|---|---|---|---|---|---|---|---|
+| <3% | 3.4% | | 2.5-3.0 | 5.1% | | already cleared | 4.7% |
+| 3-5% | 3.3% | | 3.0-3.5 | 3.3% | | 0-2R | 1.3% |
+| 5-7% | 4.3% | | 3.5-4.0 | 4.6% | | 2-5R | 1.7% |
+| 7-10% | 5.2% | | 4.0+ | 2.6% | | 5-20R | 4.2% |
+
+Only volatility shows a clean gradient, and the 10% ADR ceiling already
+trims the worst of it. Score does not predict it. **[DECISION] No new
+rule.** A properly filled -1R stop at ~1 in 25 entries is a cost of
+participating in the setup, not a leak. Dave: "you can't catch them all."
+
+### [REFACTOR] The momentum screen now exists in exactly one place
+
+The eight criteria were written out twice -- in
+`run_full_historical_scan()` and inline in `orchestrator.py`'s
+`find_new_signals_for_date()`. **That duplication is precisely how the
+`price_above_50ma` bug survived**: fixed in the scan on 2026-09-11, while
+the orchestrator went on running the unfixed screen in production until
+2026-09-14. The backtest enforced a rule that live trading did not.
+
+New in `touch_scan_and_momentum_screen.py`, used by both callers:
+
+- `passes_momentum_screen(row)` -- the screen, including the NaN-readiness
+  guard
+- `momentum_screen_detail(row)` -- per-criterion pass/fail dict, for
+  diagnosing why a given ticker/date qualified (e.g. the CLSK/NFLX/CLOV
+  verification)
+- `touched_50ma(row)` -- the touch definition
+- named thresholds `ADX50_MIN/MAX`, `AVG_VOL10_MIN`, `PERF6MO_MIN/MAX`
+
+Callers still prepare their own columns -- vectorised over the full frame
+for the historical sweep, trailing window up to `target_date` for the live
+single-date check. That difference is legitimate. **The screen itself is
+what must not differ.**
+
+**VERIFIED: bit-for-bit identical output.** Re-ran the refactored screen
+over all 1,591 tickers: 2,310 touches across 567 tickers, zero events
+added, zero lost, exact set equality with
+`Historical_Touches_WideUniverse_v1.csv`. Behaviour unchanged;
+duplication gone.
+
+### Files to push (final state of this session)
+
+To `main`, in `pipeline/`:
+
+- `sim.py` -- stop-before-trail ordering fix AND gap-aware stop fills
+- `overhead_resistance_and_smoothness_checks.py` -- v3 proximity rule
+- `orchestrator.py` -- `OVERHEAD_PROXIMITY_R = 0.5`, entry/risk computed
+  before the overhead check, screen call deduplicated
+- `touch_scan_and_momentum_screen.py` -- shared screen functions
+- `Architecture_and_Scope_v1.md` -- this document
+
+To `historical_backtest_research`, in `research/`:
+
+- `staged_pipeline_backtest.py`
+
+### Where the system stands
+
+The backtesting is not finished, but it is now trustworthy -- which is
+the more important threshold. Every gate has been tested inside the full
+pipeline and three of four earn their keep; the fourth (the unscorable
+guard) has been examined and deliberately retained. Production and
+research run the same screen, the same scorer and the same trail rule.
+Known limits are written down rather than assumed away.
+
+REMAINING, in rough order of value:
+
+1. The screen admits names Dave would not trade on sight (CLSK, CLOV,
+   NFLX all passed all eight criteria point-in-time). Gap between the
+   rules and his judgement -- the most valuable open item.
+2. Holding-period / trade-duration analysis. Deliberately LAST: it is a
+   function of every other decision.
+3. `Conviction_Sizing_Model_v2.md` needs rewriting -- its ADR-band basis
+   was withdrawn 2026-09-14 and score magnitude does not discriminate
+   above 2.5. May have no validated input yet.
+4. Trend Efficiency redesign -- its ADR-overlap rationale is itself now
+   in question.
+5. Phase 3: trade execution automation via the TradingView -> TradeStation
+   bridge.
