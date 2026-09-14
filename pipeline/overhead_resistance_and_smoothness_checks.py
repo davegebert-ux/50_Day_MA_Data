@@ -71,11 +71,56 @@ def load(ticker):
 # =========================================================================
 # CHECK 1: OVERHEAD-RESISTANCE / ALL-TIME-HIGH CHECK
 # =========================================================================
-def overhead_resistance_check(df, as_of_date, lookback_years=2, grace_days=60):
+def overhead_resistance_check(df, as_of_date, lookback_years=2, grace_days=60,
+                              entry_price=None, risk_per_share=None,
+                              proximity_R=0.5):
     """
-    FINAL, locked-in version (v2). Excludes a ticker if there is any
-    unresolved old high above its current price within the lookback
-    window -- no percentage-drop threshold, no minimum drawdown required.
+    v3 (2026-09-14): PROXIMITY-BASED. Excludes only when an unresolved old
+    high sits CLOSE ENOUGH OVERHEAD to plausibly reject the trade before
+    it can reach profitability -- specifically, within `proximity_R`
+    (default 0.5R) above the entry price. An old high far overhead is left
+    alone.
+
+    WHY v2 WAS REPLACED
+    --------------------
+    v2 excluded on ANY unresolved high anywhere in the 2-year window,
+    however far above. Tested for the first time against outcomes on
+    2026-09-14 (2,310-event wide-universe sample, inside the full staged
+    pipeline, outliers excluded), it was found to be REMOVING VALUE:
+
+        rejected by v2 : n=1055  avgR=+0.483  win=40.7%
+        kept by v2     : n=1255  avgR=+0.410  win=42.0%
+
+    i.e. the trades it threw away were better than the ones it kept, and
+    it discarded 46% of the sample to do it. Headroom-to-old-high showed
+    no monotonic relationship with outcome at any distance band, so the
+    rule was not merely mistuned -- as written it measured something that
+    does not predict outcome in this data.
+
+    Dave's stated intent was always narrower than the code: remove setups
+    that run straight into prominent resistance immediately after entry.
+    Measuring that distance in R (rather than percent) makes it
+    comparable across volatility regimes -- what matters is whether the
+    old high sits between the entry and the point where the trade becomes
+    profitable.
+
+    Sweep inside the full pipeline (ADR ceiling + score gate on):
+        no overhead gate at all : n=1111  avgR=0.545  win=44.5%
+        exclude within 0.5R     : n=1011  avgR=0.576  win=45.6%   <-- BEST
+        exclude within 1.0R     : n= 928  avgR=0.517  win=45.4%
+        exclude within 1.5R     : n= 893  avgR=0.506  win=45.5%
+        exclude within 2.0R     : n= 861  avgR=0.492  win=45.1%
+        exclude within 3.0R     : n= 842  avgR=0.486  win=45.1%
+        v2 (any high, 2yr)      : n= 753  avgR=0.518  win=44.6%
+
+    0.5R beats both v2 and no gate at all, on expectancy AND win rate,
+    while keeping 91% of trades instead of v2's 68%.
+
+    BACKWARD COMPATIBILITY: if `entry_price` and `risk_per_share` are not
+    supplied, this falls back to v2 behaviour (any unresolved high
+    excludes) so older research scripts keep running -- but production
+    MUST pass both, or the gate silently reverts to the rule that was
+    just shown to remove value.
 
     Logic:
       1. Look back `lookback_years` (2 years) from as_of_date.
@@ -120,9 +165,23 @@ def overhead_resistance_check(df, as_of_date, lookback_years=2, grace_days=60):
         return {'verdict': 'pass (no eligible history yet)'}
     old_high = eligible['Close'].max()
     old_high_date = eligible.loc[eligible['Close'].idxmax(), 'Date']
-    verdict = 'EXCLUDE' if current_price <= old_high else 'pass'
-    return {'verdict': verdict, 'old_high': round(old_high, 2), 'old_high_date': old_high_date.date(),
-            'current_price': round(current_price, 2)}
+
+    if entry_price is None or risk_per_share is None or risk_per_share <= 0:
+        # v2 fallback -- see BACKWARD COMPATIBILITY note in the docstring.
+        verdict = 'EXCLUDE' if current_price <= old_high else 'pass'
+        overhead_R = None
+    else:
+        # v3: how far above the ENTRY does the old high sit, in units of
+        # initial risk? Negative means it is already below the entry
+        # (cleared) and cannot act as overhead resistance at all.
+        overhead_R = (old_high - entry_price) / risk_per_share
+        verdict = 'EXCLUDE' if 0 < overhead_R <= proximity_R else 'pass'
+
+    return {'verdict': verdict, 'old_high': round(old_high, 2),
+            'old_high_date': old_high_date.date(),
+            'current_price': round(current_price, 2),
+            'overhead_R': None if overhead_R is None else round(float(overhead_R), 2),
+            'proximity_R': proximity_R}
 
 
 def run_overhead_resistance_15name_validation():

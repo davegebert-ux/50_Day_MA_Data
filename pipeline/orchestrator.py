@@ -84,6 +84,15 @@ SKIP_SCORE_THRESHOLD = 2.5  # MVP decision -- see Conviction_Sizing_Model_v2.md
 # outlier exclusion and must not be reintroduced as a sizing input.
 ADR_CEILING_PCT = 10.0
 
+# ADDED 2026-09-14: overhead-resistance proximity, in units of initial
+# risk (R). An unresolved old high is only treated as disqualifying
+# resistance if it sits within this distance ABOVE the entry price.
+# Validated inside the full staged pipeline on the 2,310-event sample:
+# 0.5R gave 0.576R / 45.6% win while keeping 91% of trades, beating both
+# the old any-high rule (0.518R / 44.6%, keeping 68%) and no gate at all
+# (0.545R / 44.5%). See overhead_resistance_and_smoothness_checks.py.
+OVERHEAD_PROXIMITY_R = 0.5
+
 OPEN_POSITIONS_COLUMNS = [
     "ticker", "entry_date", "entry_price", "risk_per_share",
     "score_at_entry", "shares", "position_cost",
@@ -258,8 +267,33 @@ def find_new_signals_for_date(target_date, already_open_tickers):
         if not touched:
             continue
 
-        # Overhead-resistance pre-watchlist screen
-        or_result = overhead_resistance_check(df, target_date)
+        # REORDERED 2026-09-14: entry price, ADR and risk-per-share are now
+        # computed BEFORE the overhead-resistance check, because the v3
+        # proximity rule needs entry_price and risk_per_share to express
+        # overhead distance in R. Calling it without them silently falls
+        # back to the v2 "any unresolved high" rule, which was shown on
+        # 2026-09-14 to REMOVE value (rejected trades averaged +0.483R vs
+        # +0.410R for those it kept).
+        entry_price = row["SMA50"]
+        adr10_pct = ((df["High"] / df["Low"] - 1) * 100).rolling(10).mean().iloc[-1]
+
+        # ADDED 2026-09-14: volatility ceiling -- see ADR_CEILING_PCT above.
+        if pd.isna(adr10_pct) or adr10_pct > ADR_CEILING_PCT:
+            continue
+
+        risk_per_share = sim.compute_risk_per_share(entry_price, adr10_pct)
+        if risk_per_share <= 0:
+            continue
+
+        # Overhead-resistance pre-watchlist screen (v3, proximity-based:
+        # excludes only when an unresolved old high sits within
+        # OVERHEAD_PROXIMITY_R above the entry).
+        or_result = overhead_resistance_check(
+            df, target_date,
+            entry_price=float(entry_price),
+            risk_per_share=float(risk_per_share),
+            proximity_R=OVERHEAD_PROXIMITY_R,
+        )
         if or_result is None or or_result["verdict"] == "EXCLUDE":
             continue
 
@@ -270,15 +304,6 @@ def find_new_signals_for_date(target_date, already_open_tickers):
         total_score = score_result.get("total_score_v2")
         if total_score is None or total_score < SKIP_SCORE_THRESHOLD:
             continue
-
-        entry_price = row["SMA50"]
-        adr10_pct = ((df["High"] / df["Low"] - 1) * 100).rolling(10).mean().iloc[-1]
-
-        # ADDED 2026-09-14: volatility ceiling -- see ADR_CEILING_PCT above.
-        if pd.isna(adr10_pct) or adr10_pct > ADR_CEILING_PCT:
-            continue
-
-        risk_per_share = sim.compute_risk_per_share(entry_price, adr10_pct)
 
         signals.append({
             "ticker": ticker,
