@@ -3218,3 +3218,49 @@ NOT YET DONE: `sim.py` and the staged backtest do not apply the cost cap.
 This is acceptable because the cap does not change R multiples, only the
 dollar weight behind them, and the backtest measures R. It WILL matter
 the moment portfolio-level dollar returns or compounding are modelled.
+
+
+---
+
+## OPEN ITEM: Candidate Selection When Signals Exceed Capacity (raised 2026-09-14)
+
+Raised by Dave immediately after the position-cost cap was adopted, and it
+is the direct consequence of it. With a 10% cost cap the account holds
+about ten positions. If a day produces more qualifying signals than there
+is capacity for -- ten candidates, room for three -- **which three?**
+
+There is currently NO answer in the code. `find_new_signals_for_date()`
+returns signals in whatever order `glob` yields the per-ticker files, and
+`size_and_open_trades()` opens them in that order until capital runs out.
+That is effectively alphabetical. It is the same "decided by accident"
+failure the cost cap was adopted to remove, displaced one step: the cap
+now determines HOW MANY positions, but nothing determines WHICH.
+
+The obvious ranking key does not work. Score was validated 2026-09-14 as
+a GATE, not a dial -- realized R is flat above the 2.5 threshold, so
+ranking ten passing candidates by score would be close to ranking them at
+random. Whatever solves this has to be something not yet identified.
+
+Constraints on any solution:
+
+- It must be validated inside the full staged pipeline, under the
+  promotion criteria agreed this session (survives outlier exclusion,
+  reported with top-10 contributing tickers removed, reasoning written
+  into this document at the same time as the code).
+- It cannot lean on score magnitude, ADR band, or the withdrawn
+  conviction-sizing findings.
+- Candidate inputs worth sweeping: overhead_R (distance to the nearest
+  unresolved high -- more room may genuinely be better, and unlike score
+  it was never tested as a ranking variable, only as a gate), relative
+  strength as a continuous value rather than a scored bucket, sector or
+  correlation spread across concurrent positions, and distance of the
+  touch from the 50-day MA.
+- Honest possibility to test first: that no ranking beats taking them in
+  arbitrary order, in which case the correct answer is an explicit
+  random or first-come rule, documented as such rather than left
+  implicit. A null result here is a real result and should be recorded.
+
+Worth a dedicated session. Sequenced AFTER the remaining items only if
+signal counts per day turn out to rarely exceed capacity -- that is the
+first thing to measure, and it is cheap: count signals per day in the
+staged pipeline results and see how often the count exceeds ten.
