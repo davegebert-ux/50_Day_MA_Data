@@ -346,18 +346,32 @@ def simulate_trail(df, entry_idx, entry_price, risk_per_share, rule='atr_1.0x', 
                                 realized_R=round(realized_R, 3))
                 continue
 
+        # FIX (2026-09-14): the hard stop is now checked BEFORE the trail
+        # line. Previously the trail check came first and the stop sat in
+        # an elif, so on any day where price broke the stop intraday AND
+        # closed below the trail line, the simulation recorded an exit at
+        # the CLOSE and ignored the stop entirely. A resting stop order
+        # would have filled first in real life. This silently overstated
+        # the worst losses: all 40 trades in the wide-universe sample that
+        # came in worse than -1R were labelled '{rule}_trail', and the
+        # worst (RZLT 2025-12-04) showed -13.37R where a filled stop would
+        # have produced roughly -1R. Checking the stop first fixes the
+        # ordering; genuine overnight gaps through the stop are a separate,
+        # real effect and are NOT modelled here (see the gap-risk open
+        # item in Architecture_and_Scope_v1.md).
+        if low <= stop:
+            exit_price = stop
+            frac = remaining if take_partial else 1.0
+            realized_R += frac * (exit_price - entry_price) / risk_per_share
+            return dict(exit_date=row['Date'], exit_reason='stop',
+                        realized_R=round(realized_R, 3))
+
         trail_line = get_trail_line(df, i, rule, entry_idx, adr_threshold, swing_state)
         if not pd.isna(trail_line) and close < trail_line:
             exit_price = close
             frac = remaining if take_partial else 1.0
             realized_R += frac * (exit_price - entry_price) / risk_per_share
             return dict(exit_date=row['Date'], exit_reason=f'{rule}_trail',
-                        realized_R=round(realized_R, 3))
-        elif low <= stop:
-            exit_price = stop
-            frac = remaining if take_partial else 1.0
-            realized_R += frac * (exit_price - entry_price) / risk_per_share
-            return dict(exit_date=row['Date'], exit_reason='stop',
                         realized_R=round(realized_R, 3))
 
     last_close = df.iloc[-1]['Close']
