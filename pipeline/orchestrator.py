@@ -73,6 +73,17 @@ LAST_RUN_PATH = os.path.join(_STATE_DIR, "last_run_date.txt")
 
 SKIP_SCORE_THRESHOLD = 2.5  # MVP decision -- see Conviction_Sizing_Model_v2.md
 
+# ADDED 2026-09-14: volatility ceiling. Reject touch events whose ADR10 at
+# entry exceeds this. Validated on the 2,310-event wide-universe sample
+# (outliers excluded): a 10% ceiling lifted avg R from 0.459 to 0.494 and
+# win rate from 41.9% to 43.6% while discarding only ~11% of trades.
+# Tighter ceilings (9% down to 5%) added nothing -- all flat near 0.47R --
+# so 10% is a wildness cap, NOT a sweet-spot filter. Combined with the
+# 2.5 score gate it produced the best cell on the board: 0.568R / 45.1%.
+# NOTE: the earlier "5-7% ADR band carries +0.86R" finding did NOT survive
+# outlier exclusion and must not be reintroduced as a sizing input.
+ADR_CEILING_PCT = 10.0
+
 OPEN_POSITIONS_COLUMNS = [
     "ticker", "entry_date", "entry_price", "risk_per_share",
     "score_at_entry", "shares", "position_cost",
@@ -227,11 +238,20 @@ def find_new_signals_for_date(target_date, already_open_tickers):
             continue
 
         sma50_rising = row["SMA50"] > row["SMA50_prior5"]
+        price_above_50ma = row["Close"] > row["SMA50"]
         stack_ok = row["SMA100"] > row["SMA200"]
         adx_ok = 20 <= row["ADX50"] <= 40
         vol_ok = row["AvgVol10"] > 1_000_000
         perf_ok = 30 <= row["Perf6mo"] <= 500
-        if not (sma50_rising and stack_ok and adx_ok and vol_ok and perf_ok):
+        # FIXED 2026-09-14: price_above_50ma was missing from this inline
+        # copy of the screen. The same bug was fixed in
+        # touch_scan_and_momentum_screen.py on 2026-09-11, but THIS function
+        # deliberately re-implements the screen rather than importing it, so
+        # that fix never reached the live daily run -- the backtest enforced
+        # the rule and production did not. Keep the two in sync until this
+        # duplication is refactored away.
+        if not (sma50_rising and price_above_50ma and stack_ok and adx_ok
+                and vol_ok and perf_ok):
             continue
 
         touched = row["Low"] <= row["SMA50"] <= row["High"]
@@ -253,6 +273,11 @@ def find_new_signals_for_date(target_date, already_open_tickers):
 
         entry_price = row["SMA50"]
         adr10_pct = ((df["High"] / df["Low"] - 1) * 100).rolling(10).mean().iloc[-1]
+
+        # ADDED 2026-09-14: volatility ceiling -- see ADR_CEILING_PCT above.
+        if pd.isna(adr10_pct) or adr10_pct > ADR_CEILING_PCT:
+            continue
+
         risk_per_share = sim.compute_risk_per_share(entry_price, adr10_pct)
 
         signals.append({
