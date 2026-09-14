@@ -3052,3 +3052,169 @@ REMAINING, in rough order of value:
    in question.
 5. Phase 3: trade execution automation via the TradingView -> TradeStation
    bridge.
+
+
+---
+
+## Position Sizing: Two Constraints (2026-09-14)
+
+### The problem, found by accident
+
+Raised by Dave while reviewing which passing trades he had traded live.
+He had skipped DELL because its share price did not suit his position
+sizing. That prompted an inspection of `size_and_open_trades()`, which
+turned up a real hole.
+
+Sizing was computed from risk alone:
+
+    shares = int(dollar_risk_per_trade / risk_per_share)
+
+That is CORRECT as far as it goes, and worth stating plainly: because the
+rounding is downward, the 1% risk limit can never be breached, not even
+by a single share. Dave asked this directly and the answer is no -- there
+is no path by which a trade risks more than 1%.
+
+But risk is not the only thing a position consumes. Sizing off risk caps
+what a trade can LOSE while saying nothing about what it COSTS. When the
+stop is very tight, reaching the full 250 dollar risk budget requires an
+enormous number of shares, because each share only loses a few cents if
+the trade fails. The risk is fine. The capital committed is not.
+
+Worked example: FBP on 2026-09-02 had ADR10 of 1.60%, so risk per share
+was ~1.6% of entry, so the sizing maths returned a position costing about
+15,000 dollars -- 60% of a 25,000 dollar account, in one trade.
+
+Measured across the 1,023 passing trades (outliers excluded, n=1,001),
+position cost as a percentage of account:
+
+    median   21.8%
+    75th     31.0%
+    90th     41.0%
+    95th     46.3%
+    99th     60.1%
+    max      92.7%
+
+So this is not a rare tail case. A quarter of all trades tie up more than
+30% of the account.
+
+`check_capital_committed()` did flag over-commitment -- but only by
+PRINTING a warning after positions were already opened. It blocked
+nothing.
+
+### The key insight: a cost cap is not a cost
+
+Capping position cost lowers total return in backtest, and it is
+important to understand WHY, because the naive reading is wrong.
+
+Uncapped, the passing trades total ~579% account return over the sample.
+Capping position cost:
+
+    cap 15%: 395% total, binds on 79% of trades, avg risk 0.68% of account
+    cap 20%: 460% total, binds on 58% of trades, avg risk 0.81%
+    cap 25%: 502% total, binds on 40% of trades, avg risk 0.88%
+    cap 33%: 540% total, binds on 20% of trades, avg risk 0.95%
+    cap 50%: 572% total, binds on  4% of trades, avg risk 0.99%
+
+The shortfall is NOT lost edge. Return per dollar risked is unchanged --
+identical trades, identical R multiples. What falls is how much is risked
+per trade: the cap means the tight-stop names run out of capital before
+they reach the full 250 dollars of risk, so average risk per trade drops
+below 1%. The cap is a TRANSLATION, not a tax. If the old return number
+is wanted back, the lever is the risk percent, not removing the cap.
+
+Which leads to the actual reason to have one:
+
+**Without a cost cap, the number of positions the system can hold is
+decided by accident.** On a tight-stop day two trades commit the entire
+account and the third signal cannot be taken. The cap converts that into
+a deliberate choice -- 25% means four concurrent positions are always
+possible, 10% means ten. What is being bought is the ability to be
+diversified, and the price is slightly under a full 1% risk on the
+tightest-stop names.
+
+The cap should therefore be chosen on concurrency grounds, NOT by picking
+whichever number backtests highest. (Which would be no cap at all --
+i.e. maximum concentration.)
+
+### Rejected: flooring the stop distance
+
+The alternative considered was a minimum stop distance, e.g. never less
+than 2% of entry price. It fixes position cost as a side effect -- a
+wider stop means fewer shares -- and the argument for it was that a 1.6%
+stop sits inside the stock's daily noise, so you are stopped out by
+Tuesday rather than by the thesis failing. There was a plausible
+hypothesis that it would improve win rate.
+
+REJECTED, on Dave's argument, which the structure of the strategy
+supports: the whole edge here is a small stop producing a large R
+multiple. Artificially widening the stop to solve a sizing problem
+spends exactly the thing the system exists to capture. The trades that
+produce the big multiples are precisely the tight-stop ones. Better to
+commit less capital and keep the possibility of a large return on a
+small amount of capital.
+
+The hypothesis about win rate was never tested and is now moot. If it is
+ever revisited, note that it would have to beat the cost cap on
+risk-adjusted terms, not on raw return.
+
+### DECISION: both constraints, cost cap at 10%
+
+Adopted 2026-09-14. Share count is now the LESSER of:
+
+    shares_by_risk = int(1% of account / risk_per_share)
+    shares_by_cost = int(10% of account / entry_price)
+
+Both rounded down, so neither limit can be breached.
+
+The 10% figure comes from Dave's live practice, not from the backtest.
+He runs a maximum of ~10 concurrent positions: typically around five
+open with five resting orders, and since the resting orders rarely all
+fill, in practice more like seven open with a theoretical maximum of
+twelve. 10% of account per position matches that directly, and the
+arithmetic is coherent -- ten positions at 10% is a fully invested
+account carrying roughly 4.5% total risk.
+
+This is an experience-derived number that the analysis supports, which
+is a stronger basis than a backtest-optimised one.
+
+KNOWN AND ACCEPTED: at 10% cost and 1% risk, **the cost cap binds on
+100% of trades**. Average risk per trade lands near 0.45% of account, not
+1%. The risk rule is therefore DORMANT at current settings -- sizing is
+effectively a fixed 10% slice of capital, which is a different sizing
+philosophy from the one the code was written around.
+
+Dave's reasoning for keeping both anyway, which is sound: they express
+different things (how much goes in versus how much can be lost), they
+cost nothing to carry, and if max concurrent positions is ever revised
+to, say, 8, the risk rule is already sitting there to take over.
+
+To make the dormancy visible rather than hidden, `size_and_open_trades()`
+now records a `sizing_constraint` column on every position -- "risk",
+"cost", or "both" -- so a change in which limit governs can be seen at a
+glance.
+
+### Implementation notes
+
+In `orchestrator.py`:
+
+- New constant `MAX_POSITION_COST_PCT = 0.10`, with the rationale above
+  in comment form including the rejected stop-floor alternative.
+- `size_and_open_trades()` computes both share counts, takes the
+  minimum, and records which bound.
+- New `sizing_constraint` field in `OPEN_POSITIONS_COLUMNS` (and
+  therefore inherited by `CLOSED_TRADES_COLUMNS`).
+- Signals that size to ZERO shares -- where one share alone exceeds the
+  cost cap, i.e. a stock priced above 2,500 dollars on a 25,000 dollar
+  account -- are skipped with a printed reason rather than opened as a
+  zero-share row. This is the automated analogue of Dave passing on DELL.
+- The per-trade print now reports dollars committed, dollars actually at
+  risk, and the binding constraint.
+
+`check_capital_committed()` is left as-is. It is now largely redundant as
+a guard -- ten positions at 10% cannot exceed the account -- but remains
+useful as a reporting line.
+
+NOT YET DONE: `sim.py` and the staged backtest do not apply the cost cap.
+This is acceptable because the cap does not change R multiples, only the
+dollar weight behind them, and the backtest measures R. It WILL matter
+the moment portfolio-level dollar returns or compounding are modelled.
