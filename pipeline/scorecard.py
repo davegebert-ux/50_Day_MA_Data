@@ -596,12 +596,28 @@ def score_controlled_arrival(df, entry_date, min_window=6, lookback_search=30):
 # attribute could quietly drag down good trades inside an average in a way
 # a veto/floor would have caught.
 def score_total_v2(df, entry_date, spy_df):
+    """
+    UPDATED 2026-09-03: Trend Efficiency v2 DEMOTED out of the active MVP
+    score and moved to Phase 2 (see Architecture_and_Scope_v1.md, Stage 3).
+    Re-validated against the 253-event overhead-resistance-filtered
+    universe and found to have near-zero correlation with outcome (0.034),
+    confirmed not an artifact of that filter (0.011 on the original
+    unfiltered 456-event set either). Dropping it and averaging only MA
+    Respect + Relative Strength improved correlation with outcome from
+    0.186 to 0.238 and produced a cleanly negative bottom-half result
+    (-0.133R vs. previously +0.065R) - i.e. Trend Efficiency was diluting
+    signal, not just failing to add any. It is still computed and
+    returned below (as trend_efficiency_score) for visibility/logging,
+    but it is NO LONGER included in total_score_v2. Do not re-add it to
+    the average without revisiting the Phase 2 question first.
+    """
     te = score_trend_efficiency(df, entry_date)
     ma = score_ma_respect(df, entry_date)
     rs = score_relative_strength(df, spy_df, entry_date)
 
     te_score, ma_score, rs_score = te.get('score'), ma.get('score'), rs.get('score')
-    scores = {'trend_efficiency': te_score, 'ma_respect': ma_score, 'relative_strength': rs_score}
+    # Only MA Respect and Relative Strength count toward the MVP total.
+    scores = {'ma_respect': ma_score, 'relative_strength': rs_score}
     missing = [k for k, v in scores.items() if v is None]
 
     if missing:
@@ -613,7 +629,7 @@ def score_total_v2(df, entry_date, spy_df):
             'note': f"missing: {', '.join(missing)}",
         }
 
-    total = round((te_score + ma_score + rs_score) / 3, 2)
+    total = round((ma_score + rs_score) / 2, 2)
     return {
         'trend_efficiency_score': te_score,
         'ma_respect_score': ma_score,
