@@ -237,3 +237,153 @@ with an `lte` column added. Computed from the per-ticker daily CSVs by
 searching the entry date, taking the 252 prior closes, and dividing net
 change by summed absolute daily changes. No network or external data
 required.
+
+
+---
+
+## 2026-09-15 — Candidate selection when signals exceed capacity: NULL RESULT
+
+**Status: no predictive ranking key found. A non-predictive rule
+(least-correlated-first) was adopted in production as a stopgap. The
+underlying question remains OPEN.**
+
+### The question
+
+When there are more qualifying signals than there is capital to take
+them, which ones do you take? Before today the pipeline had no answer:
+`find_new_signals_for_date()` returns candidates in `sorted(glob(...))`
+order, so selection was ALPHABETICAL and capital ran out partway down
+the alphabet. Not neutral — it favours the same early-alphabet names
+every time.
+
+### How often this actually binds
+
+Measured over the passing-trade sample, 2024-09 to 2026-09:
+
+- Median signals per day: 2. 75th percentile: 3. Only ONE day in the
+  entire sample produced more than ten signals.
+- But with a ten-position limit, **50.5% of all qualifying signals had
+  to be turned away.**
+- Uncapped, the median number of concurrently open positions was 18,
+  with a peak of 46.
+
+So this is not a "too many signals today" problem, it is a "positions
+accumulate and the book stays full" problem. On a typical day the real
+question is *there is one slot free and two candidates*. Dave confirmed
+this matches what he sees live.
+
+Caveat: the sample screens the full ~1,591-ticker universe, wider than
+what would be watched in practice, so the 50.5% figure is an upper
+bound on how often it bites. The shape of the problem is unaffected.
+
+### What was tested, and how
+
+Each key was run as an ACTUAL RANKING RULE inside a ten-slot simulation
+over the passing-trade sample (n=1001, top/bottom 1% of R excluded),
+not merely as a quintile split — and compared against a random-pick
+baseline run over 30 seeds. Total R captured:
+
+| rule | total R |
+|---|---|
+| random baseline, 30 seeds | mean +296, range +259 .. +319 |
+| alphabetical (the incumbent) | +298 |
+| `total_score_v2`, highest first | +294 |
+| LTE, highest first | +272 |
+| pullback depth, shallowest first | +273 |
+| pullback speed / ADR, slowest first | +318 |
+| `overhead_R`, highest first | +312 |
+
+**Every rule fell inside the random baseline's own seed-to-seed range.
+None beat a coin flip.**
+
+### Why the quintile evidence was misleading
+
+Two keys looked genuinely promising on quintile analysis and still
+failed as ranking rules:
+
+- **Pullback depth** (new measure, built this session: % drawdown from
+  the 20-day high to the touch-day low). Q1 — the shallowest pullbacks —
+  averaged +1.002R at a 58.6% win rate against a +0.566R / 45.7% base,
+  and SURVIVED the top-10-ticker test at +0.266R. It also held across
+  the Sep-2025 out-of-sample split (in-sample 45.3% vs 37.4% win;
+  out-of-sample 60.3% vs 45.7% at a 10% threshold) — which is more than
+  LTE managed. But its rejected group still returned +0.629R out of
+  sample, so it does not earn a gate, and ranking on it captured LESS
+  total R than random.
+- **`overhead_R`** is humped, not monotonic — the middle quintiles rank
+  best and both extremes are poor. That is the signature of a gate,
+  which is how it is already used, not a ranking key.
+
+The lesson worth keeping: **a quintile edge does not survive contact
+with the actual constraint.** The constraint never asks "is this a good
+trade", it asks "is this better than the other candidate competing for
+this specific slot today". Those are different questions and the
+evidence for one is not evidence for the other.
+
+### Score specifically — the intuitive answer, and why it fails
+
+Ranking by score is the obvious move and it does not work. Above the
+2.5 gate the score does not grade:
+
+| score | n | expectancy | win rate |
+|---|---|---|---|
+| 2.5 | 252 | +0.434R | 42.9% |
+| 3.0 | 290 | +0.745R | 47.2% |
+| 3.5 | 231 | +0.316R | 43.7% |
+| 4.0 | 177 | +0.919R | 52.0% |
+| 4.5 | 48 | +0.304R | 47.9% |
+| 5.0 | 3 | +1.000R | 33.3% |
+
+That zigzag is noise, not a gradient. Correlation between score and
+realized R is **0.022**. There is also very little spread to rank with:
+over half of all passing trades score 3.0 or below, and only 3 trades
+in the entire sample ever scored 5.0.
+
+**The score is a good gate and a bad ranking key.** Those are different
+jobs and it currently only does the first one.
+
+### What was adopted, and on what grounds
+
+**Least-correlated-first**: prefer the candidate whose trailing 120-day
+daily returns are least correlated with the positions already open,
+chosen greedily so that simultaneous candidates are also decorrelated
+from each other.
+
+It captured +314R against the random mean of +296R — but +314 **still
+sits inside random's range**, so this is explicitly NOT a claim of
+edge and must not be cited as one later. It was adopted because:
+
+1. **It is deterministic.** All 15 seeds returned exactly +314R; the
+   correlation sort overrides the random tiebreak completely. Random
+   picking swings +259R to +319R on the same rules and the same data,
+   a 23% spread in outcome from nothing but luck of the draw.
+   Eliminating that is worth having by itself.
+2. **It prevents accidental concentration.** Mean pairwise correlation
+   across the 363 tickers in the sample is 0.168, so there is real
+   spread to exploit, and nothing else in the pipeline currently looks
+   at concentration at all.
+3. It is strictly better than the incumbent, which was alphabetical.
+
+### Re-test trigger / path out
+
+The honest summary is that **no tested attribute predicts which of two
+simultaneous candidates does better.** The expected resolution is not a
+better ranking key bolted on the side, but a scoring model that
+actually separates winners — at which point ranking by score becomes
+correct and `rank_signals()` should be reconsidered or retired.
+
+Re-test when either: (a) the scoring model is revised such that
+score-vs-R correlation rises meaningfully above 0.022, or (b) a
+per-ticker funnel log accumulates enough live data to re-run this
+comparison on out-of-sample production signals rather than backtest
+reconstruction.
+
+### Also produced, reusable
+
+`pullback_shape.csv` — for 1,009 passing trades: `pb_days` (trading
+days from the 20-day high to the touch), `pb_depth` (% drawdown over
+that span), `pb_speed` (depth per day) and `pb_speed_adr` (speed
+normalised by ADR10). Typical pullback: 11 days, ~14% deep. None of
+these are used in production; the shallow-pullback result above is the
+most promising unpromoted lead in the file and is the natural thing to
+revisit if the judgement gap is attacked again.
