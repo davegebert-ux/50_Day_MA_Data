@@ -332,143 +332,97 @@ def find_new_signals_for_date(target_date, already_open_tickers):
 
 
 # ============================================================
-# STEP 3b: RANK CANDIDATES WHEN THERE ARE MORE SIGNALS THAN SLOTS
+# STEP 3b: ORDER CANDIDATES WHEN THERE ARE MORE SIGNALS THAN SLOTS
 # ============================================================
-# ADDED 2026-09-15.
+# ADDED 2026-09-15. REVISED SAME DAY -- read the whole comment before
+# changing this, including the part about what was wrong the first time.
 #
 # THE PROBLEM. Signals routinely outnumber the capital available to take
-# them. Measured over the 2024-09 to 2026-09 sample: a ten-position limit
-# would have turned away 50.5% of all qualifying signals. Note this is NOT
-# a "too many signals today" problem -- the median signal day produces only
-# two candidates, and only one day in the whole sample produced more than
-# ten. The constraint binds because open positions ACCUMULATE: uncapped,
-# the median number of concurrently open positions was 18 and the peak 46.
-# So on most days the question is not "which three of ten" but "there is
-# one slot free and two candidates".
+# them. Over the 2024-09 to 2026-09 sample, a ten-position limit would
+# have turned away roughly half of all qualifying signals. This is NOT a
+# "too many signals today" problem -- the median signal day produces two
+# candidates and only one day in two years produced more than ten. It
+# binds because open positions ACCUMULATE: uncapped, the median number of
+# concurrent positions was 17-18 and the peak 46. On a typical day the
+# real question is "one slot free, two candidates".
 #
-# Until today the answer was accidental: find_new_signals_for_date() walks
-# the data directory via sorted(glob(...)), so candidates arrived in
-# ALPHABETICAL order and capital simply ran out partway down the alphabet.
-# That is not neutral -- it systematically favours early-alphabet tickers,
-# and favours the SAME ones every time.
+# WHAT WAS TESTED AND REJECTED. Every one of these was run as an actual
+# ranking key inside a ten-slot portfolio replay (n=1001, outliers
+# excluded), compared against a random-pick baseline over 30 seeds:
+# total_score_v2 highest-first, LTE highest-first, pullback depth
+# shallowest-first, pullback speed/ADR slowest-first, overhead_R
+# highest-first, and alphabetical. EVERY ONE landed inside the random
+# baseline's own seed-to-seed range. None beat a coin flip.
 #
-# WHAT WAS TESTED AND REJECTED. Each rule below was run as an actual
-# ranking key inside a ten-slot simulation over the passing-trade sample
-# (n=1001, outliers excluded), and compared against a random-pick baseline
-# run over 30 seeds. Total R captured:
+# Score deserves a specific note because ranking on it is the intuitive
+# answer. Above the 2.5 gate the score does not grade: expectancy by
+# score value runs 2.5 -> +0.434R, 3.0 -> +0.745R, 3.5 -> +0.316R,
+# 4.0 -> +0.919R, 4.5 -> +0.304R. That is noise, not a gradient.
+# Correlation between score and realized R is 0.022. There is also very
+# little spread to rank WITH: over half of all passing trades score 3.0
+# or below and only 3 trades ever scored 5.0. The score is a good GATE
+# and a bad RANKING KEY, and those are different jobs.
 #
-#     random baseline (30 seeds)     mean +296   range +259 .. +319
-#     alphabetical (what we had)          +298
-#     total_score_v2, highest first       +294
-#     LTE, highest first                  +272
-#     pullback depth, shallowest first    +273
-#     pullback speed/ADR, slowest first   +318
-#     overhead_R, highest first           +312
+# LEAST-CORRELATED-FIRST WAS ADOPTED AND THEN REVERTED, SAME DAY.
+# The first version of this function preferred whichever candidate was
+# least correlated with the existing book. It was written up as capturing
+# +314R against a random mean of +296R, and as being deterministic
+# (15 seeds, all exactly +314R). BOTH CLAIMS WERE ARTIFACTS OF A BAD
+# TEST: the correlation matrix behind them was computed over the FULL
+# two-year sample, so every decision was made using data from after the
+# decision date. Re-run point-in-time (trailing 120 days as of the
+# decision, which is what any honest implementation must use):
+#   - total R across 5 candidate-arrival orders: 279, 290, 312, 321, 345.
+#     Mean ~309, inside the random range, and NOT deterministic -- the
+#     spread comes purely from arrival order.
+#   - mean pairwise correlation of the held book: 0.252, against 0.253
+#     for random picking and 0.258 for alphabetical. It did not even
+#     deliver the diversification it was adopted for.
+# The reason is structural: with a median of two candidates a day, there
+# is almost no choice available to exercise. You cannot diversify a book
+# by picking one name out of two.
 #
-# EVERY rule landed inside the random baseline's own seed-to-seed range.
-# None of them beat picking at random. This held even for keys that looked
-# strong in quintile analysis -- shallow pullbacks (Q1 depth) average
-# +1.00R vs +0.57R base and survive the top-10-ticker test, yet ranking on
-# depth captured LESS total R than a coin flip. A quintile edge does not
-# survive contact with the actual constraint, because the constraint does
-# not ask "is this a good trade", it asks "is this better than the other
-# candidate competing for the same slot today".
+# WHAT THIS DOES NOW. A date-seeded shuffle. Selection is arbitrary --
+# nothing tested beats arbitrary -- but it is arbitrary WITHOUT BIAS,
+# which alphabetical is not. sorted(glob(...)) hands back candidates in
+# alphabetical order, so early-alphabet tickers get first refusal on
+# every constrained day, permanently. If one of them is a chronic
+# underperformer the account keeps buying it and keeps skipping the names
+# further down. Seeding on the date keeps runs reproducible and replays
+# of missed days identical, while giving every ticker the same long-run
+# chance of being reached.
 #
-# Score deserves a specific note, since ranking on it is the intuitive
-# answer. Above the 2.5 gate the score does not grade: expectancy by score
-# value runs 2.5 -> +0.434R, 3.0 -> +0.745R, 3.5 -> +0.316R, 4.0 -> +0.919R,
-# 4.5 -> +0.304R. That is noise, not a gradient. Correlation between score
-# and realized R is 0.022. There is also very little spread to rank WITH:
-# over half of all passing trades score 3.0 or below and only 3 trades in
-# the entire sample ever scored 5.0. The score is a good gate and a bad
-# ranking key, and those are different jobs.
-#
-# WHAT WAS ADOPTED, AND ON WHAT GROUNDS. Least-correlated-first: prefer the
-# candidate whose daily returns are least correlated with the positions
-# already open. In the same simulation it captured +314R versus the random
-# mean of +296R -- but +314 still sits inside random's range, so this is
-# NOT a claim of edge and must not be written up as one. It is adopted for
-# two other reasons:
-#   1. It is DETERMINISTIC. The 15 seeds tested all returned exactly +314R,
-#      because the correlation sort overrides the random tiebreak entirely.
-#      Random picking swings from +259R to +319R depending on the draw --
-#      same rules, same data, a 23% spread in outcome purely from luck of
-#      the ordering. Removing that variance is worth having on its own.
-#   2. It stops the account accidentally holding ten expressions of one
-#      trade. Mean pairwise correlation across the 363 tickers in the
-#      sample is only 0.168, so there is real spread available to use, and
-#      nothing else in the pipeline is currently looking at concentration.
-#
-# THIS IS A STOPGAP AND SHOULD BE REVISITED. The honest summary is that no
-# tested attribute predicts which of two simultaneous candidates does
-# better. The expected path out is not a better ranking key bolted on the
-# side, but a scoring model that actually separates winners -- at which
-# point ranking by score becomes correct and this function should be
-# reconsidered. Full write-up of the null result is in
-# General_Research_Findings.md on the historical_backtest_research branch.
-
-RANK_CORR_LOOKBACK_DAYS = 120   # trading days of returns used for correlation
+# THIS IS A STOPGAP. The honest position is that no tested attribute
+# predicts which of two simultaneous candidates does better. The expected
+# path out is not a cleverer tiebreak but a scoring model that actually
+# separates winners, at which point ranking by score becomes correct and
+# this function should be retired. Full write-up, including the corrected
+# numbers above, is in General_Research_Findings.md on the
+# historical_backtest_research branch.
 
 
-def _daily_returns(ticker, target_date, lookback=RANK_CORR_LOOKBACK_DAYS):
-    """Trailing daily close-to-close returns for one ticker, ending on
-    target_date. Returns None if the file or the history is not there."""
-    fpath = os.path.join(DATA_DIR, f"{ticker}_1d_data.csv")
-    if not os.path.exists(fpath):
-        return None
-    df = sim.load_ticker(fpath)
-    df = df[df["Date"] <= pd.Timestamp(target_date)]
-    if len(df) < lookback + 1:
-        return None
-    return df["Close"].tail(lookback + 1).pct_change().dropna().to_numpy()
+def order_candidates(signals, target_date):
+    """Shuffle the day's candidates deterministically, seeded on the date.
 
+    Same date always produces the same order, so a replayed missed day
+    behaves identically to a live one. Different dates produce unrelated
+    orders, so no ticker holds a standing advantage.
 
-def rank_signals(signals, open_df, target_date):
-    """Order signals least-correlated-first against currently open positions.
-
-    Greedy and sequential: the least-correlated candidate is chosen, then
-    treated as held so the next choice accounts for it too. This matters
-    when several candidates arrive together -- ranking them all against
-    only the EXISTING book would happily hand back three names that are
-    highly correlated with each other.
-
-    With no open positions and no prior picks there is nothing to be
-    decorrelated from, so the first pick falls back to the order given.
-    Tickers with missing or short history sort last rather than erroring.
+    This is NOT a ranking function and must not be dressed up as one. If
+    something is ever found that genuinely predicts which candidate to
+    prefer, it replaces this outright -- and it has to clear the bar the
+    least-correlated rule failed: tested point-in-time, inside the slot
+    limit, against a random baseline's full seed range.
     """
     if len(signals) <= 1:
-        return signals
+        return list(signals)
 
-    held = list(open_df["ticker"]) if len(open_df) else []
-    returns = {}
-    for t in held + [s["ticker"] for s in signals]:
-        if t not in returns:
-            returns[t] = _daily_returns(t, target_date)
+    d = pd.Timestamp(target_date)
+    seed = d.year * 10000 + d.month * 100 + d.day
+    rng = np.random.RandomState(seed)
 
-    def mean_corr(ticker, against):
-        a = returns.get(ticker)
-        if a is None or not against:
-            return 0.0
-        vals = []
-        for h in against:
-            b = returns.get(h)
-            if b is None or len(b) != len(a):
-                continue
-            if a.std() == 0 or b.std() == 0:
-                continue
-            vals.append(float(np.corrcoef(a, b)[0, 1]))
-        return float(np.mean(vals)) if vals else 0.0
-
-    remaining = list(signals)
-    ordered = []
-    reference = list(held)
-    while remaining:
-        # Missing history -> sort last, so it is taken only if slots remain.
-        remaining.sort(key=lambda s: (returns.get(s["ticker"]) is None,
-                                      mean_corr(s["ticker"], reference)))
-        pick = remaining.pop(0)
-        ordered.append(pick)
-        reference.append(pick["ticker"])
+    ordered = list(signals)
+    rng.shuffle(ordered)
     return ordered
 
 
@@ -562,10 +516,11 @@ def process_single_day(target_date):
     already_open_tickers = set(open_df["ticker"]) if len(open_df) else set()
     signals = find_new_signals_for_date(target_date, already_open_tickers)
 
-    # ADDED 2026-09-15: order candidates before sizing, so that when capital
-    # runs out it runs out on the LEAST useful candidates rather than on
-    # whichever ones happen to sit late in the alphabet. See rank_signals().
-    signals = rank_signals(signals, open_df, target_date)
+    # ADDED 2026-09-15: order candidates before sizing. Nothing tested
+    # predicts which candidate to prefer, so this is a date-seeded
+    # shuffle -- arbitrary, but without alphabetical's standing bias
+    # toward early-alphabet tickers. See order_candidates().
+    signals = order_candidates(signals, target_date)
 
     open_df = size_and_open_trades(signals, open_df)
 
