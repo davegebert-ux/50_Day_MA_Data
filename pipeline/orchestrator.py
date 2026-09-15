@@ -113,6 +113,43 @@ OVERHEAD_PROXIMITY_R = 0.5
 # is what makes a large R multiple possible -- so it was ruled out.
 MAX_POSITION_COST_PCT = 0.10
 
+# ADDED 2026-09-15: per-ticker daily funnel log. Append-only record of what
+# the pipeline did to EVERY ticker it looked at each day, not just the ones
+# that became signals. Written because the counts alone ("1,591 scanned, 2
+# signals") do not let you spot-check a name you expected to see and find
+# out why it was cut. Deliberately a persistent file to look back through,
+# NOT a line in the daily email.
+#
+# The gate names in dropped_at are the production gate ORDER, and must stay
+# in sync with find_new_signals_for_date(). A ticker gets exactly one row
+# per day, stamped with the FIRST gate it failed; tickers that pass every
+# gate get dropped_at empty and a disposition recording what then happened
+# to the signal -- including "skipped_no_capital", which is invisible
+# anywhere else in the system today and is exactly the raw material any
+# future work on candidate selection needs.
+FUNNEL_LOG_PATH = os.path.join(_STATE_DIR, "daily_funnel.csv")
+
+FUNNEL_COLUMNS = [
+    "run_date", "ticker", "dropped_at", "disposition",
+    "entry_price", "risk_per_share", "adr10_pct", "overhead_R",
+    "score", "shares", "position_cost", "sizing_constraint",
+]
+
+# Gate labels, in production order. "passed" is not a gate -- it means the
+# ticker survived all of them.
+FUNNEL_GATES = [
+    "already_open",         # dedup: ticker already in an open trade
+    "no_data_for_date",
+    "insufficient_history",
+    "momentum_screen",
+    "no_50ma_touch",
+    "adr_ceiling",
+    "bad_risk_per_share",
+    "overhead_resistance",
+    "no_spy_data",
+    "score_below_threshold",
+]
+
 OPEN_POSITIONS_COLUMNS = [
     "ticker", "entry_date", "entry_price", "risk_per_share",
     "score_at_entry", "shares", "position_cost",
@@ -127,6 +164,54 @@ OPEN_POSITIONS_COLUMNS = [
 CLOSED_TRADES_COLUMNS = OPEN_POSITIONS_COLUMNS + [
     "exit_date", "exit_reason", "exit_price", "realized_R", "realized_pnl",
 ]
+
+
+
+# ============================================================
+# DAILY FUNNEL LOG (append-only, one row per ticker per day)
+# ============================================================
+def append_funnel_rows(rows):
+    """Append funnel rows for one processed day.
+
+    Append-only and never rewritten, same discipline as closed_trades.csv.
+    A replayed missed day appends its rows exactly as a live day would, so
+    the file is complete regardless of whether the automation ran on time.
+
+    Re-processing a date that is already in the file WILL duplicate it --
+    the orchestrator's last-run-date guard is what prevents that, and this
+    function deliberately does not second-guess it. If a date ever needs
+    reprocessing, drop its rows first.
+    """
+    if not rows:
+        return
+    df = pd.DataFrame(rows, columns=FUNNEL_COLUMNS)
+    header = not os.path.exists(FUNNEL_LOG_PATH)
+    df.to_csv(FUNNEL_LOG_PATH, mode="a", header=header, index=False)
+    print(f"  Funnel log: appended {len(df)} rows to {FUNNEL_LOG_PATH}")
+
+
+def funnel_row(run_date, ticker, dropped_at=None, disposition="", **fields):
+    """Build one funnel row, leaving unknown fields empty.
+
+    Fields are filled in progressively as a ticker survives gates, so a
+    ticker cut at the momentum screen has no entry_price and a ticker cut
+    at scoring has everything except shares.
+    """
+    row = {c: "" for c in FUNNEL_COLUMNS}
+    row["run_date"] = pd.Timestamp(run_date).date().isoformat()
+    row["ticker"] = ticker
+    row["dropped_at"] = dropped_at if dropped_at else ""
+    row["disposition"] = disposition
+    for k, v in fields.items():
+        if k in row and v is not None:
+            row[k] = v
+    return row
+
+def _log(funnel_rows, run_date, ticker, dropped_at=None, disposition="", **fields):
+    """Append a funnel row if logging is enabled. No-op when it isn't."""
+    if funnel_rows is None:
+        return
+    funnel_rows.append(funnel_row(run_date, ticker, dropped_at, disposition, **fields))
 
 
 # ============================================================
@@ -225,7 +310,7 @@ def check_open_positions_for_exits(open_df, target_date):
 # (touch-scan + momentum-screen + overhead-resistance + scorecard,
 #  restricted to a SINGLE target date -- not a full-history scan)
 # ============================================================
-def find_new_signals_for_date(target_date, already_open_tickers):
+def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=None):
     """
     Evaluates ONLY target_date as a possible touch event per ticker (still
     loading whatever trailing history is needed to compute the moving
@@ -252,13 +337,19 @@ def find_new_signals_for_date(target_date, already_open_tickers):
     for fpath in files:
         ticker = os.path.basename(fpath).replace("_1d_data.csv", "")
         if ticker in already_open_tickers:
-            continue  # dedup rule -- don't re-signal a ticker already in a trade
+            # dedup rule -- don't re-signal a ticker already in a trade
+            _log(funnel_rows, target_date, ticker, "already_open")
+            continue
 
         df = sim.load_ticker(fpath)
         if target_date not in set(df["Date"]):
-            continue  # ticker didn't trade / no data for this date
+            # ticker didn't trade / no data for this date
+            _log(funnel_rows, target_date, ticker, "no_data_for_date")
+            continue
         if len(df[df["Date"] <= target_date]) < 260:
-            continue  # insufficient history, same floor as the historical scan
+            # insufficient history, same floor as the historical scan
+            _log(funnel_rows, target_date, ticker, "insufficient_history")
+            continue
 
         df = df[df["Date"] <= target_date].reset_index(drop=True)
         df["SMA50"] = df["Close"].rolling(50).mean()
@@ -276,10 +367,12 @@ def find_new_signals_for_date(target_date, already_open_tickers):
         # fix reached the backtest on 2026-09-11 but not production until
         # 2026-09-14. The screen now lives in exactly one place.
         if not passes_momentum_screen(row):
+            _log(funnel_rows, target_date, ticker, "momentum_screen")
             continue
 
         touched = touched_50ma(row)
         if not touched:
+            _log(funnel_rows, target_date, ticker, "no_50ma_touch")
             continue
 
         # REORDERED 2026-09-14: entry price, ADR and risk-per-share are now
@@ -294,10 +387,16 @@ def find_new_signals_for_date(target_date, already_open_tickers):
 
         # ADDED 2026-09-14: volatility ceiling -- see ADR_CEILING_PCT above.
         if pd.isna(adr10_pct) or adr10_pct > ADR_CEILING_PCT:
+            _log(funnel_rows, target_date, ticker, "adr_ceiling",
+                 entry_price=round(float(entry_price), 4),
+                 adr10_pct=None if pd.isna(adr10_pct) else round(float(adr10_pct), 4))
             continue
 
         risk_per_share = sim.compute_risk_per_share(entry_price, adr10_pct)
         if risk_per_share <= 0:
+            _log(funnel_rows, target_date, ticker, "bad_risk_per_share",
+                 entry_price=round(float(entry_price), 4),
+                 adr10_pct=round(float(adr10_pct), 4))
             continue
 
         # Overhead-resistance pre-watchlist screen (v3, proximity-based:
@@ -310,14 +409,29 @@ def find_new_signals_for_date(target_date, already_open_tickers):
             proximity_R=OVERHEAD_PROXIMITY_R,
         )
         if or_result is None or or_result["verdict"] == "EXCLUDE":
+            _log(funnel_rows, target_date, ticker, "overhead_resistance",
+                 entry_price=round(float(entry_price), 4),
+                 risk_per_share=round(float(risk_per_share), 4),
+                 adr10_pct=round(float(adr10_pct), 4),
+                 overhead_R=None if or_result is None else or_result.get("overhead_R"))
             continue
 
         # Score
         if spy_df is None:
+            _log(funnel_rows, target_date, ticker, "no_spy_data",
+                 entry_price=round(float(entry_price), 4),
+                 risk_per_share=round(float(risk_per_share), 4),
+                 adr10_pct=round(float(adr10_pct), 4))
             continue
         score_result = scorecard.score_total_v2(df, target_date, spy_df)
         total_score = score_result.get("total_score_v2")
         if total_score is None or total_score < SKIP_SCORE_THRESHOLD:
+            _log(funnel_rows, target_date, ticker, "score_below_threshold",
+                 entry_price=round(float(entry_price), 4),
+                 risk_per_share=round(float(risk_per_share), 4),
+                 adr10_pct=round(float(adr10_pct), 4),
+                 overhead_R=or_result.get("overhead_R"),
+                 score=total_score)
             continue
 
         signals.append({
@@ -326,6 +440,9 @@ def find_new_signals_for_date(target_date, already_open_tickers):
             "entry_price": round(float(entry_price), 4),
             "risk_per_share": round(float(risk_per_share), 4),
             "score_at_entry": total_score,
+            # carried for the funnel log only -- not used in sizing
+            "adr10_pct": round(float(adr10_pct), 4),
+            "overhead_R": or_result.get("overhead_R"),
         })
 
     return signals
@@ -429,7 +546,7 @@ def order_candidates(signals, target_date):
 # ============================================================
 # STEP 4: OPEN NEW TRADES (dollar sizing off the STATIC account balance)
 # ============================================================
-def size_and_open_trades(signals, open_df):
+def size_and_open_trades(signals, open_df, funnel_rows=None, target_date=None):
     """Size each signal under BOTH constraints and open the position.
 
     Two independent limits, added 2026-09-14 (see MAX_POSITION_COST_PCT):
@@ -446,6 +563,16 @@ def size_and_open_trades(signals, open_df):
     """
     dollar_risk_per_trade = parameters.ACCOUNT_STARTING_BALANCE * parameters.RISK_PERCENT_PER_TRADE
     max_position_cost = parameters.ACCOUNT_STARTING_BALANCE * MAX_POSITION_COST_PCT
+
+    # ADDED 2026-09-15: capital available for NEW positions today, so a
+    # signal that cannot be funded is recorded as skipped rather than
+    # silently opened. Before this, sizing never consulted the account at
+    # all -- check_capital_committed() only printed a warning AFTER the
+    # fact, so the system could and did open positions it had no money
+    # for. The funnel log made that visible, which is the point of it.
+    committed = open_df["position_cost"].sum() if len(open_df) else 0.0
+    capital_available = parameters.ACCOUNT_STARTING_BALANCE - committed
+
     new_rows = []
     for sig in signals:
         shares_by_risk = int(dollar_risk_per_trade / sig["risk_per_share"]) if sig["risk_per_share"] > 0 else 0
@@ -467,6 +594,22 @@ def size_and_open_trades(signals, open_df):
         if shares <= 0:
             print(f"  SKIPPED {sig['ticker']}: sizes to 0 shares "
                   f"(entry {sig['entry_price']:.2f} vs cost cap {max_position_cost:.2f})")
+            _log(funnel_rows, target_date, sig["ticker"], None, "skipped_zero_shares",
+                 entry_price=sig["entry_price"], risk_per_share=sig["risk_per_share"],
+                 adr10_pct=sig.get("adr10_pct"), overhead_R=sig.get("overhead_R"),
+                 score=sig["score_at_entry"])
+            continue
+
+        position_cost_check = shares * sig["entry_price"]
+        if position_cost_check > capital_available:
+            print(f"  SKIPPED {sig['ticker']}: needs {position_cost_check:.2f} dollars, "
+                  f"only {capital_available:.2f} available")
+            _log(funnel_rows, target_date, sig["ticker"], None, "skipped_no_capital",
+                 entry_price=sig["entry_price"], risk_per_share=sig["risk_per_share"],
+                 adr10_pct=sig.get("adr10_pct"), overhead_R=sig.get("overhead_R"),
+                 score=sig["score_at_entry"], shares=shares,
+                 position_cost=round(position_cost_check, 2),
+                 sizing_constraint=constraint)
             continue
 
         position_cost = round(shares * sig["entry_price"], 2)
@@ -481,9 +624,15 @@ def size_and_open_trades(signals, open_df):
             "position_cost": position_cost,
             "sizing_constraint": constraint,
         })
+        capital_available -= position_cost
         print(f"  OPENED {sig['ticker']}: score {sig['score_at_entry']}, "
               f"{shares} shares, {position_cost:.2f} dollars committed, "
               f"{actual_risk:.2f} dollars at risk (limited by {constraint})")
+        _log(funnel_rows, target_date, sig["ticker"], None, "opened",
+             entry_price=sig["entry_price"], risk_per_share=sig["risk_per_share"],
+             adr10_pct=sig.get("adr10_pct"), overhead_R=sig.get("overhead_R"),
+             score=sig["score_at_entry"], shares=shares,
+             position_cost=position_cost, sizing_constraint=constraint)
 
     if new_rows:
         new_df = pd.DataFrame(new_rows, columns=OPEN_POSITIONS_COLUMNS)
@@ -514,7 +663,13 @@ def process_single_day(target_date):
     open_df = check_open_positions_for_exits(open_df, target_date)
 
     already_open_tickers = set(open_df["ticker"]) if len(open_df) else set()
-    signals = find_new_signals_for_date(target_date, already_open_tickers)
+
+    # ADDED 2026-09-15: collected across the whole day and written once at
+    # the end, so a crash midway leaves no half-day of rows in the log.
+    funnel_rows = []
+
+    signals = find_new_signals_for_date(target_date, already_open_tickers,
+                                        funnel_rows=funnel_rows)
 
     # ADDED 2026-09-15: order candidates before sizing. Nothing tested
     # predicts which candidate to prefer, so this is a date-seeded
@@ -522,10 +677,13 @@ def process_single_day(target_date):
     # toward early-alphabet tickers. See order_candidates().
     signals = order_candidates(signals, target_date)
 
-    open_df = size_and_open_trades(signals, open_df)
+    open_df = size_and_open_trades(signals, open_df,
+                                   funnel_rows=funnel_rows,
+                                   target_date=target_date)
 
     save_open_positions(open_df)
     check_capital_committed(open_df)
+    append_funnel_rows(funnel_rows)
     set_last_run_date(target_date)
 
     # TEMP DEBUG (2026-09-09): tracing down a mystery where the orchestrator
