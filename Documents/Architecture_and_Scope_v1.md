@@ -3483,3 +3483,92 @@ it cannot affect these numbers. This is the natural place to add both
 when portfolio dollar returns are taken on, and it is the standing
 answer to the known gap that the staged backtest does not understand
 position limits.
+
+
+---
+
+## Daily Per-Ticker Funnel Log (2026-09-15)
+
+Closes the open item logged 2026-09-14.
+
+### What it is
+
+An append-only record of what the pipeline did to **every ticker it
+looked at, every day** -- not just the ones that became signals. Written
+to `state/daily_funnel.csv`, alongside `open_positions.csv` and
+`closed_trades.csv`, and committed by the daily workflow like the other
+state files.
+
+Counts alone ("1,591 scanned, 2 signals") do not let you spot-check a
+name you expected to see and find out why it was cut. This does. It is
+deliberately a persistent file to look back through, NOT a line in the
+daily email.
+
+### Columns
+
+`run_date`, `ticker`, `dropped_at`, `disposition`, `entry_price`,
+`risk_per_share`, `adr10_pct`, `overhead_R`, `score`, `shares`,
+`position_cost`, `sizing_constraint`.
+
+Fields fill in progressively as a ticker survives gates -- a ticker cut
+at the momentum screen has no entry price; one cut at scoring has
+everything except share count.
+
+### dropped_at -- the first gate the ticker failed
+
+In production order: `already_open`, `no_data_for_date`,
+`insufficient_history`, `momentum_screen`, `no_50ma_touch`,
+`adr_ceiling`, `bad_risk_per_share`, `overhead_resistance`,
+`no_spy_data`, `score_below_threshold`. One row per ticker per day,
+stamped with the FIRST gate it failed. Empty means it passed everything.
+
+**These labels must stay in sync with `find_new_signals_for_date()`.**
+The logging calls sit at the same points as the `continue` statements;
+if a gate is added or reordered, its label moves with it or the log
+silently misattributes drops.
+
+### disposition -- what then happened to a signal that passed
+
+`opened`, `skipped_zero_shares` (one share would exceed the cost cap),
+or **`skipped_no_capital`**. That last one did not previously exist
+anywhere in the system and is the point of the exercise: it is the
+record of signals the pipeline qualified but could not fund, and it is
+the raw material any future work on candidate selection needs.
+
+### A bug this immediately exposed
+
+Sizing never consulted the account balance at all.
+`check_capital_committed()` only printed a warning AFTER positions were
+opened, so the orchestrator could and did open positions it had no money
+for. `size_and_open_trades()` now tracks capital available for new
+positions and records unfunded signals as `skipped_no_capital` rather
+than opening them. Building the log found this on the first real test
+day, which is a fair argument for the log itself.
+
+### What it looks like in practice
+
+Test run, 2026-03-09, 169-ticker subset: 132 cut at the momentum screen,
+8 at no touch, 5 below the score threshold, 2 at overhead resistance, 3
+each for missing data and insufficient history -- and 16 passed. Of
+those 16, ten were funded and six were recorded `skipped_no_capital`.
+Live, expect ~1,591 rows per day.
+
+Note what that day shows: IAUX and TROX were skipped at score 3.5 while
+STX, CAT, AMAT and HSBC were funded at 2.5, purely because of arbitrary
+candidate ordering. That is the selection problem made visible -- though
+see the candidate-selection section above, which establishes that score
+does not predict outcome, so it is not necessarily a loss.
+
+### How to read it
+
+It is committed to the repo, so GitHub renders it as a sortable table in
+the browser at `state/daily_funnel.csv` -- no tooling needed. Or use
+Download and open it in Excel to filter by ticker or by `dropped_at`.
+
+### Deliberately not done
+
+Rows are collected across the whole day and written once at the end, so
+a crash midway leaves no half-day in the file. Re-processing a date
+already in the log WILL duplicate it -- the last-run-date guard is what
+prevents that, and `append_funnel_rows()` does not second-guess it. If a
+date needs reprocessing, drop its rows first.
