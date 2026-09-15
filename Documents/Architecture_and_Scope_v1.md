@@ -3354,3 +3354,90 @@ Currently recorded there:
 The judgement-gap open item therefore remains OPEN. LTE is the best
 lead on it so far, and the reason it did not close the item is written
 down in full.
+
+
+---
+
+## Candidate Selection When Signals Exceed Capacity (2026-09-15)
+
+### Status: RESOLVED in code, UNRESOLVED in substance
+
+The open item logged on 2026-09-14 -- "if you can only take three
+positions but have ten candidates, which three?" -- has been worked and
+has a production answer, but the answer is deliberately NOT a
+predictive one. Read this before attempting it again.
+
+### How often the constraint actually binds
+
+Measured over the passing-trade sample (2024-09 to 2026-09):
+
+- Median signals per day is 2; the 75th percentile is 3; only ONE day
+  in two years produced more than ten signals.
+- Yet a ten-position limit would have turned away **50.5% of all
+  qualifying signals.**
+- Uncapped, the median number of concurrently open positions was 18,
+  peaking at 46.
+
+The constraint does not bind because too many signals arrive at once.
+It binds because positions ACCUMULATE and the book stays full. On a
+typical day the real question is "one slot free, two candidates", not
+"three slots, ten candidates". Dave confirmed this matches live
+experience. (The sample screens the full ~1,591-ticker universe, wider
+than would be watched in practice, so 50.5% is an upper bound.)
+
+### Production rule adopted: least-correlated-first
+
+`rank_signals()` in `orchestrator.py` orders candidates by lowest mean
+correlation of trailing 120-day daily returns against the positions
+already open, greedily, so that candidates arriving together are also
+decorrelated from each other. It is called in `process_single_day()`
+immediately before `size_and_open_trades()`, so that when capital runs
+out it runs out on the least useful candidates.
+
+**This rule is not claimed to have predictive edge and must not be
+cited as if it does.** It captured +314R in a ten-slot simulation
+against a random-pick mean of +296R, which is inside random's own
+seed-to-seed range of +259R to +319R. It was adopted because it is
+DETERMINISTIC (all 15 seeds gave exactly +314R, where random picking
+swings 23% on luck of the draw alone), because it prevents the account
+holding ten expressions of the same trade, and because the incumbent
+was ALPHABETICAL ordering from `sorted(glob(...))` -- which is not
+neutral, it favours the same early-alphabet names every time.
+
+### What was tested as a ranking key and REJECTED
+
+Run as actual ranking rules inside the ten-slot simulation, not just as
+quintile splits: `total_score_v2` highest-first (+294R), LTE
+highest-first (+272R), pullback depth shallowest-first (+273R),
+pullback speed/ADR slowest-first (+318R), `overhead_R` highest-first
+(+312R), alphabetical (+298R). **Every one fell inside the random
+baseline's range. None beat a coin flip.**
+
+Ranking by SCORE is the intuitive answer and specifically does not
+work. Above the 2.5 gate the score does not grade -- expectancy by
+score value runs 2.5 -> +0.434R, 3.0 -> +0.745R, 3.5 -> +0.316R,
+4.0 -> +0.919R, 4.5 -> +0.304R. Correlation between score and realized
+R is 0.022. Over half of all passing trades score 3.0 or below and only
+3 trades ever scored 5.0, so there is barely any spread to rank with.
+The score is a good GATE and a bad RANKING KEY; those are different
+jobs.
+
+### The general lesson
+
+A quintile edge does not survive contact with the actual constraint.
+Pullback depth Q1 averages +1.002R at 58.6% wins against a +0.566R
+base, survives the top-10-ticker test, AND holds across the Sep-2025
+out-of-sample split -- and still captured less total R than random when
+used to rank. The constraint never asks "is this a good trade", it asks
+"is this better than the other candidate competing for this slot
+today". Evidence for the first is not evidence for the second.
+
+### Path out
+
+No tested attribute predicts which of two simultaneous candidates does
+better. The expected resolution is not a better ranking key bolted on
+the side, but a scoring model that genuinely separates winners -- at
+which point ranking by score becomes correct and `rank_signals()`
+should be reconsidered or retired. Full null-result write-up, including
+the new pullback-shape measures, is in `General_Research_Findings.md`
+on the `historical_backtest_research` branch.
