@@ -3264,3 +3264,93 @@ Worth a dedicated session. Sequenced AFTER the remaining items only if
 signal counts per day turn out to rarely exceed capacity -- that is the
 first thing to measure, and it is cheap: count signals per day in the
 staged pipeline results and see how often the count exceeds ten.
+
+
+---
+
+## OPEN ITEM: Daily Per-Ticker Funnel Log (raised 2026-09-15)
+
+Requested by Dave. He wants visibility into what the pipeline did on a
+given day -- not just how many candidates survived each gate, but WHICH
+tickers, so he can spot-check individual names and see why something was
+cut. Explicitly: he wants to be able to look back through history, so
+this must be a persistent file, NOT a line in the daily email.
+
+### Why this is cheap
+
+The orchestrator already walks every gate in `find_new_signals_for_date()`
+-- momentum screen, 50-day MA touch, ADR ceiling, overhead resistance,
+scorable, score threshold. It simply `continue`s past each rejection and
+discards the reason. Nothing new has to be computed; the information is
+already in hand and being thrown away.
+
+### The shape already exists
+
+`Staged_Pipeline_Results.csv`, produced by `staged_pipeline_backtest.py`
+on the research branch, is exactly the right format: one row per
+ticker-date, with a `dropped_at` column naming the gate that ended it
+(blank = passed everything) plus the diagnostic values at that point --
+`adr10_pct_at_entry`, `overhead_R`, `total_score_v2`, component scores,
+`score_note`, `entry_price`, `risk_per_share`. This is what was used to
+diagnose why CLSK, CLOV and NFLX never became trades despite passing the
+momentum screen.
+
+So the work is not a new report. It is making the ORCHESTRATOR write the
+same record daily that the backtest writes once -- ideally by sharing the
+row-building code so the two cannot drift, the same lesson as the
+deduplicated momentum screen (2026-09-14).
+
+### Design notes for the session
+
+- Append-only file in `state/`, one row per ticker-date evaluated, same
+  discipline as `closed_trades.csv`. Name candidate: `daily_funnel.csv`.
+- Must be written on replayed missed days too, not just real ones.
+- Should record the newly added `sizing_constraint`, and rows for
+  signals that passed scoring but were SKIPPED for capital reasons --
+  those are invisible today and are exactly the cases the pending
+  candidate-selection work needs data on.
+- Counts per gate are then derivable from the file; no separate summary
+  needed, though a printed per-run summary is a trivial addition.
+
+### Sequencing
+
+Dave explicitly said this does not have to be the next session, only
+that it should happen in the right order. It pairs naturally with the
+candidate-selection open item, since the skipped-for-capital rows are
+the raw material for that work.
+
+Note on scope: the research branch does not run on a schedule -- it is a
+repository, run manually. So this is a PRODUCTION-branch feature. The
+research equivalent already exists and needs nothing.
+
+
+---
+
+## POINTER: Research findings live on the research branch (2026-09-15)
+
+Research findings -- ideas tested and NOT promoted, or tested and
+withdrawn -- are recorded in `General_Research_Findings.md` on the
+`historical_backtest_research` branch. That is one running document,
+newest entry at the bottom, not one file per idea.
+
+This pointer exists because an unpromoted finding is otherwise invisible
+from `main`, and a later session would have no way to know the work had
+already been done.
+
+Currently recorded there:
+
+- **Long-Term Trend Efficiency (LTE)**, 2026-09-15. NOT PROMOTED.
+  Net displacement over 252 days divided by total distance travelled --
+  an attempt to measure "bottom left to upper right" and close the gap
+  between the momentum screen and Dave's own judgement (the CLSK /
+  CLOV / NFLX problem). Strong in-sample, including survival of the
+  top-10-ticker test; FAILED out-of-sample, where its rejected group
+  still returned +0.539R. A RE-TEST TRIGGER is armed: 2026Q3 expectancy
+  turned negative (-0.125R, 35.1% win), so if the harder tape persists,
+  re-run the split and check whether LTE's rejected group returns to
+  negative expectancy. Available now as a DIAGNOSTIC (it explains why a
+  name looks wrong) without gating anything.
+
+The judgement-gap open item therefore remains OPEN. LTE is the best
+lead on it so far, and the reason it did not close the item is written
+down in full.
