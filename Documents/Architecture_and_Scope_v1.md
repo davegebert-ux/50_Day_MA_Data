@@ -2529,7 +2529,8 @@ WORST win rate.
 
 **Consequence:** conviction sizing on ADR band is off the table.
 `Conviction_Sizing_Model_v2.md` is now known to be built on a withdrawn
-finding and must not be implemented as written.
+finding and must not be implemented as written. SUPERSEDED 2026-09-16 by
+`Conviction_Sizing_Model_v3.md`.
 
 ### [ADOPTED] ADR ceiling of 10%
 
@@ -2594,9 +2595,10 @@ the holding-period analysis is done.
 1. **The unscorable third.** Decide whether `_find_trend_start()`
    returning None should mean "skip" or "score by Relative Strength
    alone". Currently a third of candidates are discarded silently.
-2. `Conviction_Sizing_Model_v2.md` needs rewriting -- its ADR-band basis
-   is withdrawn and score magnitude is now known not to discriminate
-   above 2.5. Conviction sizing may simply not have a validated input yet.
+2. ~~`Conviction_Sizing_Model_v2.md` needs rewriting~~ DONE 2026-09-16 --
+   see `Conviction_Sizing_Model_v3.md`. Conviction sizing has no validated
+   input: flat sizing retained, tiered sizing blocked on the score-vs-R
+   correlation rising above 0.022.
 3. Holding-period / trade-duration analysis -- still NOT STARTED.
 4. Trend Efficiency redesign -- the ADR-overlap rationale is now itself
    in question, since the ADR band effect was an outlier artifact.
@@ -3045,9 +3047,9 @@ REMAINING, in rough order of value:
    rules and his judgement -- the most valuable open item.
 2. Holding-period / trade-duration analysis. Deliberately LAST: it is a
    function of every other decision.
-3. `Conviction_Sizing_Model_v2.md` needs rewriting -- its ADR-band basis
-   was withdrawn 2026-09-14 and score magnitude does not discriminate
-   above 2.5. May have no validated input yet.
+3. ~~`Conviction_Sizing_Model_v2.md` needs rewriting~~ DONE 2026-09-16 --
+   see `Conviction_Sizing_Model_v3.md`. Flat sizing retained; the v2 tier
+   ladder was a small-sample artifact and its gain vanishes out of sample.
 4. Trend Efficiency redesign -- its ADR-overlap rationale is itself now
    in question.
 5. Phase 3: trade execution automation via the TradingView -> TradeStation
