@@ -786,3 +786,42 @@ Three consecutive zero-signal days (2026-06-01 to 06-03, 151 tickers watched eac
 **[SECONDARY OBSERVATION] Live log confirms the cost cap binds.** On the March day, 16 signals qualified but only 10 opened; 6 were `skipped_no_capital`, and `sizing_constraint` was `cost` on every single row — the risk rule never bound. This is the dormant-risk-rule finding showing up in production data rather than in replay.
 
 **Expected future signature:** from the day the 85% trend-start change ships, `unscorable` counts should collapse and `score_below_threshold` should rise. That is the intended effect, not a fault.
+
+
+## [CLOSED — NEGATIVE] Pullback depth does not predict expectancy (2026-09-16)
+
+**Status: dead. No action. Do not re-open without a new formulation.**
+
+Pullback depth was the best remaining lead on the judgement gap, on the strength of an earlier result (Q1 shallow +1.002R at 58.6% win vs +0.566R base) that survived the top-10 test and held out-of-sample. It fails once measured honestly.
+
+**[THE FLAW] The original measure used information not available at entry.** Depth was computed from the 20-day high down to the *entry day's low*. Entry is a resting limit at the 50-day MA with the stop just below it, so the entry day's low is mechanically tied to the trade's own outcome: a shallow low means the stop was not hit that day; a deep low usually means it was. The measure was partly reading the result rather than predicting it.
+
+Confirmation, old-style depth on the 85% pipeline output (n=1,255):
+
+| quartile | n | avg R | win % | stopped out within 3d | median hold |
+|---|---|---|---|---|---|
+| Q1 shallow | 314 | +0.838 | 54.5 | 13.7% | 10 |
+| Q2 | 314 | +0.720 | 41.7 | 19.1% | 8 |
+| Q3 | 313 | +1.205 | 49.5 | 21.4% | 9 |
+| Q4 deep | 314 | +0.369 | 38.2 | 28.0% | 7 |
+
+Fast stop-out rate rises monotonically with depth and median hold falls — the mechanical link, visible directly.
+
+**[THE HONEST MEASURE] 20-day high down to the MA50 itself, normalized by ADR10.** Both quantities are known at the prior close, so there is no lookahead. Same 1,255 trades:
+
+| quartile | n | avg R | win % | avg R, top-10 removed |
+|---|---|---|---|---|
+| Q1 shallow | 314 | +0.859 | 51.9 | +0.286 |
+| Q2 | 314 | +0.704 | 43.9 | +0.191 |
+| Q3 | 313 | +0.920 | 44.4 | −0.012 |
+| Q4 deep | 314 | +0.647 | 43.6 | +0.041 |
+
+Correlation of depth with realized R: **−0.021** — the same near-zero territory as the score-vs-R correlation (0.022) that killed score as a ranking key.
+
+**[FINDING] Expectancy is flat across depth.** Q3 beats Q2 and nearly beats Q1, so there is no gradient — a real effect would not be non-monotonic. Out-of-sample the ordering scrambles further (Q1 +1.455, Q3 +0.133). Not a gate, not a ranking key, not a scoring attribute.
+
+**[SECONDARY — the one survivor] Win rate does vary with depth:** ~52% shallow vs ~44% for the rest, and it is the only roughly monotonic column. But it does not convert into expectancy, which means deeper pullbacks win less often and win *bigger*. That cancellation is itself the reason depth cannot be used for selection.
+
+**[METHOD NOTE] Second finding killed by lookahead in a derived feature, after the "least-correlated-first" ranking rule.** Both looked strong and both were reading the outcome. Standing rule, reinforced: for any candidate feature, name the exact moment each input is knowable and check it is before the fill.
+
+**[CONSEQUENCE] The judgement gap has no strong lead remaining.** LTE stays tabled with its re-test trigger. Depth is closed.
