@@ -219,6 +219,28 @@ def score_trend_efficiency(df, entry_date):
 #      window (same formula as the pre-watchlist smoothness screen).
 #   3. MA50 violation profile: ADR-normalized depth/frequency of actual
 #      MA50 violations since the anchor.
+# Fraction of days since the trend-start anchor that price must have
+# closed above the MA50 for the anchor to count as a clean trend start.
+#
+# Was 95 from inception; lowered to 85 on 2026-09-16. At 95 this single
+# constant discarded 599 of 2,310 staged touch events as "unscorable" --
+# a quarter of everything the pipeline saw -- and those events averaged
+# +0.644R, i.e. as good as the trades being taken. They were unmeasured,
+# not bad. 95 is a cliff rather than a slope: 90 recovers 46% of them,
+# 85 recovers 75%.
+#
+# Validated by a full staged_pipeline_backtest run in production gate
+# order at both values. Passing pool 1,023 -> 1,255 events while the
+# average trade IMPROVED (+0.578R -> +0.613R); account replay gained
+# ~19 CAGR points in all four tests including top-10-ticker removal,
+# with drawdown slightly better. See General_Research_Findings.md,
+# "PROMOTION RUN: full staged pipeline at 85%".
+#
+# NOT swept for an optimum -- 80 and 90 were never run end to end, so a
+# better value may exist. Exposed as a constant so that sweep is easy.
+TREND_START_PCT_ABOVE = 85
+
+
 def _find_trend_start(df, entry_date, max_lookback=252, min_days_since=40):
     df = df.copy()
     df['MA50'] = df['Close'].rolling(50).mean()
@@ -242,7 +264,7 @@ def _find_trend_start(df, entry_date, max_lookback=252, min_days_since=40):
             continue
         post = sub.iloc[idx:]
         pct_above = (post['Close'] > post['MA50']).mean() * 100
-        if pct_above >= 95:
+        if pct_above >= TREND_START_PCT_ABOVE:
             best = {'date': sub['Date'].iloc[idx], 'days_since': days_since,
                     'pct_time_above_since': round(float(pct_above), 1)}
             break
