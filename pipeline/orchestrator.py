@@ -71,7 +71,7 @@ OPEN_POSITIONS_PATH = os.path.join(_STATE_DIR, "open_positions.csv")
 CLOSED_TRADES_PATH = os.path.join(_STATE_DIR, "closed_trades.csv")
 LAST_RUN_PATH = os.path.join(_STATE_DIR, "last_run_date.txt")
 
-SKIP_SCORE_THRESHOLD = 2.5  # MVP decision -- see Conviction_Sizing_Model_v2.md
+SKIP_SCORE_THRESHOLD = 2.5  # MVP decision -- see Conviction_Sizing_Model_v3.md
 
 # ADDED 2026-09-14: volatility ceiling. Reject touch events whose ADR10 at
 # entry exceeds this. Validated on the 2,310-event wide-universe sample
