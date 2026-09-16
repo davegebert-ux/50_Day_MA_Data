@@ -3631,3 +3631,135 @@ actually taken under the ten-slot limit, about 4-5 per week. Median hold
 6 trading days, mean 8.3 -- so each slot turns over ~30 times a year and
 ten slots cap out near 300 trades. Signals are not the binding
 constraint; slots are. Scale down for a narrower live watchlist.
+
+
+---
+
+## [DECISION] MAX_CONCURRENT_POSITIONS stays at 10 (2026-09-16)
+
+The joint test flagged as needed on 2026-09-15 has been run. Slot count
+and cost cap were swept TOGETHER, holding total deployed capital roughly
+constant, so that each pairing is a real alternative rather than a
+restatement of the same one.
+
+Compounded, 25,000 dollar start, 1% risk, 5 arrival-order seeds:
+
+| slots @ cap | CAGR | max DD | CAGR per unit DD | underwater | avg open |
+|---|---|---|---|---|---|
+| 8 @ 12.5% | 71.4% | -19.8% | 3.61 | 231d | 6.9 |
+| **10 @ 10.0%** | **68.9%** | **-18.2%** | **3.78** | 223d | 8.3 |
+| 12 @ 8.3% | 65.1% | -16.8% | 3.87 | 216d | 9.5 |
+| 15 @ 6.5% | 62.6% | -14.4% | 4.34 | 211d | 11.2 |
+| 20 @ 5.0% | 55.7% | -11.7% | 4.77 | 211d | 13.5 |
+| 15 @ 10.0% | 68.9% | -18.2% | 3.78 | 223d | 8.3 |
+
+### What the sweep shows
+
+**It is a real trade-off, not a free lunch.** Spreading the same capital
+over more positions lowers return AND lowers drawdown, monotonically.
+Raw return favours fewer, larger positions; return per unit of drawdown
+favours more, smaller ones. Diversification behaves exactly as theory
+predicts, which is mild evidence the replay is sound.
+
+**The last row is the trap.** 15 slots at the CURRENT 10% cap reproduces
+the 10-slot numbers exactly, with 495 signals left unfunded -- five slots
+that can never fill, because ten positions at 10% already commit the
+account. Raising the slot count alone is a no-op. This is the finding
+from 2026-09-15 restated with the joint test behind it.
+
+### Decision and rationale
+
+**Staying at 10 @ 10%** (Dave, 2026-09-16). The 15-slot pairing is
+better risk-adjusted, but while entries and exits are placed BY HAND,
+15 concurrent positions is materially more daily work for a lower
+headline return. The operational cost is real and the risk-adjusted gain
+is modest.
+
+**Revisit trigger:** when Phase 3 execution automation (TradingView ->
+TradeStation bridge) is live and positions no longer have to be managed
+manually, the position-count cost largely disappears and **15 @ 6.5%
+becomes the better choice on this evidence** -- roughly 4 points less
+drawdown and a better return-per-drawdown ratio.
+
+### Caveats
+
+- The sample contains no serious correlated market break. Diversification
+  pays most precisely when one arrives, so these figures likely
+  UNDERSTATE the case for more positions.
+- Equity is closed equity; real drawdowns at every row are deeper.
+- Any change here must move both numbers together. They are one decision.
+
+
+---
+
+## [PROMOTED 2026-09-16] Trend-start threshold 95% -> 85%
+
+Closes the oldest open item in this document ("the unscorable third").
+Changed in `scorecard.py`: the `_find_trend_start()` anchor test is now
+the named constant `TREND_START_PCT_ABOVE = 85`, replacing a hard-coded
+95 inside a conditional.
+
+### What the gate does
+
+`_find_trend_start()` walks back up to 252 trading days looking for the
+day price reclaimed the MA50, requires that anchor to be at least 40 days
+old, and requires price to have closed above the MA50 on at least
+`TREND_START_PCT_ABOVE` percent of days since. No anchor means MA Respect
+returns None, which means no total score, which means the event is
+discarded before the 2.5 gate ever sees it.
+
+### Why it changed
+
+At 95 this one constant was discarding **599 of 2,310 staged touch
+events** -- a quarter of everything the pipeline saw. Those events
+averaged **+0.644R**, against +0.578R for the trades actually being
+taken and -0.136R for trades that genuinely scored below 2.5.
+**Unscorable did not mean bad; it meant unmeasured.** The system was
+throwing away a quarter of its candidates on a technicality.
+
+95 turned out to be a cliff rather than a slope -- 90 recovers 46% of
+those events, 85 recovers 75%.
+
+### Evidence (full run, production gate order, both thresholds)
+
+The 95% run reproduced the historical funnel exactly, so the two runs
+differ only in this constant.
+
+| stage | 95% | 85% |
+|---|---|---|
+| + scorable | 1,279 @ +0.442R | 1,724 @ +0.486R |
+| + score >= 2.5 | 1,023 @ +0.578R | **1,255 @ +0.613R** |
+
+Account replay, 10 slots / 10% cap / 20 arrival seeds:
+
+| test | 95% | 85% | delta |
+|---|---|---|---|
+| full sample | 68.8% | 87.8% | +19.0 |
+| top-10 tickers removed | 29.6% | 49.4% | +19.8 |
+| in-sample | 28.0% | 47.2% | +19.2 |
+| out-of-sample | 157.7% | 183.5% | +25.7 |
+
+Max drawdown slightly better at every row. **The passing pool grew 23%
+AND its average trade improved** -- more trades at a better average,
+which is the opposite of the usual trade-off, and the reason this
+cleared the bar.
+
+### Two things to watch
+
+1. **The funnel log will change shape from the day this ships.**
+   Expect the unscorable count to collapse (599 -> 154 on staged data)
+   and `score_below_threshold` to rise correspondingly. That is the
+   expected signature, not a fault.
+2. **The 2.5 gate's reject pile now averages +0.146R** rather than
+   -0.136R, which looks like the gate weakening. It is not: with the top
+   10 contributing tickers removed the rejects are -0.175R, still
+   properly negative. A few large winners were flattering the pile.
+
+### Not settled
+
+**85 was not swept for an optimum.** It came from a recovery-rate table;
+80 and 90 were never run end to end. A better value may exist, which is
+why the threshold is now a named constant instead of a literal. All
+standing sample limits still apply -- one universe snapshot, optimistic
+gap fills, no serious market break in the window, closed equity only.
+The +19 points is a measured delta on this sample, not a forecast.
