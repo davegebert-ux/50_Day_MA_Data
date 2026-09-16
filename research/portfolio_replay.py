@@ -23,14 +23,29 @@ slot limit, taking candidates in the SAME ranked order production uses,
 and reports what the account would actually have captured -- plus a
 record of everything it had to skip.
 
-WHAT IT DOES NOT DO YET
------------------------
-Dollar returns and compounding. It reports R, slot occupancy and skip
-counts only. The account model is still the static-balance one in
-parameters.py, and MAX_POSITION_COST_PCT is not applied here -- the cost
-cap does not change R multiples, only dollar weight, so it cannot affect
-these numbers. This file is the natural place to add both when portfolio
-dollar returns are modelled; that is the flagged future work.
+DOLLAR RETURNS AND COMPOUNDING (added 2026-09-15)
+-------------------------------------------------
+The R-based replay above answers "what multiple of risk did the rules
+capture". It cannot answer "what did the ACCOUNT do", because R is
+scale-free: it does not know that ten positions at a 10% cost cap
+consume the entire account, and it cannot show a drawdown or an
+underwater stretch.
+
+replay_dollars() adds that layer. It sizes every trade exactly as
+orchestrator.size_and_open_trades() does -- shares = min(risk-based,
+cost-cap-based), MAX_POSITION_COST_PCT applied -- tracks capital
+committed by open positions, refuses entries it cannot fund, and
+compounds realised P&L back into the balance.
+
+READ THE OUTPUT AS A STRESS TEST OF THE RULES, NOT A FORECAST.
+Compounding one sample's returns does not validate them, it magnifies
+whatever is already in there, including the known flaws: survivorship
+bias in the ticker universe, optimistic gap fills, and a two-year window
+containing no serious market break. What the equity curve DOES tell you
+honestly is structural -- drawdown depth, time underwater, and whether
+the slot count and cost cap are a sensible pairing -- because those
+depend on the SHAPE of the return stream rather than on the edge being
+exactly the size measured.
 
 SHARED RANKING LOGIC -- IMPORTANT
 ---------------------------------
@@ -73,6 +88,19 @@ RANDOM_BASELINE_SEEDS = 30
 
 TAKEN_OUT_PATH = "Portfolio_Replay_Taken.csv"
 SKIPPED_OUT_PATH = "Portfolio_Replay_Skipped.csv"
+EQUITY_CURVE_OUT_PATH = "Portfolio_Replay_Equity_Curve.csv"
+
+# --- dollar model (added 2026-09-15) ---
+# These mirror pipeline/parameters.py and orchestrator.py. They are
+# duplicated rather than imported because this script must run from a
+# research-branch checkout that may not carry pipeline/ -- but they are
+# only ACCOUNT settings, not logic. The sizing rule itself is
+# reimplemented in size_position() below and must be kept in step with
+# orchestrator.size_and_open_trades(); see the warning there.
+START_BALANCE = 25000.00
+RISK_PERCENT_PER_TRADE = 0.01
+MAX_POSITION_COST_PCT = 0.10
+DOLLAR_SEEDS = 5                   # arrival-order seeds to average over
 
 
 # ------------------------------------------------------------------
@@ -246,10 +274,181 @@ def main():
         print(f"  Those skipped trades would have returned "
               f"avgR={sr.mean():+.3f}, totalR={sr.sum():+.1f}")
 
+    report_dollars(df)
+
     taken.to_csv(TAKEN_OUT_PATH, index=False)
     skipped.to_csv(SKIPPED_OUT_PATH, index=False)
     print(f"\nWrote {TAKEN_OUT_PATH} ({len(taken)} rows) and "
           f"{SKIPPED_OUT_PATH} ({len(skipped)} rows).")
+
+
+
+# ------------------------------------------------------------------
+# DOLLAR / COMPOUNDING REPLAY (added 2026-09-15)
+# ------------------------------------------------------------------
+def size_position(entry_price, risk_per_share, basis):
+    """Shares for one trade under the two-constraint rule.
+
+    MUST MATCH orchestrator.size_and_open_trades(). It is reimplemented
+    here rather than imported because that function is welded to the
+    open-positions DataFrame and the funnel log, neither of which exist
+    in a replay. That makes this the one place in this file where drift
+    is possible -- if the production sizing rule changes, change it here
+    and re-run, or the equity curve quietly stops describing the system.
+
+    basis: the account figure both constraints are measured against.
+    Passing CURRENT equity compounds; passing START_BALANCE does not.
+    """
+    if entry_price <= 0 or risk_per_share <= 0:
+        return 0
+    shares_by_risk = (basis * RISK_PERCENT_PER_TRADE) / risk_per_share
+    shares_by_cost = (basis * MAX_POSITION_COST_PCT) / entry_price
+    return int(min(shares_by_risk, shares_by_cost))
+
+
+def replay_dollars(df, slots=MAX_CONCURRENT_POSITIONS, start=START_BALANCE,
+                   compound=True, seed=0):
+    """Walk forward day by day tracking real dollars.
+
+    Same day ordering as replay(): exits first, then entries, mirroring
+    the orchestrator. Candidates are shuffled per day -- arrival order is
+    arbitrary by design (see order_candidates), and averaging over
+    DOLLAR_SEEDS shows how much of the result is arrival-order luck.
+
+    Equity is CLOSED equity: realised P&L only, marked when a position
+    exits. Open positions are not marked to market, so the curve
+    understates intra-trade swings -- real drawdowns are deeper than the
+    ones reported here. Stated plainly because it cuts the wrong way for
+    comfort.
+
+    Returns (final_equity, taken_df, curve_df, skipped_slot, skipped_cash).
+    """
+    rng = np.random.RandomState(seed)
+    equity = start
+    open_positions = []
+    taken, curve = [], []
+    skipped_slot = skipped_cash = 0
+
+    for date, day in df.groupby("entry_date", sort=True):
+        still_open = []
+        for pos in open_positions:
+            if pos["exit_date"] <= date:
+                equity += pos["risk_dollars"] * pos["R"]
+            else:
+                still_open.append(pos)
+        open_positions = still_open
+
+        committed = sum(p["cost"] for p in open_positions)
+        available = equity - committed
+        basis = equity if compound else start
+
+        candidates = day.to_dict("records")
+        rng.shuffle(candidates)
+
+        for row in candidates:
+            if len(open_positions) >= slots:
+                skipped_slot += 1
+                continue
+            shares = size_position(row["entry_price"], row["risk_per_share"], basis)
+            if shares <= 0:
+                continue
+            cost = shares * row["entry_price"]
+            if cost > available:
+                # Cannot fund it. This is the dollar equivalent of the
+                # funnel log's skipped_no_capital disposition.
+                skipped_cash += 1
+                continue
+            risk_dollars = shares * row["risk_per_share"]
+            open_positions.append({"exit_date": row["outcome_exit_date"],
+                                   "cost": cost,
+                                   "risk_dollars": risk_dollars,
+                                   "R": row["outcome_realized_R"],
+                                   "ticker": row["ticker"]})
+            available -= cost
+            taken.append({**row, "shares": shares, "cost": cost,
+                          "risk_dollars": risk_dollars,
+                          "pnl": risk_dollars * row["outcome_realized_R"]})
+
+        curve.append({"date": date, "equity": equity, "committed": committed,
+                      "open_positions": len(open_positions)})
+
+    for pos in open_positions:
+        equity += pos["risk_dollars"] * pos["R"]
+
+    return equity, pd.DataFrame(taken), pd.DataFrame(curve), skipped_slot, skipped_cash
+
+
+def curve_stats(curve):
+    """Max drawdown (%) and longest underwater stretch (calendar days)."""
+    equity = curve["equity"]
+    drawdown = (equity - equity.cummax()) / equity.cummax()
+    longest = 0
+    peak_value = -np.inf
+    peak_date = curve["date"].iloc[0]
+    for date, value in zip(curve["date"], equity):
+        if value >= peak_value:
+            peak_value, peak_date = value, date
+        else:
+            longest = max(longest, (date - peak_date).days)
+    return drawdown.min() * 100, longest
+
+
+def report_dollars(df):
+    """Print the dollar/compounding section of the report."""
+    years = (df["entry_date"].max() - df["entry_date"].min()).days / 365.25
+    print("\n" + "=" * 62)
+    print("DOLLAR RETURNS AND COMPOUNDING")
+    print("=" * 62)
+    print(f"Starting balance ${START_BALANCE:,.0f}  |  risk "
+          f"{RISK_PERCENT_PER_TRADE * 100:.0f}%  |  cost cap "
+          f"{MAX_POSITION_COST_PCT * 100:.0f}%  |  {years:.2f} years\n")
+
+    for compound in (False, True):
+        finals, dds, uws, counts, cash = [], [], [], [], []
+        for seed in range(DOLLAR_SEEDS):
+            final, taken, curve, s_slot, s_cash = replay_dollars(
+                df, compound=compound, seed=seed)
+            max_dd, underwater = curve_stats(curve)
+            finals.append(final); dds.append(max_dd); uws.append(underwater)
+            counts.append(len(taken)); cash.append(s_cash)
+        mean_final = np.mean(finals)
+        cagr = ((mean_final / START_BALANCE) ** (1 / years) - 1) * 100
+        label = "compounded" if compound else "fixed sizing"
+        print(f"  {label:<14} final ${mean_final:>10,.0f}  "
+              f"CAGR {cagr:5.1f}%  maxDD {np.mean(dds):6.1f}%  "
+              f"underwater {np.mean(uws):4.0f}d  trades {np.mean(counts):.0f}  "
+              f"unfunded {np.mean(cash):.0f}")
+
+    print("\n  Slot sweep (compounded), to show what the slot limit buys:")
+    for slots in (4, 6, 8, 10, 12, 15, 20):
+        finals, dds, cash = [], [], []
+        for seed in range(DOLLAR_SEEDS):
+            final, taken, curve, s_slot, s_cash = replay_dollars(
+                df, slots=slots, seed=seed)
+            max_dd, _ = curve_stats(curve)
+            finals.append(final); dds.append(max_dd); cash.append(s_cash)
+        cagr = ((np.mean(finals) / START_BALANCE) ** (1 / years) - 1) * 100
+        print(f"    slots={slots:<3d} final ${np.mean(finals):>10,.0f}  "
+              f"CAGR {cagr:5.1f}%  maxDD {np.mean(dds):6.1f}%  "
+              f"unfunded {np.mean(cash):.0f}")
+
+    print("\n  READ THIS BEFORE QUOTING THE SLOT SWEEP: above 10 slots every")
+    print("  number is IDENTICAL, because 10 positions at a 10% cost cap")
+    print("  already consume the whole account -- the unfunded column jumps")
+    print("  to show it. The slot limit is therefore not an independent")
+    print("  choice; MAX_POSITION_COST_PCT has already made it. Raising the")
+    print("  slot count only does something if the cost cap falls with it,")
+    print("  and this sweep cannot tell you which PAIRING is better because")
+    print("  the two move together.")
+    print("\n  Also note the headline CAGR is not a forecast. A strategy that")
+    print("  truly compounded at that rate would attract capital until the")
+    print("  edge closed. Halve it before believing it, and treat the")
+    print("  drawdown as a floor: equity here is CLOSED equity, so real")
+    print("  intra-trade drawdowns are deeper.")
+
+    final, taken, curve, _, _ = replay_dollars(df, compound=True, seed=0)
+    curve.to_csv(EQUITY_CURVE_OUT_PATH, index=False)
+    print(f"\n  Wrote {EQUITY_CURVE_OUT_PATH} ({len(curve)} rows, seed 0).")
 
 
 # ------------------------------------------------------------------
