@@ -757,3 +757,32 @@ because the numbers were identical to four decimal places. **When
 sweeping a constant, assert the value inside the run and echo it with
 the results** -- identical output across supposedly different
 configurations is the symptom to watch for.
+
+
+## [NO ACTION] Funnel log check: zero-signal days explained (2026-09-16)
+
+**Question:** do zero-signal days reflect a real absence of setups, or a pipeline fault?
+
+**Answer: real absence. No action required. Do not re-investigate.**
+
+Evidence, from `state/daily_funnel.csv`:
+
+A normal day (2026-03-09, 169 tickers watched):
+
+| gate | rejected | remaining |
+|---|---|---|
+| momentum_screen | 132 | 37 |
+| insufficient_history | 3 | 34 |
+| no_data_for_date | 3 | 31 |
+| no_50ma_touch | 8 | 23 |
+| overhead_resistance | 2 | 21 |
+| score_below_threshold | 5 | 16 |
+| **passed all gates** | | **16** |
+
+Three consecutive zero-signal days (2026-06-01 to 06-03, 151 tickers watched each day) were identical to each other: 140 failed the momentum screen, only 5 names reached the touch scan, and none of those 5 were touching their 50-day MA. Nothing reached the scorer at all.
+
+**[FINDING] Dry spells originate at the momentum screen, not at scoring or sizing.** When few names are in qualifying uptrends, the funnel empties at stage 0 and everything downstream is correctly idle. This is consistent with the earlier result that zero-signal weeks are normal (9 of 116, 7.8%, longest dry run 5 weeks).
+
+**[SECONDARY OBSERVATION] Live log confirms the cost cap binds.** On the March day, 16 signals qualified but only 10 opened; 6 were `skipped_no_capital`, and `sizing_constraint` was `cost` on every single row — the risk rule never bound. This is the dormant-risk-rule finding showing up in production data rather than in replay.
+
+**Expected future signature:** from the day the 85% trend-start change ships, `unscorable` counts should collapse and `score_below_threshold` should rise. That is the intended effect, not a fault.
