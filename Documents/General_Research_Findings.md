@@ -381,3 +381,117 @@ rather than backtest reconstruction.
   everything else. Worth revisiting when the judgement gap is next
   attacked. Note these measures are computed per-event from price history
   and are point-in-time; unlike the correlation matrix, they are safe.
+
+
+---
+
+## Dollar Returns, Compounding and the Slot/Cost-Cap Interaction (2026-09-15)
+
+Closes the "flagged next addition" noted above. `portfolio_replay.py` now
+carries `replay_dollars()`, `size_position()`, `curve_stats()` and
+`report_dollars()`, and writes `Portfolio_Replay_Equity_Curve.csv`.
+
+### Why R alone could not answer the question
+
+R is scale-free. It cannot show a drawdown, cannot show time spent
+underwater, and does not know that ten positions at a 10% cost cap
+consume the entire account. "0.59R per trade" and "what does the account
+do" are different questions, and only the second one is tradeable.
+
+### Result (1,001 passing trades, 2024-06 to 2026-09, 2.19 years)
+
+Starting balance 25,000 dollars, 1% risk, 10% cost cap, 10 slots,
+averaged over 5 arrival-order seeds:
+
+| | final | CAGR | max DD | longest underwater | trades |
+|---|---|---|---|---|---|
+| fixed sizing | 57,925 | 46.8% | -13.7% | 223 days | 511 |
+| compounded | 78,690 | 68.9% | -18.2% | 226 days | 506 |
+
+The single-seed figure quoted mid-session was 72.1%; averaging five
+arrival orders brings it to 68.9%. **That spread is pure arrival-order
+luck** -- the same effect that exposed the least-correlated error.
+Report the averaged number.
+
+Roughly two thirds of months are positive, worst month about -9%
+compounded. **The 226-day underwater stretch matters more than the
+drawdown depth** -- seven months of grinding sideways is what breaks
+discipline, not a single bad week.
+
+### [FINDING] The slot limit is not an independent choice
+
+Slot sweep, compounded:
+
+| slots | final | CAGR | max DD | unfunded |
+|---|---|---|---|---|
+| 4 | 43,778 | 29.2% | -9.9% | 0 |
+| 6 | 54,790 | 43.1% | -13.0% | 0 |
+| 8 | 65,982 | 55.8% | -16.4% | 0 |
+| 10 | 78,690 | 68.9% | -18.2% | 52 |
+| 12 | 78,690 | 68.9% | -18.2% | 495 |
+| 15 | 78,690 | 68.9% | -18.2% | 495 |
+| 20 | 78,690 | 68.9% | -18.2% | 495 |
+
+Below ten, returns rise with slot count and drawdown rises gently with
+it. **At and above ten, every number is identical** -- 10 positions at a
+10% cost cap already commit the whole account, so the eleventh signal can
+never be funded. The unfunded column jumps from 52 to 495 to show it.
+
+So `MAX_CONCURRENT_POSITIONS` has already been decided by
+`MAX_POSITION_COST_PCT`. They are one parameter wearing two names.
+Raising the slot count does nothing unless the cost cap falls with it,
+and **this sweep cannot say which pairing is better, because the two
+always move together** -- that needs a deliberate joint test.
+
+Practical reading: with the current settings the account is fully
+deployed at ten positions, so idle slots are pure drag -- but "fully
+invested at all times" is also the worst posture for a correlated market
+break, and this sample contains none.
+
+### [FINDING] The risk rule is dormant
+
+A margin variant was run out of curiosity (50% margin, 15 slots). Two
+versions -- risk measured off equity, and risk measured off buying power
+-- returned 117.4% and 118.3% CAGR. **Near-identical, because the cost
+cap binds first on essentially every trade**, so changing the risk basis
+barely moves share counts. This confirms in dollars what the
+`sizing_constraint` column was added to watch for: at 1% risk and a 10%
+cost cap, the risk rule almost never decides anything. Margin set aside,
+not adopted; it roughly doubles both return and drawdown (-26%) on a
+sample with no serious market break in it.
+
+### How these numbers should and should not be used
+
+**Honest:** drawdown depth, time underwater, month-to-month shape, and
+whether the slot/cost-cap pairing is sensible. These depend on the SHAPE
+of the return stream, not on the edge being exactly the size measured.
+
+**Not honest:** the headline CAGR as a forecast. Compounding one sample's
+returns does not validate them, it magnifies them along with survivorship
+bias, optimistic gap fills and a kind two-year window. A strategy
+genuinely compounding at 69% would attract capital until the edge closed.
+Ten-year projections are arithmetic, not prediction: at 68.9%, 25,000
+becomes ~5.7M in ten years, which is itself the argument against
+believing it. **Halve the edge before planning on it** -- at 30%, ten
+years gives ~345,000, and that is the figure to anchor on.
+
+**Floor, not estimate:** equity here is CLOSED equity -- open positions
+are not marked to market -- so real intra-trade drawdowns are deeper than
+-18.2%.
+
+### Trade frequency and duration (same session)
+
+- Median hold 6 trading days, mean 8.3, max 41. **Winners run ~11 days
+  (mean 12.6, +2.785R); losers die in ~3 (mean 4.6, -1.060R).** The exit
+  is doing its job: cut fast, let winners breathe.
+- R by duration bucket is perfectly monotonic -- 0-1 days -1.021R, 2-3
+  -0.837R, 4-5 -0.308R, 6-10 +0.470R, 11-20 +2.572R, 21+ +5.248R at 92.9%
+  wins. **This is not predictive.** It is the same fact viewed backwards:
+  surviving trades are winning trades, because the stop is what ends them.
+  Duration cannot select anything at entry.
+- ~464 qualifying signals per year on the 1,591-name universe, but only
+  ~230 taken under a 10-slot limit -- about 4-5 trades a week. Slot
+  turnover explains the ceiling: an 8-day average hold gives each slot ~30
+  turns a year, so ten slots caps out near 300. **Signals are not the
+  binding constraint; slots are.** Scale down for a narrower live
+  watchlist.
