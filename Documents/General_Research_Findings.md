@@ -495,3 +495,214 @@ are not marked to market -- so real intra-trade drawdowns are deeper than
   turns a year, so ten slots caps out near 300. **Signals are not the
   binding constraint; slots are.** Scale down for a narrower live
   watchlist.
+
+
+---
+
+## The Unscorable Third: `_find_trend_start()` and the 95% Rule (2026-09-16)
+
+Closes the oldest open item in the architecture doc. **Recommendation:
+relax the trend-start threshold from 95% to 85%.** Validated against the
+standard bar; see caveats before promoting.
+
+### The problem
+
+Of 2,310 staged touch events, **599 were dropped as unscorable** -- a
+quarter of everything the pipeline sees, discarded silently. 593 of the
+599 were MA Respect returning None; relative strength accounted for 6.
+So this is one function.
+
+`_find_trend_start()` walks back up to 252 days for the day price
+reclaimed the MA50, requires it to be at least 40 days ago, and then
+requires price to have closed above the MA50 on **at least 95% of days
+since**. If no anchor satisfies all three, MA Respect returns None, the
+total score is None, and the event is discarded.
+
+### [FINDING] Unscorable does not mean bad
+
+| group | n | avg R | win |
+|---|---|---|---|
+| passing (score >= 2.5) | 1,001 | +0.578 | 46.2% |
+| **unscorable** | 587 | **+0.644** | 44.5% |
+| scored below 2.5 | 250 | -0.136 | 34.4% |
+
+The unscorable group performed slightly BETTER than the trades the
+system actually takes, and nothing like the genuinely low-scoring group.
+It survives both standard checks: with the top 10 contributing tickers
+removed the two groups converge (+0.285 passing vs +0.224 unscorable),
+and out-of-sample the unscorable group leads (+0.741 vs +0.710).
+
+These trades are **indistinguishable from the ones being taken**. The
+system was discarding a quarter of its candidates on a technicality, not
+on merit.
+
+### [FINDING] 95% is a cliff, not a slope
+
+Re-running `_find_trend_start()` over the 599 unscorable events at
+relaxed thresholds:
+
+| pct_above required | events recovered |
+|---|---|
+| 95% (current) | 4 (1%) |
+| 90% | 277 (46%) |
+| 85% | 451 (75%) |
+| 80% | 539 (90%) |
+| 75% | 572 (95%) |
+
+Nearly half return at 90%, three quarters at 85%. A single percentage
+point of strictness was doing enormous work, and 95 appears to have been
+chosen by intuition rather than measurement.
+
+### [FINDING] Recovered trades are properly sorted by the existing gate
+
+The point is not to wave these through -- it is to SCORE them so the 2.5
+gate can judge them. Rescored with the real production `score_total_v2()`
+at an 85% threshold (426 of 572 testable events scored):
+
+| test | passes gate | fails gate |
+|---|---|---|
+| full sample | +0.830 (n=225) | +0.544 (n=191) |
+| top-10 tickers removed | **+0.216 (n=197)** | **-0.052 (n=170)** |
+| in-sample (pre Sep-2025) | +0.618 (n=106) | +0.246 (n=79) |
+| out-of-sample | +1.019 (n=119) | +0.754 (n=112) |
+
+**The separation holds in all four.** The top-10-removed row is the
+important one -- it is where five previous findings died -- and here the
+gate still splits positive from negative. At 90% the separation is
+similar (+0.884 vs +0.681) but recovers only 265 events; 85% recovers
+more and still sorts.
+
+### Caveats before promoting
+
+1. **Not yet run inside the full staged pipeline in production gate
+   order.** This rescored the unscorable subset in isolation. The
+   promotion bar requires the whole pipeline; that run has not happened.
+2. **The recovered trades change portfolio composition.** Roughly 225
+   extra qualifying signals over two years, against a slot limit that
+   already turns away ~50% of signals. More candidates competing for the
+   same ten slots may not raise account returns at all -- that needs
+   `portfolio_replay.py`, not the staged average.
+3. **By-score monotonicity is absent** in the recovered group (2.5 ->
+   +1.126, 3.0 -> +0.562, 3.5 -> +0.033). Consistent with the known
+   0.022 score-vs-R correlation: the gate works, the dial does not.
+4. Two sandbox data faults were hit and fixed during this work (an
+   unsorted SPY file, and a SPY file ending 2026-08-18 while trades run
+   to 2026-09). 146 events could not be tested for lack of SPY coverage.
+   Re-run on complete data before promoting.
+
+### Recommended next step
+
+Run the full staged pipeline end to end with `_find_trend_start()` at
+85%, in production gate order, and then feed the result through
+`portfolio_replay.py` to see whether the extra candidates actually
+improve the ACCOUNT rather than the average trade. Only then change
+`scorecard.py`.
+
+
+### Follow-up: does recovering them help the ACCOUNT? (2026-09-16)
+
+The staged average said the recovered trades are as good as the ones
+being taken. That is not the same as saying they make money, because
+they compete for the same ten slots. Run through the portfolio replay
+(10 slots, 10% cap, 1% risk, 20 arrival-order seeds, both pools cut at
+2026-08-18 where SPY coverage ends, so the comparison is like for like):
+
+| test | current | + recovered | delta |
+|---|---|---|---|
+| full sample | 75.5% CAGR | 90.5% | +15.0 |
+| top-10 tickers removed | 30.9% | 49.4% | +18.5 |
+| in-sample (pre Sep-2025) | 30.4% | 45.5% | +15.1 |
+| out-of-sample | 167.0% | 200.0% | +33.0 |
+
+Max drawdown is unchanged to slightly better throughout (-18.3% ->
+-18.1% full sample). Signals rise from 974 to 1,198; trades actually
+taken rise only from 482 to 535, because slots bind -- **the gain comes
+from better candidates filling the same slots, not from more trades.**
+
+**This passes the standard bar in all four tests, including the top-10
+removal that killed five previous findings.** It is the strongest result
+in this file.
+
+### Why it is still not promoted
+
+1. **Still not run inside the full staged pipeline in gate order.** The
+   recovered events were rescored in isolation and merged into the pool.
+   The promotion bar requires the real pipeline run; that is the
+   remaining work.
+2. The out-of-sample CAGRs (167%, 200%) are inflated by a short window
+   and should not be read as returns -- only the DELTA between columns
+   is meaningful.
+3. 146 of 572 events could not be tested at all (SPY coverage). The true
+   effect size is unknown, though the untested events are unlikely to
+   differ systematically.
+4. Arrival-order spread widens with the larger pool (seed sd 5.7 -> 8.8),
+   as expected with more candidates competing.
+
+### Recommended change, when promoted
+
+In `scorecard.py`, `_find_trend_start()`: `pct_above >= 95` becomes
+`pct_above >= 85`. One number. Everything downstream -- the 2.5 gate,
+sizing, the funnel log -- is unchanged and already handles these events
+correctly. Note the funnel log will show a sharp drop in the
+`score_below_threshold` and unscorable counts from the day it ships,
+which is the expected signature, not a fault.
+
+
+### PROMOTION RUN: full staged pipeline at 85% (2026-09-16)
+
+The isolation test above has now been repeated the right way: both
+thresholds run through `staged_pipeline_backtest.py` end to end, in
+production gate order, from the same 2,310 touch events. The 95% run
+reproduced the historical funnel exactly (n=1,023, +0.578R), confirming
+the two runs differ only in the one constant.
+
+**Staged funnel, 95% vs 85%:**
+
+| stage | 95% | 85% |
+|---|---|---|
+| raw touch events | 2,310 @ +0.436 | same |
+| + overhead resistance | 2,121 @ +0.450 | same |
+| + ADR ceiling | 1,878 @ +0.501 | same |
+| + scorable | 1,279 @ +0.442 | **1,724 @ +0.486** |
+| + score >= 2.5 | 1,023 @ +0.578 | **1,255 @ +0.613** |
+
+Unscorable drops from 599 to 154. The passing pool grows by 23% AND its
+average trade improves -- more trades at a better average, which is the
+opposite of the usual trade-off.
+
+**Account replay (10 slots, 10% cap, 20 seeds):**
+
+| test | 95% | 85% | delta |
+|---|---|---|---|
+| full sample | 68.8% | 87.8% | +19.0 |
+| top-10 tickers removed | 29.6% | 49.4% | +19.8 |
+| in-sample (pre Sep-2025) | 28.0% | 47.2% | +19.2 |
+| out-of-sample | 157.7% | 183.5% | +25.7 |
+
+Max drawdown is slightly BETTER at every row. The improvement is
+strikingly consistent across all four -- around +19 points everywhere,
+including the top-10-removed row where five previous findings died.
+
+**One number worth flagging:** the trades rejected by the 2.5 gate go
+from -0.136R at 95% to +0.146R at 85%, which looks like the gate
+weakening. It is not -- with the top 10 tickers removed the rejected
+group is -0.175R, still properly negative. A handful of large winners
+were flattering the reject pile.
+
+### [RECOMMENDED FOR PROMOTION]
+
+`scorecard.py`: `pct_above >= 95` becomes `pct_above >= 85`, exposed as
+`TREND_START_PCT_ABOVE = 85` so it is visible and sweepable rather than
+buried in a conditional. Nothing else changes.
+
+Both promotion-bar conditions are now met: validated inside the full
+staged pipeline in production gate order, and it survives outlier
+exclusion and the top-10-ticker test. This is the largest validated
+improvement in the file.
+
+**Remaining honest caveats:** 85 was chosen from a recovery-rate table,
+not swept for an optimum -- 80% and 90% were not run through the full
+pipeline, and the true best value is unknown. All the usual sample
+limits still apply: one universe snapshot, optimistic gap fills, no
+serious market break, closed equity only. The +19 points is the
+measured delta on this sample, not a forecast.
