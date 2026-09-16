@@ -825,3 +825,65 @@ Correlation of depth with realized R: **−0.021** — the same near-zero territ
 **[METHOD NOTE] Second finding killed by lookahead in a derived feature, after the "least-correlated-first" ranking rule.** Both looked strong and both were reading the outcome. Standing rule, reinforced: for any candidate feature, name the exact moment each input is knowable and check it is before the fill.
 
 **[CONSEQUENCE] The judgement gap has no strong lead remaining.** LTE stays tabled with its re-test trigger. Depth is closed.
+
+
+## [RE-TESTED — STAYS DEMOTED] Trend Efficiency v2 on the clean 1,255-trade pipeline (2026-09-16)
+
+**Status: demotion upheld. Not returned to the score, not adopted as a gate. Real but unusable.**
+
+Trend Efficiency v2 was demoted on 2026-09-03 on a 253-event sample whose outcome columns came from the *pre-fix* `sim.py`. That is weak evidence by current standards, so the formula was re-scored unchanged against the 1,255 passing trades from the 85% staged pipeline.
+
+**What it measures** (unchanged, `score_trend_efficiency`): a chart-tidiness check, `min()` of two direction-agnostic sub-scores — Gap Check (largest absolute overnight gap over 40 days; under 3% scores 5, over 18% scores 0) and ATR Variability (coefficient of variation of ATR10% over 20 days; CV ≤0.08 scores 5, >0.28 scores 0). It says nothing about trend direction or strength.
+
+**[FINDING] It is monotonic — the 253-event null was too harsh.**
+
+| TE score | n | avg R | win % | avg R, top-10 removed |
+|---|---|---|---|---|
+| 0 | 110 | +0.449 | 49.1 | −0.244 |
+| 1 | 226 | +0.615 | 42.0 | −0.075 |
+| 2 | 276 | +0.658 | 40.9 | −0.103 |
+| 3 | 355 | +0.808 | 43.9 | +0.100 |
+| 4 | 240 | +0.840 | 52.5 | +0.071 |
+| 5 | 48 | +2.572 | 68.8 | +0.331 |
+
+Correlation with realized R = **0.074**, versus 0.034 on the old sample. Halves: low 0–2 +0.605R / 42.8% win, high 3–5 +0.952R / 49.0%. Sign is correct in every bucket after top-10 removal — negative below 3, positive at 3 and above.
+
+**[FINDING] It does not survive out-of-sample.** In-sample halves +0.627 vs +1.096; out-of-sample +0.542 vs +0.662, correlation 0.035, and the bucket ladder scrambles (TE=0 second-best on n=25). Only the top bucket holds its shape (+2.417R, 75% win, n=12 — too small to lean on).
+
+**[FINDING] Re-adding it as a third averaged attribute fails.** 3-attribute score correlation 0.041 vs −0.015 for the current 2-attribute score, which looks like an improvement, but the 2.5 gate would then drop **361 of 1,255 trades**. Kept +0.872R vs rejected +0.561R full-sample and +1.003 vs +0.524 in-sample — but **out-of-sample it inverts: kept +0.590 vs rejected +0.673.** It would be paying 29% of the trade flow for nothing.
+
+**[FINDING] Tightening as a gate buys concentration, not edge.** Raw average R rises with the cutoff (TE≥3 +0.952, ≥4 +1.129, ≥5 +2.572) while the top-10-removed figure falls in the opposite direction (+0.391, +0.361, +0.331). The apparent gain is carried by a few tickers. The only non-concentrating version — exclude TE=0, dropping 110 trades — does nothing out-of-sample (+0.594 kept vs +0.610 all).
+
+**[DECISION] Stays out of the MVP score and out of the gate stack.** Distinguish this from the pullback-depth null: depth was *flat and non-monotonic* — no effect at all. Trend Efficiency has a real, correctly-ordered tendency that is simply too weak to pay for the candidates it would cost. It is a measurement worth keeping in the output for diagnosis, not a decision input.
+
+**Re-test trigger:** if the passing pool grows well beyond 2,000 trades, or if the top bucket (TE=5) accumulates enough out-of-sample cases to judge on its own.
+
+
+## [METHOD — READ BEFORE TRUSTING ANY ATTRIBUTE RESULT] Statistical power of this dataset (2026-09-16)
+
+Raised by Dave after the Trend Efficiency re-test: is the sample actually large enough to support these conclusions? Computed rather than assumed, and the answer changes how several findings should be read.
+
+**Realized R has a standard deviation of 3.31** across the 1,255-trade passing pool. That is the governing number. Standard error of the overall mean is 0.094R.
+
+Sample needed to resolve a difference between two equal halves at t≈2:
+
+| difference to detect | trades needed (total) |
+|---|---|
+| 0.50R | ~351 |
+| 0.35R | ~716 |
+| 0.25R | ~1,405 |
+| 0.15R | ~3,903 |
+
+**[FINDING] The Trend Efficiency half-vs-half gap of +0.347R has t = 1.86 — not significant.** At n=1,255 the dataset sits right at the edge for quarter-R effects. The out-of-sample slice (n=375) has a standard error of 0.242R per half, so it cannot resolve anything smaller than about half an R.
+
+**[CONSEQUENCE — two piles.]
+
+*Safe.* Effects far above the noise floor, which also replicated under top-10 removal and out-of-sample: the trend-start 95%→85% promotion (~19 CAGR points in all four tests) and the slot-count × cost-cap sweep (clearly separated trade-offs, not close calls). These stand.
+
+*Not safe.* Essentially all attribute-level work, which lives in the 0.1–0.4R range: Trend Efficiency, pullback depth, score-as-ranking-key, LTE. These are **"not detectable at this sample size," not "zero."** The distinction matters — writing them up as closed nulls overstates what was shown. Pullback depth is the partial exception: it was flat *and* non-monotonic *and* had a diagnosed lookahead flaw in the original measure, which is an argument independent of power.
+
+**[BLOCKER] More history is not available in the current dataset.** All 1,591 per-ticker files are a uniform pull: 753 rows each, 2023-09-11 to 2026-09-10. The backtest already consumes essentially all of it, so there is no untested history to recover and waiting accrues only ~464 qualifying signals/yr.
+
+**[ACTION — the highest-leverage open task] Re-pull price history over a 5–10 year window.** At roughly 3× the history the passing pool would reach 3,000–4,000 trades, which brings 0.15–0.25R effects into range and would let every parked attribute question be re-tested at once, rather than one at a time against noise. Note this would also span at least one serious correlated market break, which the current sample lacks — the same gap flagged in the slot-count decision.
+
+**Standing rule:** before adopting or rejecting an attribute, state the size of the effect being claimed and check it against the table above.
