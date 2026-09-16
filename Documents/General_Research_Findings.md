@@ -706,3 +706,54 @@ pipeline, and the true best value is unknown. All the usual sample
 limits still apply: one universe snapshot, optimistic gap fills, no
 serious market break, closed equity only. The +19 points is the
 measured delta on this sample, not a forecast.
+
+
+### Threshold sweep: was 85 the right pick? (2026-09-16)
+
+The one caveat left open by the promotion run. All five values run end
+to end through `staged_pipeline_backtest.py`, then through the account
+replay (10 slots, 10% cap, 8 arrival seeds).
+
+| threshold | passing n | avg R | CAGR | max DD | **CAGR, top-10 removed** |
+|---|---|---|---|---|---|
+| 75 | 1,243 | +0.635 | 83.6% | -19.9% | 46.7% (sd 7.2) |
+| 80 | 1,249 | +0.631 | 94.6% | -19.5% | 48.0% (sd 2.5) |
+| **85 (shipped)** | 1,229 | +0.613 | 84.2% | -18.1% | **48.7% (sd 4.2)** |
+| 90 | 1,164 | +0.612 | 78.7% | -17.6% | 44.8% (sd 5.4) |
+| 95 (old) | 1,001 | +0.578 | 69.0% | -18.3% | 29.3% (sd 4.3) |
+
+### [FINDING] 75 to 85 is a plateau, not a peak
+
+**No change recommended. 85 stays.**
+
+The large gain is entirely in the step down from 95. Everything from 75
+to 85 is the same result within noise -- 46.7, 48.0 and 48.7 on the
+top-10-removed measure, against seed standard deviations of 2.5 to 7.2.
+The differences are smaller than the arrival-order noise.
+
+The full-sample column looks like it favours 80 (94.6% vs 84.2%), but
+that row is **non-monotonic** -- 80 beats both its neighbours, which a
+real effect would not do. It is seed luck, and it disappears under the
+top-10 test. Picking 80 on that basis would be exactly the error the
+least-correlated ranking rule taught us to avoid.
+
+What does move monotonically: drawdown improves as the threshold rises
+(-19.9% at 75 to -17.6% at 90), and average R per trade falls. Looser
+thresholds admit more trades of slightly lower quality, which is the
+expected shape. 85 sits where the drawdown has mostly improved but the
+trade quality has not yet decayed.
+
+**Conclusion: the choice of 85 was luckier than it was principled, but
+it lands on a flat region, so nothing needs changing. The threshold is
+not a sensitive parameter anywhere in 75-85 -- which is itself the
+useful result.** Below 90 the gate stops being the binding constraint;
+the 2.5 score gate takes over, as it should.
+
+### Process note
+
+A run-ordering error cost time here: the constant was reverted by a
+cleanup line and two "80%" runs silently reproduced 95% output. Caught
+because the numbers were identical to four decimal places. **When
+sweeping a constant, assert the value inside the run and echo it with
+the results** -- identical output across supposedly different
+configurations is the symptom to watch for.
