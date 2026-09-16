@@ -3572,3 +3572,60 @@ a crash midway leaves no half-day in the file. Re-processing a date
 already in the log WILL duplicate it -- the last-run-date guard is what
 prevents that, and `append_funnel_rows()` does not second-guess it. If a
 date needs reprocessing, drop its rows first.
+
+
+---
+
+## Portfolio Dollar Returns -- Pointer (2026-09-15)
+
+Full working lives in `General_Research_Findings.md` on the
+`historical_backtest_research` branch, under "Dollar Returns,
+Compounding and the Slot/Cost-Cap Interaction". Code is in
+`portfolio_replay.py` on the same branch. Summarised here because one
+finding bears directly on a locked parameter in this document.
+
+### [FINDING] MAX_CONCURRENT_POSITIONS is not an independent parameter
+
+A slot sweep over the 1,001 passing trades (compounded, 25,000 dollar
+start, 1% risk, 10% cost cap) rises with slot count up to ten -- 4 slots
+29.2% CAGR, 8 slots 55.8%, 10 slots 68.9% -- and then **stops changing
+entirely**. Slots of 12, 15 and 20 return byte-identical results,
+because ten positions at `MAX_POSITION_COST_PCT = 0.10` already commit
+the whole account; the count of signals that could not be funded jumps
+from 52 to 495 at that boundary.
+
+So the ten-position basis recorded against `MAX_POSITION_COST_PCT` above
+is not a separate choice that happens to agree with the cost cap -- it
+IS the cost cap, restated. Changing one without the other changes
+nothing. **If the position count is ever revisited, the two must be
+tested jointly**; no result to date compares one pairing against
+another.
+
+Related: a margin variant showed that measuring risk off equity versus
+off buying power barely moved the outcome (117.4% vs 118.3% CAGR),
+because the cost cap binds first on essentially every trade. At current
+settings `RISK_PERCENT_PER_TRADE` almost never determines share count --
+which is exactly what the `sizing_constraint` column was added to make
+visible. Margin was not adopted.
+
+### Account-level behaviour, for reference
+
+Compounded: 68.9% CAGR, max drawdown -18.2%, longest underwater stretch
+226 days, ~two thirds of months positive. Fixed sizing: 46.8% CAGR,
+-13.7% drawdown. Figures average five arrival-order seeds -- single-seed
+runs vary by several points, and that variation is luck, not signal.
+
+**These are a stress test of the rules, not a forecast.** Drawdown
+shape, time underwater and the slot/cost-cap interaction are the honest
+outputs. The CAGR is not: it compounds one sample containing known
+survivorship bias, optimistic gap fills and no serious market break.
+Equity is CLOSED equity, so real intra-trade drawdowns are deeper than
+reported. Halve the edge before planning against it.
+
+### Trade frequency, for capacity planning
+
+~464 qualifying signals per year on the 1,591-name universe; ~230
+actually taken under the ten-slot limit, about 4-5 per week. Median hold
+6 trading days, mean 8.3 -- so each slot turns over ~30 times a year and
+ten slots cap out near 300 trades. Signals are not the binding
+constraint; slots are. Scale down for a narrower live watchlist.
