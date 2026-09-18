@@ -3763,3 +3763,95 @@ why the threshold is now a named constant instead of a literal. All
 standing sample limits still apply -- one universe snapshot, optimistic
 gap fills, no serious market break in the window, closed equity only.
 The +19 points is a measured delta on this sample, not a forecast.
+
+
+## OPEN ITEM: One Position Per Ticker, With Setup Reset (raised 2026-09-18)
+
+Raised by Dave while reviewing `Trail_Rule_Review.csv`. He noticed the same
+tickers entering repeatedly on consecutive days and said plainly: **a real
+trader would enter the position once.**
+
+This is a **specification defect, not a measurement gap**. It was written up
+deliberately before running the numbers on it, at Dave's instruction -- the
+problem is that the rules do not describe what a trader would actually do.
+
+### The defect
+
+The touch scan fires on every day where `Low <= SMA50 <= High`. A stock that
+sits on its 50-day MA for a week generates five "setups", and the backtest
+takes all five as independent trades.
+
+Observed in the 10-year staged run: ACAD 3 entries in 12 days (all killed the
+same day, -11.56R); MUFG 3 entries in 8 days (-8.12R); DASH 3 entries in 12
+days (-6.72R); VISN 2 entries (-6.32R); BFLY 7 entries across a 6-week window.
+It inflates winners identically: RCAT 5 entries (+101.62R), COGT 3 (+88.29R).
+Roughly 2,151 of the 3,039 passing trades sit in repeat-entry clusters.
+
+**Both tails are exaggerated, and every statistic computed from the staged
+results inherits the distortion** -- expectancy, the concentration sweep, the
+per-year table, the equity curve.
+
+### Rule 1 -- One open position per ticker
+
+Take the first touch that passes all gates. Ignore every subsequent touch in
+that ticker while the position remains open. No pyramiding, no averaging, no
+second line.
+
+### Rule 2 -- Re-entry requires a genuine setup reset
+
+Two alternatives were considered and rejected:
+
+- *Immediate re-entry on the next qualifying touch* -- reproduces the original
+  problem the day after an exit.
+- *Fixed cooldown of N days* -- arbitrary; a stock that has genuinely run away
+  and pulled back again is a legitimate new setup regardless of the calendar.
+
+**Chosen (Dave's call): the setup must actually reset.** After a position
+closes, the ticker becomes eligible again only once price has genuinely left
+the 50-day MA and returned to it -- not merely hovered. A stock sitting on its
+50-day for five days is not five pullbacks.
+
+### Three parameters to specify before implementing
+
+1. **Departure threshold** -- how far above the SMA50 price must travel to
+   count as having left. Candidate: `Close >= SMA50 + (k x ADR10)`.
+   **Must be ADR-normalised, not a fixed percentage** -- a 1.6% ADR name (TRV)
+   and a 10% ADR name are not comparable.
+2. **Persistence** -- consecutive closes required above that threshold
+   (candidate: 1 vs 3). Guards against a single spike qualifying.
+3. Then a fresh touch re-arms the setup normally, with all existing gates
+   (ADR ceiling, overhead, score >= 2.5) applying as usual.
+
+**Do not sweep these three for maximum backtest return.** Pick the values that
+honestly describe the setup being traded, then measure the cost. Sweeping is
+how a specification turns into an overfit -- the same failure that killed
+pullback depth and Trend Efficiency.
+
+### Where it must be implemented
+
+The logic has to exist in both places or the numbers diverge:
+
+- `staged_pipeline_backtest.py`, so research statistics reflect real behaviour.
+- `orchestrator.py` / `portfolio_replay.py`, so live signals and the equity
+  replay agree.
+
+`portfolio_replay.py` already reimplements `size_position()` separately from
+the orchestrator -- the one known place drift can occur. **This rule must not
+become the second.** Share the code.
+
+### Consequences to expect
+
+- Trade count falls materially.
+- **Every prior finding built on the staged results must be re-checked
+  afterwards**, including the pending 8-slots-at-12.5% concentration decision,
+  the per-year expectancy table, and the 10-year equity curve.
+- The top-10-ticker fragility (~10 CAGR points) may look different once repeat
+  entries in the same name collapse into single positions. It may get worse.
+
+### Still not addressed
+
+Rule 1 covers one ticker. It does **not** handle correlated entries across
+DIFFERENT tickers -- TRIP and DASH entered on the same two days in April 2024,
+same sector, both dead within the week, -7.72R combined. That remains a
+separate open gap (P8 in `Chart_Review_Observations.md`), and it needs sector
+data the pipeline does not currently carry.
