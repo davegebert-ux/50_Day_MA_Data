@@ -257,12 +257,29 @@ def main():
     # even if they've since fallen out of today's screen results -- see
     # get_open_position_tickers() docstring for why this matters.
     open_position_tickers = get_open_position_tickers()
-    added_tickers = open_position_tickers - set(universe.keys())
+
+    # FIX (2026-09-19): SPY must ALWAYS be pulled, and never was.
+    # The relative-strength half of the score is computed against SPY, so
+    # orchestrator.py reads data/SPY_1d_data.csv on every scored signal --
+    # but the pull universe is defined by the TradingView momentum screen,
+    # and SPY is an index ETF that cannot pass a momentum screen by
+    # construction. So SPY was never fetched, the file never existed, and
+    # EVERY genuine signal died at the no_spy_data gate: confirmed in
+    # state/daily_funnel.csv for 2026-09-15 and 2026-09-16, where GEO,
+    # NXDR and GEO again detected a real 50-day MA touch, priced the entry
+    # correctly, and were then dropped at no_spy_data. The system had
+    # produced zero trades since going live for this reason alone.
+    # Unioned in unconditionally, the same way open positions are, because
+    # like them it is a correctness requirement independent of whatever
+    # the screen returns on any given day.
+    BENCHMARK_TICKERS = {"SPY"}
+    added_tickers = (open_position_tickers | BENCHMARK_TICKERS) - set(universe.keys())
     if added_tickers:
-        print(f"Adding {len(added_tickers)} open-position ticker(s) not in "
+        print(f"Adding {len(added_tickers)} required ticker(s) (benchmark / open position) not in "
               f"today's screen results: {sorted(added_tickers)}")
         for sym in added_tickers:
-            universe[sym] = ("Open Position (outside screen)", "", sym)
+            universe[sym] = ("Benchmark" if sym in BENCHMARK_TICKERS
+                             else "Open Position (outside screen)", "", sym)
 
     symbols = sorted(universe.keys())
 
