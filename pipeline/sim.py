@@ -195,6 +195,57 @@ def get_trail_line(df, i, rule, entry_idx, adr_threshold, swing_state):
             return np.nan
         return highest_close_since_entry - (1.0 * atr_today)
 
+    elif rule == 'atr_sched_c':
+        # ADDED 2026-09-19: "Option C" escalating trail. See the
+        # 2026-09-19 decision section in Architecture_and_Scope_v1.md.
+        #
+        # Same Chandelier construction as atr_1.0x (anchor on the highest
+        # CLOSE since entry) but the WIDTH escalates with how far the trade
+        # has already travelled, and the trail ARMS EARLIER -- callers must
+        # pass grace_R=0.5, not the 1.5 used by atr_1.0x.
+        #
+        #     progress < 1.5R  ->  0.5 x ATR14   (tight: protect the base)
+        #     1.5R to 3.0R     ->  1.0 x ATR14
+        #     3.0R and above   ->  2.0 x ATR14   (let winners breathe)
+        #
+        # progress is measured on the highest CLOSE since entry, so it is
+        # point-in-time -- it never uses a bar the trade had not yet seen.
+        #
+        # WHY: capture diagnostics showed trail exits keep only 53.6% of
+        # peak profit, and the 2-4R pool keeps just 33.7%. A flat 1.0 ATR
+        # is simultaneously too loose for small winners and too tight for
+        # big ones. On the 10yr staged sample this earned +1,819R at a
+        # 49.8% win rate vs +1,785R at 44.0%, and -22.3% vs -26.6%
+        # marked-to-market drawdown at 8 slots / 12.5%. Unlike every other
+        # candidate tested it IMPROVED with the top-10 tickers removed.
+        #
+        # NOTE ON ENTRY PRICE: the width schedule needs entry_price and
+        # risk_per_share, which this function is not passed. They are
+        # recovered from the module-level _SCHED_CTX that simulate_trail()
+        # populates at the top of every trade. This is ugly but keeps
+        # get_trail_line()'s signature unchanged for all the other rules;
+        # do not call this rule via get_trail_line() directly without
+        # setting _SCHED_CTX first.
+        ep = _SCHED_CTX.get('entry_price')
+        rps = _SCHED_CTX.get('risk_per_share')
+        if ep is None or rps is None or rps <= 0:
+            raise ValueError(
+                "get_trail_line(): rule 'atr_sched_c' requires _SCHED_CTX to be "
+                "populated by simulate_trail(). Call simulate_trail(), not "
+                "get_trail_line() directly.")
+        highest_close_since_entry = df.loc[entry_idx:i, 'Close'].max()
+        atr_today = row['ATR14']
+        if pd.isna(atr_today):
+            return np.nan
+        progress_R = (highest_close_since_entry - ep) / rps
+        if progress_R < 1.5:
+            mult = 0.5
+        elif progress_R < 3.0:
+            mult = 1.0
+        else:
+            mult = 2.0
+        return highest_close_since_entry - (mult * atr_today)
+
     # FIX (2026-09-13): unrecognised rule strings used to fall off the end
     # of this if/elif chain and return None implicitly. simulate_trail()
     # then ran pd.isna(None), which is True, so the trade was treated as
@@ -206,7 +257,7 @@ def get_trail_line(df, i, rule, entry_idx, adr_threshold, swing_state):
     raise ValueError(
         f"get_trail_line(): unrecognised trail rule {rule!r}. "
         f"Valid rules are: '10ma', '20ma', 'hybrid_tight', "
-        f"'adr_adaptive', 'swing_low', 'atr_1.0x'."
+        f"'adr_adaptive', 'swing_low', 'atr_1.0x', 'atr_sched_c'."
     )
 
 
@@ -262,6 +313,13 @@ def update_swing_low(df, i, swing_state):
 # the stop.
 MODEL_GAP_FILLS = True
 
+# Populated by simulate_trail() at the start of each trade; read only by the
+# 'atr_sched_c' branch of get_trail_line(), which needs the trade's entry
+# price and risk-per-share to express progress in R. Module-level state is
+# safe here only because simulate_trail() is single-threaded and rewrites it
+# before every trade -- do not parallelise trades without making this local.
+_SCHED_CTX = {}
+
 
 def stop_fill_price(row, stop):
     """Price a stop actually fills at on a given bar, accounting for gaps."""
@@ -308,6 +366,9 @@ def simulate_trail(df, entry_idx, entry_price, risk_per_share, rule='atr_1.0x', 
       grace_R            : the close-based R threshold that arms the trail
                            in no-partial mode (default 1.5R)
     """
+    _SCHED_CTX['entry_price'] = entry_price
+    _SCHED_CTX['risk_per_share'] = risk_per_share
+
     stop = entry_price - risk_per_share
     partial_taken = False
     remaining = 1.0

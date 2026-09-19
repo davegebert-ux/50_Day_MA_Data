@@ -73,6 +73,23 @@ LAST_RUN_PATH = os.path.join(_STATE_DIR, "last_run_date.txt")
 
 SKIP_SCORE_THRESHOLD = 2.5  # MVP decision -- see Conviction_Sizing_Model_v3.md
 
+# SETUP RESET ON RE-ENTRY (added 2026-09-19) -- keep in sync with
+# staged_pipeline_backtest.py, which documents the reasoning in full.
+# One-position-per-ticker was ALREADY enforced here via already_open_tickers;
+# what is new is the cooldown governing when a CLOSED ticker may be taken
+# again: price must genuinely leave the 50-day MA and come back, rather than
+# hovering along it and re-triggering a touch every other day.
+# Chosen by reasoning, not swept for return -- do not tune for profit.
+# TRAIL RULE -- changed 2026-09-19 to Option C. grace_R MUST be 0.5 for
+# 'atr_sched_c'; the two are a pair. Reasoning in Architecture_and_Scope_v1.md.
+TRAIL_RULE = "atr_sched_c"
+TAKE_PARTIAL = False
+GRACE_R = 0.5
+
+ENFORCE_SETUP_RESET = True
+RESET_DEPARTURE_ADR = 1.0      # closes must clear SMA50 by this x ADR10
+RESET_PERSISTENCE_DAYS = 2     # ...on this many CONSECUTIVE days
+
 # ADDED 2026-09-14: volatility ceiling. Reject touch events whose ADR10 at
 # entry exceeds this. Validated on the 2,310-event wide-universe sample
 # (outliers excluded): a 10% ceiling lifted avg R from 0.459 to 0.494 and
@@ -111,7 +128,14 @@ OVERHEAD_PROXIMITY_R = 0.5
 # REJECTED ALTERNATIVE: flooring the stop distance (e.g. min 2%). It fixes
 # cost as a side effect but spends the strategy's core edge -- a tight stop
 # is what makes a large R multiple possible -- so it was ruled out.
-MAX_POSITION_COST_PCT = 0.10
+# CHANGED 2026-09-19: 0.10 -> 0.125, paired with MAX_CONCURRENT_POSITIONS
+# 10 -> 8. Rationale in Architecture_and_Scope_v1.md: 8 slots at a 12.5%
+# cost cap beat 10 at 10% on CAGR in the portfolio replay at equal drawdown.
+# These two numbers are a PAIR -- 8 x 12.5% = 100% of equity, the same full
+# deployment 10 x 10% gave. Changing one without the other either under-
+# deploys capital or over-concentrates it.
+MAX_POSITION_COST_PCT = 0.125
+MAX_CONCURRENT_POSITIONS = 8
 
 # ADDED 2026-09-15: per-ticker daily funnel log. Append-only record of what
 # the pipeline did to EVERY ticker it looked at each day, not just the ones
@@ -278,9 +302,16 @@ def check_open_positions_for_exits(open_df, target_date):
             entry_idx=entry_idx,
             entry_price=pos["entry_price"],
             risk_per_share=pos["risk_per_share"],
-            # rule / take_partial deliberately left at simulate_trail()'s
-            # own defaults ('20ma', False) -- the recommended, locked-in
-            # configuration. See sim.py's RECOMMENDED CONFIGURATION note.
+            # CHANGED 2026-09-19: the rule is now passed EXPLICITLY.
+            # Previously this relied on simulate_trail()'s defaults, and the
+            # comment here still claimed they were '20ma' -- stale since the
+            # 2026-09-11 switch to atr_1.0x. Production was silently taking
+            # whatever sim.py's signature happened to say. Naming the rule
+            # and grace_R here means a future default change cannot alter
+            # live behaviour without someone editing this line.
+            rule=TRAIL_RULE,
+            take_partial=TAKE_PARTIAL,
+            grace_R=GRACE_R,
         )
 
         if result["exit_reason"] in ("still_open",):
@@ -310,6 +341,53 @@ def check_open_positions_for_exits(open_df, target_date):
 # (touch-scan + momentum-screen + overhead-resistance + scorecard,
 #  restricted to a SINGLE target date -- not a full-history scan)
 # ============================================================
+def _last_closed_exit_dates():
+    """
+    ticker -> most recent exit_date from the closed-trades log, used by the
+    setup-reset rule. Returns {} if the log does not exist yet.
+    """
+    if not os.path.exists(CLOSED_TRADES_PATH):
+        return {}
+    try:
+        cl = pd.read_csv(CLOSED_TRADES_PATH, parse_dates=["exit_date"])
+    except Exception:
+        return {}
+    if len(cl) == 0 or "exit_date" not in cl.columns:
+        return {}
+    return cl.groupby("ticker")["exit_date"].max().to_dict()
+
+
+def setup_has_reset(df, exit_date, target_date):
+    """
+    True if, strictly between exit_date and target_date, the ticker printed
+    RESET_PERSISTENCE_DAYS consecutive closes at or above
+    SMA50 + RESET_DEPARTURE_ADR * ADR10 -- i.e. price genuinely left the
+    50-day MA rather than chopping along it and re-triggering a touch.
+
+    MUST stay in sync with the identically-named function in
+    staged_pipeline_backtest.py, which carries the full reasoning. If one is
+    edited and the other is not, the backtest stops describing production.
+    ADR10 is a PERCENT here, so it is converted to a price distance.
+    """
+    window = df[(df["Date"] > pd.Timestamp(exit_date)) &
+                (df["Date"] < pd.Timestamp(target_date))]
+    if len(window) < RESET_PERSISTENCE_DAYS:
+        return False
+    run = 0
+    for _, r in window.iterrows():
+        ma50, adr10, close = r.get("MA50"), r.get("ADR10"), r.get("Close")
+        if pd.isna(ma50) or pd.isna(adr10) or pd.isna(close):
+            run = 0
+            continue
+        if close >= ma50 + RESET_DEPARTURE_ADR * (adr10 / 100.0) * ma50:
+            run += 1
+            if run >= RESET_PERSISTENCE_DAYS:
+                return True
+        else:
+            run = 0
+    return False
+
+
 def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=None):
     """
     Evaluates ONLY target_date as a possible touch event per ticker (still
@@ -332,6 +410,8 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
     target_date = pd.Timestamp(target_date)
     spy_df = sim.load_ticker(SPY_PATH) if os.path.exists(SPY_PATH) else None
 
+    last_exits = _last_closed_exit_dates() if ENFORCE_SETUP_RESET else {}
+
     signals = []
     files = sorted(glob.glob(os.path.join(DATA_DIR, "*_1d_data.csv")))
     for fpath in files:
@@ -350,6 +430,15 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
             # insufficient history, same floor as the historical scan
             _log(funnel_rows, target_date, ticker, "insufficient_history")
             continue
+
+        # SETUP RESET (2026-09-19): a ticker we have already traded may not
+        # be re-entered until price has genuinely left the 50-day MA and
+        # come back. Checked BEFORE the momentum screen because it is the
+        # cheaper test and the more fundamental objection.
+        if ENFORCE_SETUP_RESET and ticker in last_exits:
+            if not setup_has_reset(df, last_exits[ticker], target_date):
+                _log(funnel_rows, target_date, ticker, "no_setup_reset")
+                continue
 
         df = df[df["Date"] <= target_date].reset_index(drop=True)
         df["SMA50"] = df["Close"].rolling(50).mean()
@@ -552,9 +641,10 @@ def size_and_open_trades(signals, open_df, funnel_rows=None, target_date=None):
     Two independent limits, added 2026-09-14 (see MAX_POSITION_COST_PCT):
       RISK limit -- shares such that shares * risk_per_share <= 1% of account.
                     Caps what the trade can LOSE.
-      COST limit -- shares such that shares * entry_price <= 10% of account.
-                    Caps what the trade TIES UP, and therefore guarantees the
-                    account can hold ~10 concurrent positions.
+      COST limit -- shares such that shares * entry_price <= 12.5% of account
+                    (was 10% before 2026-09-19). Caps what the trade TIES UP,
+                    and therefore guarantees the account can hold ~8
+                    concurrent positions.
     Share count is the LESSER of the two, always rounded down, so neither
     limit can be breached. Both are kept even though the cost cap currently
     binds first on virtually every trade: they express different things, and
@@ -573,8 +663,21 @@ def size_and_open_trades(signals, open_df, funnel_rows=None, target_date=None):
     committed = open_df["position_cost"].sum() if len(open_df) else 0.0
     capital_available = parameters.ACCOUNT_STARTING_BALANCE - committed
 
+    # ADDED 2026-09-19: the slot cap is now enforced EXPLICITLY. Previously
+    # it was only implied by the cost cap (10 x 10% = 100% of equity), so
+    # "max concurrent positions" was a arithmetic coincidence rather than a
+    # rule. With 8 x 12.5% the arithmetic still happens to work out, but any
+    # future change to either number would have silently changed the slot
+    # count. State the limit instead of inferring it.
+    slots_used = len(open_df) if open_df is not None else 0
+
     new_rows = []
     for sig in signals:
+        if slots_used + len(new_rows) >= MAX_CONCURRENT_POSITIONS:
+            print(f"  SKIPPED {sig['ticker']}: all {MAX_CONCURRENT_POSITIONS} "
+                  f"position slots in use")
+            _log(funnel_rows, target_date, sig["ticker"], "no_slot_available")
+            continue
         shares_by_risk = int(dollar_risk_per_trade / sig["risk_per_share"]) if sig["risk_per_share"] > 0 else 0
         shares_by_cost = int(max_position_cost / sig["entry_price"]) if sig["entry_price"] > 0 else 0
         shares = min(shares_by_risk, shares_by_cost)
