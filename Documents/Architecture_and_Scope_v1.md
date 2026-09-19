@@ -3855,3 +3855,342 @@ DIFFERENT tickers -- TRIP and DASH entered on the same two days in April 2024,
 same sector, both dead within the week, -7.72R combined. That remains a
 separate open gap (P8 in `Chart_Review_Observations.md`), and it needs sector
 data the pipeline does not currently carry.
+
+
+## 2026-09-19 -- Trailing-Rule Refinement: FULL SESSION, ALL CANDIDATES REJECTED
+
+**Outcome: no change. The trail stays `atr_1.0x`, armed on a 1.5R close.**
+Every candidate tested either lost outright or failed a promotion bar. Recorded
+in full so none of it is re-run from scratch.
+
+Baseline throughout: n=3,039 passing trades, avgR +0.587, win 44.0%, totalR +1,785.
+
+### Why the trail was the target
+
+Exit-reason breakdown of the 3,039 trades:
+
+| exit reason | n | share | avg R | total R |
+|---|---|---|---|---|
+| `atr_1.0x_trail` | 1,391 | 45.8% | +2.518 | **+3,503** |
+| `initial_stop` | 1,437 | 47.3% | -1.069 | -1,537 |
+| `initial_stop_entry_day` | 131 | 4.3% | -1.000 | -131 |
+| `stop` | 51 | 1.7% | -1.577 | -80 |
+| `still_open` | 29 | 1.0% | +1.056 | +31 |
+
+**The trail is the entire profit engine.** Within it, the 42 trades above 10R
+produce +650R while the 431 trades between 0 and 1R produce +244R combined.
+
+### Capture diagnostic (`_trail_diag.csv`)
+
+Trail exits capture **53.6% of peak profit**: mean MFE 4.70R, mean realized
+2.52R, mean giveback 2.18R. Capture is strongly size-dependent:
+
+| MFE bucket | n | mean MFE | mean realized | capture % |
+|---|---|---|---|---|
+| 0-2R | 107 | 1.84 | 0.29 | 15.5 |
+| **2-4R** | **734** | **2.95** | **0.99** | **33.7** |
+| 4-6R | 277 | 4.86 | 2.64 | 54.4 |
+| 6-10R | 180 | 7.66 | 5.18 | 67.6 |
+| 10-20R | 83 | 13.36 | 9.90 | 74.1 |
+| 20R+ | 10 | 33.52 | 25.78 | 76.9 |
+
+Also: **796 trades were up >=1R at some point and still stopped out, costing
+-852R**; 327 of those cleared 1.5R, i.e. the trail armed and gave it all back.
+Median time from peak to exit is **2 days** -- these are sharp reversals, not
+slow bleeds.
+
+### Where the giveback actually goes -- decomposition (2-4R pool)
+
+| component | R |
+|---|---|
+| peak intraday HIGH | 2.92 |
+| highest CLOSE (what the trail anchors to) | 2.45 |
+| lost to intraday wick | **0.38** |
+| minus 1 x ATR trail width | **1.05** |
+| slippage filling below the line on gap-downs | **0.37** |
+| actual median exit | 0.95 |
+
+**Only about half the giveback is the trail rule.** The wick premium and the
+gap-through slippage (~0.37R, near-constant across every MFE bucket) are a
+fixed toll that no ATR multiple can tune away. This is the single most useful
+number from the session.
+
+### Test 1 -- flat width sweep. REJECTED (fails win-rate constraint)
+
+Production `get_trail_line()` extended to accept any multiple; nothing else
+changed. Validated first: reproduced the production 1.0x result on 400 trades
+to within rounding.
+
+| width | avgR | win% | totalR | totalR ex-top10 |
+|---|---|---|---|---|
+| 0.75x | +0.564 | 44.7 | +1,714 | +1,225 |
+| **1.0x (current)** | +0.587 | 44.0 | +1,785 | +1,239 |
+| 1.25x | +0.615 | 41.6 | +1,870 | +1,349 |
+| 1.5x | +0.638 | 39.6 | +1,937 | +1,372 |
+| 2.0x | +0.714 | 34.9 | +2,170 | +1,645 |
+
+**Tightening loses; widening gains, monotonically, and survives outlier
+removal.** But win rate falls to 34.9% at 2.0x -- the same trade-off Dave
+rejected on 2026-09-11. Roughly 100R of total profit per point of win rate.
+
+### Test 2 -- escalating (schedule) trail. Dave's idea: tight early, wider as the trade earns room
+
+Width set by how far the trade has already run, measured on **highest close
+since entry** (point-in-time, no lookahead).
+
+| variant | totalR | win% | ex-top10 | mid-pool avg |
+|---|---|---|---|---|
+| CURRENT flat 1.0 | +1,785 | 44.0 | +1,239 | 0.73R |
+| A: arm 1.5R, 1/1.5/2 at 1.5R/3R | +2,221 | 38.6 | +1,694 | 0.88R |
+| **B: arm 1.5R, 1/1.5/2 at 3R/5R** | **+2,085** | **43.5** | **+1,571** | 0.74R |
+| C: arm 0.5R, 0.5/1/2 at 1.5R/3R | +1,819 | 49.8 | +1,410 | 0.67R |
+| D: arm 1.0R, 1/1.5/2 at 2R/4R | +2,029 | 43.8 | +1,535 | 0.75R |
+| E: arm 1.5R, 1.5/2 at 3R | +2,221 | 38.6 | +1,694 | 0.88R |
+
+**[STRUCTURAL FINDING] A and E are identical to the decimal.** If the trail
+only arms on a 1.5R close, the trade has already passed the first schedule
+step, so a tight early phase can never apply. **"Tight early" is only
+expressible if the trail arms early** -- which is variant C, and C earns the
+least. This is a property of the rule, not a sampling artifact.
+
+All variants improved both halves of the sample (pre-2022 and 2022-onward),
+so none of it is one regime.
+
+### Test 3 -- ratcheting profit floors. REJECTED (no effect or worse)
+
+On top of schedule A: lock a minimum profit once the trade closes above a
+threshold.
+
+| floor | totalR | win% | ex-top10 |
+|---|---|---|---|
+| none | +2,221 | 38.6 | +1,694 |
+| 2R -> lock 0.75R | +2,213 | 39.2 | +1,686 |
+| 2R -> lock 1R | +2,157 | 39.7 | +1,630 |
+| 2R -> 1R, 4R -> 2R | +2,158 | 39.8 | +1,631 |
+| 2.5R -> 1.5R, 4R -> 2.5R | +2,164 | 39.6 | +1,632 |
+
+**Every floor is flat-to-worse.** Consistent with the decomposition above: the
+profit is lost to wicks and overnight gaps, and a floor does not help when the
+stock opens beneath it.
+
+### Test 4 -- swing-low trail. Dave's idea. REJECTED (dominated by B)
+
+Rule: line = lowest low of the last N sessions, floored at the **entry day's
+low including the wick**, never looser than the initial hard stop, and
+ratcheting upward only. Rationale (Dave's, and it is sound): you still SIZE for
+the full ATR because that is the risk you accepted, but once the entry day
+prints a shallow low the stock has shown where support is -- stop granting room
+it has not asked for.
+
+Run in the production simulator; reproduced a scratch implementation exactly.
+
+| variant | totalR | win% | ex-top10 | mid-pool | still_open |
+|---|---|---|---|---|---|
+| CURRENT | +1,785 | 44.0 | +1,239 | 0.73R | 29 |
+| swing 5d | +1,983 | 38.3 | +1,466 | **0.89R** | 31 |
+| swing 10d | +1,995 | 32.1 | +1,508 | 0.75R | 36 |
+| swing 5d + 2.0 ATR cap | +1,971 | 38.8 | +1,427 | 0.87R | 31 |
+| swing 10d + 2.0 ATR cap | +2,077 | 35.9 | +1,540 | 0.77R | 35 |
+| swing 10d + 1.5 ATR cap | +1,865 | 39.9 | +1,333 | 0.80R | 30 |
+
+Swing 5d harvests the 2-4R pool better than anything else tested (0.89R), which
+vindicates the support intuition. But **option B beats every swing variant on
+totalR, win rate AND ex-top10 simultaneously**, so none of them advances.
+
+### Test 5 -- THE ONE THAT MATTERS. Option B through the portfolio replay. REJECTED
+
+B's hold time is barely longer than current (mean 11.6 -> 14.4 days, median 8
+-> 8), so capital tie-up was not the issue. The result was:
+
+| config | CAGR% | maxDD% |
+|---|---|---|
+| CURRENT @ 10 slots / 10% | 45.7 | -21.7 |
+| OPTION B @ 10 slots / 10% | **47.3** | -22.3 |
+| CURRENT @ 8 slots / 12.5% | **50.3** | -22.4 |
+| OPTION B @ 8 slots / 12.5% | 48.4 | -23.0 |
+
+At 8 slots / 12.5%, full sample and with each rule's own top-10 contributors
+removed (12 seeds each):
+
+| config | CAGR% | maxDD% |
+|---|---|---|
+| CURRENT full sample | **49.2** | -22.5 |
+| OPTION B full sample | 47.2 | -23.2 |
+| CURRENT ex-top10 | **30.7** | -22.9 |
+| OPTION B ex-top10 | 28.6 | -23.1 |
+
+**B wins at 10 slots and loses at 8 -- the configuration already decided on.**
+About 2 CAGR points worse both on the full sample and with outliers removed,
+with slightly worse drawdown. It fails promotion bar 2.
+
+**[LESSON, and the reason this session is worth writing up] A +300R improvement
+in total R turned into a -2 CAGR point regression once slot limits and position
+sizing were applied.** Total R is not account return. Any future trail or entry
+candidate must clear the portfolio replay at the production slot count before
+it is believed. Note also that the top-10 ticker list CHANGES under B (CELH,
+PLUG, XYZ, NRG, VIAV, VST enter) -- a rule change reshuffles which names carry
+the result, so the fragility test must be recomputed per rule, not reused.
+
+### Caveat on the replay numbers
+
+This replay was reimplemented in the sandbox from `portfolio_replay.py`'s
+`size_position()` and `replay_dollars()` logic; its absolute equity figures
+(circa $900k-$1.0M) are far above the ~$274k previously recorded from the
+production script. **The row-to-row comparison is apples-to-apples and is what
+the decision rests on; the absolute figures should not be quoted** until the
+discrepancy is chased down. That discrepancy is itself now an open item --
+`size_position()` being reimplemented in two places is the known drift risk
+called out in the source comments.
+
+### What remains open on the trail
+
+- The ~0.37R gap-through slippage and ~0.38R wick premium are structural, not
+  tunable. Reducing them needs a different exit mechanism (e.g. intraday or
+  stop-limit orders), not a different multiple.
+- Variant C (arm 0.5R, 0.5/1/2 ATR) reaches a **49.8% win rate** at +1,819R.
+  It was not run through the portfolio replay. If a higher win rate is worth
+  real money to Dave's willingness to follow the system, C is the only
+  candidate that offers it -- but it must clear the replay at 8 slots first.
+
+
+### DECISION (2026-09-19, end of session): ADOPT VARIANT C -- conditionally
+
+After option B was rejected on the portfolio replay, variant C was put through
+the same test. It had been passed over earlier purely because it earns less
+total R (+1,819 vs B's +2,085). That was the wrong criterion.
+
+**Rule C:** trail arms on a **0.5R close** (grace_R 0.5, down from 1.5).
+Width keyed to highest close since entry: **0.5 x ATR14 below +1.5R,
+1.0 x ATR14 from +1.5R, 2.0 x ATR14 from +3R.** Ratchets up only.
+
+Reproduced exactly in the production simulator (validation harness reproduced
+the current rule at n=3,039 / +1,785R / 44.0% win, max per-trade deviation
+0.006R, so the patch is sound).
+
+| config | CAGR% | maxDD% (closed) | totalR |
+|---|---|---|---|
+| CURRENT @ 10 slots / 10% | 45.0 | -21.7 | +1,785 |
+| **OPTION C @ 10 slots / 10%** | **47.6** | **-13.5** | +1,819 |
+| CURRENT @ 8 slots / 12.5% | 49.2 | -22.5 | +1,785 |
+| **OPTION C @ 8 slots / 12.5%** | **49.4** | **-14.6** | +1,819 |
+| CURRENT ex-top10 @ 8 slots | 30.7 | -22.9 | +1,239 |
+| **OPTION C ex-top10 @ 8 slots** | **34.8** | **-14.6** | +1,249 |
+
+**C wins every cell**, including at the 8 slots / 12.5% configuration where B
+failed, and unlike every other candidate tested it **improves when the top ten
+contributing tickers are removed** (+4.1 CAGR points vs current, against +0.2
+on the full sample). Less outlier dependence, not more.
+
+#### Drawdown stress test -- half the improvement was an artifact
+
+The equity curve counts CLOSED equity only, so open losers are not marked to
+market. C exits sooner, which could flatter it. Re-run marking all open
+positions to market daily (4 seeds, 8 slots / 12.5%):
+
+| rule | CAGR% | DD closed-equity | DD marked-to-market |
+|---|---|---|---|
+| CURRENT | 50.3 | -22.5% | **-26.6%** |
+| OPTION C | 51.2 | -14.7% | **-22.3%** |
+
+The advantage falls from ~7.8 points to **~4.3 points**. It is real but
+moderate. **Quote the marked-to-market figures, not the closed-equity ones.**
+Note this also means every previously recorded drawdown in this document is
+understated by roughly 4 points.
+
+#### Argument against, recorded honestly
+
+C changes three parameters at once (arming threshold plus two width steps) --
+exactly the objection that led to B being preferred over A earlier in the
+session. That is genuine overfitting exposure. The mitigating argument: C
+**loses** on total R and wins on drawdown, win rate and outlier-independence.
+A curve-fit normally wins on the axis it was selected for; C was not selected
+on those axes. Also, arming at 0.5R is directionally the same instinct as the
+swing-low tests, which independently showed the 2-4R pool is where the money
+leaks -- two different rules pointing at the same place.
+
+#### CONDITION ON PROMOTION -- do the ticker fix first
+
+**C is not to be promoted until the one-position-per-ticker + setup-reset rule
+is implemented** (open item at the end of this document). Roughly 2,151 of the
+3,039 trades sit in repeat-entry clusters; C exits faster than the current
+rule and will therefore re-enter those clusters on a different cadence. The
+comparison above could move. Order of work:
+
+1. Implement one-position-per-ticker + setup reset in BOTH
+   `staged_pipeline_backtest.py` and `orchestrator.py` / `portfolio_replay.py`.
+2. Re-run current rule vs C at 8 slots / 12.5%, full sample and ex-top10,
+   marked to market.
+3. If C still wins, change `grace_R` default to 0.5 and add the schedule to
+   `get_trail_line()` as a new rule name (do NOT silently redefine
+   `atr_1.0x`), and record the result here.
+4. Reconcile the replay equity discrepancy (this session's harness produces
+   ~$0.9-1.0M where production previously produced ~$274k) before any absolute
+   dollar figure is quoted anywhere.
+
+**Status: DECIDED, PENDING the ticker fix. Not a new open research question --
+the research is finished. Steps 1-4 are implementation.**
+
+
+### CORRECTION (2026-09-19, later the same session): the numbers above were inflated
+
+While preparing the code changes, the one-position-per-ticker + setup-reset
+rule was implemented and run against the 10-year sample. The effect is far
+larger than anticipated, and **it invalidates the absolute figures in every
+section above, including the decision table for Variant C.**
+
+#### What the rule removed
+
+| | trades |
+|---|---|
+| passing trades before the rule | 3,039 |
+| blocked -- position already open in that ticker | 987 |
+| blocked -- no setup reset since the previous exit | 634 |
+| **surviving trades** | **1,418** |
+
+**53% of the sample was repeat entries into a setup already being traded.**
+Examples: COGT 7 entries -> 3, RCAT 6 -> 2, BFLY 5 -> 4, ACAD 3 -> 1,
+MUFG 3 -> 1, DASH 3 -> 1.
+
+Total R under the old trail falls from +1,785 to **+826** -- not because the
+rule is unprofitable, but because the earlier figure was counting the same
+trade several times over. Average R per trade is essentially unchanged
+(+0.587 -> +0.583), which is the tell: the edge per setup was always real,
+the COUNT of setups was not.
+
+#### Corrected comparison, post-fix sample (n=1,418), 8 slots / 12.5%
+
+| config | totalR | avgR | win% | CAGR% | maxDD% (closed) |
+|---|---|---|---|---|---|
+| CURRENT `atr_1.0x` | +826 | 0.583 | 44.4 | 29.5 | -18.5 |
+| **OPTION C `atr_sched_c`** | +827 | 0.583 | **49.4** | **37.3** | **-10.8** |
+| CURRENT ex-top10 | -- | -- | -- | 19.7 | -24.6 |
+| **OPTION C ex-top10** | -- | -- | -- | **22.7** | **-11.6** |
+
+**The headline CAGR for the system drops from roughly 49% to roughly 30%
+under the current trail.** That is the honest number for the system as
+specified, and every CAGR figure recorded in this document before today
+should be read as inflated by repeat-entry duplication.
+
+#### The Variant C decision SURVIVES, but for a different reason
+
+On the corrected sample C's per-trade advantage **disappears entirely**:
++827R vs +826R, identical average R. The entire remaining case for C is the
+portfolio effect -- 37.3% vs 29.5% CAGR and half the drawdown -- which comes
+from exiting losers sooner and freeing slots, not from earning more per trade.
+It still improves relative to current with the top ten tickers removed.
+
+This is a weaker and narrower claim than the one made earlier in the session.
+It is also a more fragile one: an edge that lives entirely in slot recycling
+depends on the slot count, the cost cap and the arrival order, all of which
+are modelling choices. **C remains adopted, but it should be re-checked if
+MAX_CONCURRENT_POSITIONS or MAX_POSITION_COST_PCT is ever changed again.**
+
+#### Implementation bug worth remembering
+
+The first version of the Stage 6b filter tested `dropped_at is not None` on a
+DataFrame column. DataFrame construction converts the dicts' `None` values to
+`NaN`, and `NaN is not None`, so the test matched nothing: the stage ran,
+suppressed zero trades, printed a success line, and left the trade count
+unchanged at exactly 3,039. **A filter that changes nothing at all is a bug
+signature, not a null result.** The fix is `pd.notna()`; a comment to that
+effect is now in the source.
