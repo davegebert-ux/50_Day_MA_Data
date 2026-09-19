@@ -24,7 +24,8 @@ STAGE ORDER (mirrors orchestrator.py's live path)
   3. Overhead resistance -- no unresolved 2yr high above current price
   4. ADR ceiling       -- ADR10 at entry <= ADR_CEILING_PCT
   5. Score gate        -- total_score_v2 >= SKIP_SCORE_THRESHOLD
-  6. Simulate          -- entry at SMA50, atr_1.0x trail, R-multiple
+  6. Simulate          -- entry at SMA50, atr_sched_c trail, R-multiple
+  6b. One position per ticker + setup reset (added 2026-09-19)
 
 Stages 1 and 2 are performed by touch_scan_and_momentum_screen.py and
 are assumed already done (its output CSV is this script's input).
@@ -85,11 +86,89 @@ ADR_CEILING_PCT = 10.0
 SKIP_SCORE_THRESHOLD = 2.5
 OVERHEAD_PROXIMITY_R = 0.5   # v3 overhead rule -- keep in sync with orchestrator.py
 
-TRAIL_RULE = "atr_1.0x"
+# TRAIL RULE (changed 2026-09-19 -- see the "ADOPT VARIANT C" decision in
+# Architecture_and_Scope_v1.md). 'atr_sched_c' arms at a 0.5R CLOSE and
+# escalates 0.5 -> 1.0 -> 2.0 x ATR14 at +1.5R and +3R.
+# GRACE_R MUST be 0.5 for this rule; leaving it at sim.py's 1.5 default
+# silently disables the tight early phase and reproduces something close to
+# the old rule. The two settings are a pair -- change them together.
+# To reproduce pre-2026-09-19 results, set these back to "atr_1.0x" / 1.5.
+TRAIL_RULE = "atr_sched_c"
+GRACE_R = 0.5
 TAKE_PARTIAL = False
 CAP_PCT = sim.RECOMMENDED_CAP_PCT
 
 OUTLIER_LO, OUTLIER_HI = 0.01, 0.99
+
+# ---------------------------------------------------------------------------
+# ONE POSITION PER TICKER + SETUP RESET  (added 2026-09-19)
+#
+# DEFECT THIS FIXES: this backtest evaluated every touch event independently,
+# so a ticker that hovered around its 50-day MA generated an entry on each of
+# several consecutive days -- ACAD 3 entries in 12 days, BFLY 7 in 6 weeks,
+# RCAT 5 (which INFLATED results by +101R). Roughly 2,151 of the 3,039
+# passing trades sat in such clusters. A real trader takes the setup once.
+#
+# NOTE: orchestrator.py never had this bug -- find_new_signals_for_date()
+# already skips tickers in already_open_tickers and logs "already_open".
+# This is the backtest catching up to production, not a change to live
+# behaviour. What production does NOT yet have is the setup-reset rule
+# below, which governs when a CLOSED ticker may be re-entered.
+#
+# THE RULE, in two parts:
+#   1. One open position per ticker. While a trade is open, later touches in
+#      the same ticker are ignored entirely. No pyramiding, no averaging.
+#   2. After a trade closes, re-entry requires a genuine SETUP RESET: price
+#      must actually LEAVE the 50-day MA and come back, not merely hover.
+#      Concretely, after the exit date the ticker must print
+#      RESET_PERSISTENCE_DAYS consecutive closes at or above
+#      SMA50 + RESET_DEPARTURE_ADR x ADR10 before a fresh touch counts.
+#
+# The departure threshold is expressed in ADR (average daily range) rather
+# than percent so that a quiet utility and a volatile biotech face the same
+# rule in units of their own typical movement -- a fixed 3% would be noise
+# for one and a major move for the other.
+#
+# THESE THREE NUMBERS WERE CHOSEN ON REASONING, NOT SWEPT FOR RETURN.
+# 1.0 ADR = "a normal day's move clear of the average", 2 consecutive closes
+# = "not a single spike", and the existing gates re-run unchanged on the new
+# touch. Do NOT tune them to maximise backtest profit; that converts a
+# structural realism fix into a curve fit. If they are ever changed, record
+# the reasoning in Architecture_and_Scope_v1.md at the same time.
+# ---------------------------------------------------------------------------
+ENFORCE_ONE_POSITION_PER_TICKER = True
+RESET_DEPARTURE_ADR = 1.0      # closes must clear SMA50 by this x ADR10
+RESET_PERSISTENCE_DAYS = 2     # ...on this many CONSECUTIVE days
+
+
+def setup_has_reset(df_full, exit_date, next_entry_date):
+    """
+    True if, strictly between exit_date and next_entry_date, the ticker
+    printed RESET_PERSISTENCE_DAYS consecutive closes at or above
+    SMA50 + RESET_DEPARTURE_ADR * ADR10 -- i.e. price genuinely left the
+    moving average rather than chopping along it.
+
+    ADR10 is a PERCENT in this pipeline, so it is converted to a price
+    distance against the MA before use.
+    """
+    window = df_full[(df_full["Date"] > exit_date) &
+                     (df_full["Date"] < next_entry_date)]
+    if len(window) < RESET_PERSISTENCE_DAYS:
+        return False
+    run = 0
+    for _, r in window.iterrows():
+        ma50, adr10, close = r.get("MA50"), r.get("ADR10"), r.get("Close")
+        if pd.isna(ma50) or pd.isna(adr10) or pd.isna(close):
+            run = 0
+            continue
+        threshold = ma50 + RESET_DEPARTURE_ADR * (adr10 / 100.0) * ma50
+        if close >= threshold:
+            run += 1
+            if run >= RESET_PERSISTENCE_DAYS:
+                return True
+        else:
+            run = 0
+    return False
 
 
 def load_spy():
@@ -184,7 +263,8 @@ def main():
             entry_idx = len(df) - 1
             rps = sim.compute_risk_per_share(entry_price, float(adr10), CAP_PCT)
             out = sim.simulate_trail(df_full, entry_idx, entry_price, rps,
-                                     rule=TRAIL_RULE, take_partial=TAKE_PARTIAL)
+                                     rule=TRAIL_RULE, take_partial=TAKE_PARTIAL,
+                                     grace_R=GRACE_R)
             rec["entry_price"] = round(entry_price, 4)
             rec["risk_per_share"] = round(rps, 4)
             rec["outcome_exit_date"] = out.get("exit_date")
@@ -207,6 +287,47 @@ def main():
         rows.append(rec)
 
     res = pd.DataFrame(rows)
+
+    # ---------- STAGE 6b: ONE POSITION PER TICKER + SETUP RESET ----------
+    # Applied AFTER all per-event gates, because whether a touch is a repeat
+    # depends on which EARLIER touches actually became trades -- which in
+    # turn depends on those gates. Walking each ticker forward in date order
+    # is the only honest way to resolve that, and it is point-in-time: the
+    # decision on a given touch uses only touches and exits before it.
+    if ENFORCE_ONE_POSITION_PER_TICKER:
+        res = res.sort_values(["ticker", "entry_date"]).reset_index(drop=True)
+        blocked = 0
+        for ticker, grp in res.groupby("ticker", sort=False):
+            last_exit = None
+            for idx in grp.index:
+                # NOTE: must be pd.notna(), NOT "is not None". The rows are
+                # built from dicts carrying None, but DataFrame construction
+                # converts those to NaN, and NaN is not None -- so an
+                # is-None test here matches NOTHING, silently skips every
+                # row, and this whole stage becomes a no-op that still
+                # prints "0 repeat entries suppressed". Found in testing
+                # 2026-09-19; the symptom is a suspiciously unchanged
+                # trade count.
+                if pd.notna(res.at[idx, "dropped_at"]):
+                    continue          # already rejected by an earlier gate
+                entry_date = res.at[idx, "entry_date"]
+                if last_exit is not None and entry_date <= last_exit:
+                    res.at[idx, "dropped_at"] = "6b_position_already_open"
+                    blocked += 1
+                    continue
+                if last_exit is not None:
+                    df_full = cache.get(ticker)
+                    if df_full is None or not setup_has_reset(
+                            df_full, last_exit, entry_date):
+                        res.at[idx, "dropped_at"] = "6b_no_setup_reset"
+                        blocked += 1
+                        continue
+                ex = res.at[idx, "outcome_exit_date"]
+                last_exit = pd.Timestamp(ex) if pd.notna(ex) else None
+        res = res.sort_values(["entry_date", "ticker"]).reset_index(drop=True)
+        print(f"STAGE 6b: {blocked} repeat entries suppressed "
+              f"(one position per ticker + setup reset).\n")
+
     res.to_csv(OUTPUT_FILE, index=False)
 
     # ---------- THE FUNNEL ----------
@@ -230,7 +351,8 @@ def main():
     print("WHAT EACH GATE REJECTED (the counterfactual -- did it earn its keep?)")
     print("=" * 78)
     for stage in ["3_overhead_resistance", "4_adr_ceiling",
-                  "5_unscorable", "5_score_below_threshold"]:
+                  "5_unscorable", "5_score_below_threshold",
+                  "6b_position_already_open", "6b_no_setup_reset"]:
         report(f"rejected by {stage}", res[res["dropped_at"] == stage])
 
     print()
