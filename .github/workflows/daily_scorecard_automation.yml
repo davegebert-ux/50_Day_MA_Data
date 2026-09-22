@@ -7,27 +7,33 @@ name: Daily Scorecard Automation
 # the updated data and state files back into this repository so
 # tomorrow's run picks up exactly where today left off.
 #
-# SCHEDULING NOTE: GitHub Actions "schedule" triggers run on UTC time
-# only -- US Eastern time shifts between UTC-4 (EDT, summer) and UTC-5
-# (EST, winter) twice a year. Two cron triggers are defined for each
-# intended Eastern time (one per possible UTC offset); pipeline/
-# check_run_window.py checks the REAL Eastern clock at run time and
-# decides whether this specific trigger should actually do anything --
-# on any given day, two of the four triggers are no-ops.
+# SCHEDULING (REWRITTEN 2026-09-22): GitHub does NOT fire scheduled
+# workflows on time. Its own docs warn they can be delayed or dropped
+# under load, especially at the top of the hour. On Monday 2026-09-21
+# the only fires landed at 8:30pm and 1:51am Eastern; the old design
+# accepted runs only within 20 minutes of 6pm/8pm, so both were thrown
+# away and Monday was never processed.
 #
-# WEEKEND GUARD (FIX 2026-09-13): previously all four crons ran seven
-# days a week, so the pipeline fired on Saturday and Sunday and mailed
-# a stale Friday summary. Day-of-week fields are now set on every cron.
-# NOTE the offset: the 6pm Eastern primaries land on the SAME UTC day
-# (Mon-Fri = 1-5), but the 8pm Eastern retries cross midnight UTC into
-# the NEXT day, so they must run Tue-Sat (2-6) in order to cover
-# Friday evening's retry slot. This is cron-level defence only --
-# check_run_window.py should ALSO reject Saturday/Sunday on the real
-# Eastern clock, since that is the authoritative check.
+# The fix is to stop depending on WHEN a trigger fires. The workflow now
+# fires hourly through the evening plus once the next morning, always at
+# :17 past (off the busy top of the hour). pipeline/check_run_window.py
+# asks one question: has the most recent FINISHED trading session been
+# processed yet (per state/last_run_date.txt)? The first fire that lands
+# does the work; every later fire finds it done and exits in seconds.
+# Late fires, dropped fires, weekends, holidays and the EDT/EST clock
+# change are all handled by that one check, not by the cron lines.
 #
-# Intended run times: 6:00 PM Eastern (primary), 8:00 PM Eastern (retry
-# -- only actually does anything if the 6pm run failed or never ran,
-# per state/last_run_date.txt not yet reflecting today's date).
+# Cron lines are UTC. Eastern evenings Mon-Fri cross midnight UTC, so
+# the after-midnight UTC hours must run Tue-Sat to cover Mon-Fri
+# evenings. Coverage:
+#   EDT (summer): 6:17pm through 1:17am, then 8:17am next morning
+#   EST (winter): 5:17pm through 12:17am, then 7:17am next morning
+#   (a 5:17pm EST fire is before the 5:30pm ready time and no-ops)
+#
+# FAILURE EMAILS: a failure before 8pm Eastern stays quiet, because the
+# next hourly fire retries it automatically. A failure at 8pm or later
+# (including the morning safety-net fire) emails Dave. No summary email
+# by the next morning means nothing got through -- check Actions.
 #
 # WHY STATE GETS COMMITTED BACK: each GitHub Actions run starts from a
 # clean checkout of the repo -- nothing persists between runs unless
@@ -40,17 +46,25 @@ name: Daily Scorecard Automation
 
 on:
   schedule:
-    - cron: '0 22 * * 1-5'   # 6:00 PM EDT = 10:00 PM UTC, Mon-Fri
-    - cron: '0 23 * * 1-5'   # 6:00 PM EST = 11:00 PM UTC, Mon-Fri
-    - cron: '0 0 * * 2-6'    # 8:00 PM EDT retry = 12:00 AM UTC next day, Tue-Sat
-    - cron: '0 1 * * 2-6'    # 8:00 PM EST retry = 1:00 AM UTC next day, Tue-Sat
+    - cron: '17 22-23 * * 1-5'  # 6:17 & 7:17 PM EDT / 5:17 & 6:17 PM EST, Mon-Fri evenings
+    - cron: '17 0-5 * * 2-6'    # 8:17 PM-1:17 AM EDT / 7:17 PM-12:17 AM EST (next UTC day, Tue-Sat)
+    - cron: '17 12 * * 2-6'     # 8:17 AM EDT / 7:17 AM EST next-morning safety net, Tue-Sat
   workflow_dispatch:         # allows manually triggering a run from the GitHub UI, for testing
     inputs:
       force_run:
-        description: 'Force a real run right now, bypassing the 6pm/8pm Eastern time check (for manual testing)'
+        description: 'Run now even if already up to date (never touches a session whose market has not closed)'
         required: false
         default: false
         type: boolean
+
+# ADDED 2026-09-22: never let two runs overlap. With nine fires a day,
+# two delayed fires can land minutes apart; without this, both would read
+# the same state, both would process the same days, and the second push
+# would collide with the first. This makes the second one wait, then it
+# checks out the first one's committed state and finds nothing to do.
+concurrency:
+  group: daily-scorecard
+  cancel-in-progress: false
 
 jobs:
   run-pipeline:
@@ -67,9 +81,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pandas numpy requests lxml tradingview-screener
+        run: pip install pandas numpy requests lxml
 
-      - name: Determine if this trigger should actually run (correct Eastern hour check)
+      - name: Determine if this trigger should actually run (has the latest finished session been processed?)
         id: check_time
         run: python3 pipeline/check_run_window.py
         env:
@@ -102,10 +116,15 @@ jobs:
             echo "No changes to commit -- nothing new from today's run (normal on non-trading days)."
           else
             git commit -m "Automated daily update: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            # ADDED 2026-09-22: pick up any commit Dave made to main while
+            # this run was working (e.g. pasting an updated pipeline file),
+            # so the push isn't rejected. The bot only writes data/ and
+            # state/, Dave only edits code and docs, so these never overlap.
+            git pull --rebase origin main
             git push
           fi
 
-      - name: Send failure notification email (only if this was the 8pm retry AND it failed)
+      - name: Send failure notification email (only if it failed at or after 8pm Eastern)
         if: steps.check_time.outputs.should_run == 'true' && steps.check_time.outputs.is_retry_slot == 'true' && failure()
         run: python3 pipeline/send_failure_email.py
         env:
@@ -113,16 +132,15 @@ jobs:
           EMAIL_APP_PASSWORD: ${{ secrets.SCORECARD_EMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.SCORECARD_EMAIL_TO }}
 
-      # DUPLICATE-EMAIL NOTE (2026-09-13): on 2026-09-12 both the primary
-      # and the retry sent an identical summary. Root cause was NOT here
-      # -- it was that orchestrator.py only stamped
-      # state/last_run_date.txt when it actually processed a trading day,
-      # so on a quiet day the primary's success left no trace and the 8pm
-      # retry concluded the 6pm run had never happened. Both fixes now
-      # live in the Python: orchestrator.py stamps the date on every
-      # completed run, and check_run_window.py rejects non-trading days
-      # outright using the NYSE calendar. This step's condition is
-      # therefore unchanged -- should_run is now trustworthy.
+      # DUPLICATE-EMAIL NOTE (2026-09-13, updated 2026-09-22): on
+      # 2026-09-12 both the primary and the retry sent an identical
+      # summary, because the old clock-window design couldn't tell a
+      # quiet successful run from a run that never happened. Under the
+      # 2026-09-22 design should_run is true only when a finished session
+      # is still unprocessed, so exactly one run per session reaches this
+      # step. When a run catches up several days at once, the email
+      # summarizes the LAST day processed; the earlier days are in
+      # state/daily_funnel.csv.
       - name: Send daily summary email (only on success)
         if: steps.check_time.outputs.should_run == 'true' && success()
         run: python3 pipeline/send_summary_email.py
