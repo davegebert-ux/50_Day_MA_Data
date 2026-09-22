@@ -50,6 +50,10 @@ import numpy as np
 import parameters
 import sim
 import scorecard
+# FIX (2026-09-22): single source of truth for "which trading day has
+# finished". Lives in check_run_window.py (same pipeline/ folder) so the
+# workflow gate and the orchestrator can never disagree about it.
+from check_run_window import latest_completed_session
 from overhead_resistance_and_smoothness_checks import overhead_resistance_check
 
 DATA_DIR = "data"  # per-ticker {TICKER}_1d_data.csv files
@@ -110,6 +114,18 @@ ADR_CEILING_PCT = 10.0
 # (0.545R / 44.5%). See overhead_resistance_and_smoothness_checks.py.
 OVERHEAD_PROXIMITY_R = 0.5
 
+# ADDED 2026-09-19: how far BELOW the 50-day MA to place the entry limit,
+# in multiples of ATR14 on the touch day. 0.0 reproduces the previous
+# at-the-MA behaviour exactly. See the long comment at the entry-price
+# calculation in find_new_signals_for_date(), and the architecture doc
+# section "Entry Price: Bidding Below the 50-Day MA (2026-09-19)".
+#
+# NOT YET VALIDATED LIVE -- adopted on backtest + portfolio replay only.
+# This is the first parameter in the system set from a portfolio result
+# that the trade-level result ARGUES AGAINST (total R falls). If it
+# underperforms in paper trading, suspect this asymmetry first.
+ENTRY_BID_ATR_MULT = 0.10
+
 # ADDED 2026-09-14: maximum position COST as a fraction of the account,
 # independent of the risk rule. Reasoning (see architecture doc, "Position
 # Sizing: Two Constraints", 2026-09-14):
@@ -167,9 +183,11 @@ FUNNEL_GATES = [
     "insufficient_history",
     "momentum_screen",
     "no_50ma_touch",
+    "bid_not_filled",       # ADDED 2026-09-19: touched the MA but never reached our bid
     "adr_ceiling",
     "bad_risk_per_share",
     "overhead_resistance",
+    "no_atr_for_entry_bid",   # ADDED 2026-09-19 with ENTRY_BID_ATR_MULT
     "no_spy_data",
     "score_below_threshold",
 ]
@@ -471,8 +489,69 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
         # back to the v2 "any unresolved high" rule, which was shown on
         # 2026-09-14 to REMOVE value (rejected trades averaged +0.483R vs
         # +0.410R for those it kept).
-        entry_price = row["SMA50"]
+        # CHANGED 2026-09-19: the entry limit is now placed
+        # ENTRY_BID_ATR_MULT * ATR14 BELOW the 50-day MA, not at it.
+        #
+        # WHY: tested on the clean 1,404-trade post-Stage-6b sample. Bidding
+        # below the MA fills less often (77% of touch days at 0.10 ATR,
+        # because median penetration below the MA is 0.25 ATR) but every
+        # per-trade statistic improves: avgR +0.594 -> +0.723, win 50.1% ->
+        # 52.5%, immediate-stop rate 26.4% -> 21.9%. Total R FALLS (+833 ->
+        # +781) because the misses outweigh the quality gain, so on total R
+        # alone this change would be rejected.
+        #
+        # It is adopted on the PORTFOLIO result, which is what the account
+        # actually experiences: 23.3% -> 26.9% CAGR over 20 tie-break seeds,
+        # with median closed drawdown improving from -8.9% to -7.1%. The
+        # reason the two disagree is that at 8 slots the baseline already
+        # turns away ~300 of 1,374 signals it cannot fund; the trades a lower
+        # bid gives up are disproportionately trades never taken anyway.
+        #
+        # 0.10 and not 0.20 (which scored highest at 28.0%): 0.20's
+        # neighbours at 0.15 and 0.25 both print ~26.2%, making it a
+        # single-cell spike between two lower values. 0.05-0.25 is a broad
+        # plateau and 0.10 sits inside it. Picking a sweep's best cell is
+        # how a sweep gets overfitted.
+        #
+        # Set ENTRY_BID_ATR_MULT = 0.0 to restore the at-the-MA behaviour.
+        # See Architecture_and_Scope_v1.md, "Entry Price: Bidding Below the
+        # 50-Day MA (2026-09-19)".
+        # ATR14 is computed by sim.load_ticker() (Wilder's 14-day ATR in
+        # dollars) and is already on df -- the same column the backtest used.
+        # Do NOT recompute it here: a second implementation is exactly the
+        # drift that put the momentum screen in two files for three days.
+        atr14_at_entry = row["ATR14"]
+        if pd.isna(atr14_at_entry) or atr14_at_entry <= 0:
+            # No usable ATR means no defensible offset. Fail loudly into the
+            # funnel rather than silently falling back to the MA, which would
+            # make two different entry rules indistinguishable in the log.
+            _log(funnel_rows, target_date, ticker, "no_atr_for_entry_bid")
+            continue
+        entry_price = row["SMA50"] - ENTRY_BID_ATR_MULT * float(atr14_at_entry)
         adr10_pct = ((df["High"] / df["Low"] - 1) * 100).rolling(10).mean().iloc[-1]
+
+        # ADDED 2026-09-19, with ENTRY_BID_ATR_MULT: a bid BELOW the MA is a
+        # limit that may never fill. The setup was valid and we wanted it --
+        # price simply never traded down to our price. That is a materially
+        # different event from "no signal today", and if both collapse into
+        # a smaller signal count the log cannot tell a quiet market from a
+        # bid set too low.
+        #
+        # Backtested miss rate at 0.10 ATR is 23.1% of touch days (median
+        # penetration below the MA is 0.25 ATR). If the live rate drifts far
+        # from that, the offset is wrong for the current regime -- that is
+        # the number this gate exists to expose.
+        #
+        # NOTE this is same-day only, matching how the change was tested. A
+        # bid resting across multiple days was explicitly REJECTED as a
+        # measurement: it readmits the repeat-entry duplication Stage 6b
+        # removed. Do not "improve" this into a multi-day resting order
+        # without re-deriving the Stage 6b interaction first.
+        if ENTRY_BID_ATR_MULT > 0 and row["Low"] > entry_price:
+            _log(funnel_rows, target_date, ticker, "bid_not_filled",
+                 entry_price=round(float(entry_price), 4),
+                 adr10_pct=None if pd.isna(adr10_pct) else round(float(adr10_pct), 4))
+            continue
 
         # ADDED 2026-09-14: volatility ceiling -- see ADR_CEILING_PCT above.
         if pd.isna(adr10_pct) or adr10_pct > ADR_CEILING_PCT:
@@ -838,28 +917,39 @@ def load_market_open_dates():
     return set(open_days)
 
 
-def get_trading_days_to_process(today=None):
+def get_trading_days_to_process(through=None):
     """
     Returns the list of TRADING days to process this run, in order. If the
     orchestrator has run before, replays every trading day from the day
-    after the last successful run through today (inclusive), one at a
-    time -- this is the missed-day catch-up behavior. If it has never run
-    before, processes only today (if today is itself a trading day).
+    after the last successful run through the latest FINISHED session
+    (inclusive), one at a time -- this is the missed-day catch-up
+    behavior. If it has never run before, processes only that session.
 
     FIX (2026-09-05): now filters against the static NYSE market calendar
     (see load_market_open_dates()) so weekends/holidays are correctly
     skipped rather than counted as missed trading days needing catch-up.
+
+    FIX (2026-09-22): the end date used to be datetime.now().date() --
+    the GitHub runner's clock, which is UTC. From 8pm Eastern onward the
+    UTC date is already TOMORROW, so a late run would "process" a day
+    whose market hadn't opened: find_new_signals_for_date() skips every
+    ticker with no bar for the date, yet process_single_day() still
+    stamps that date as done -- silently losing it forever. A midday
+    run would instead process a PARTIAL bar. Both are now impossible:
+    the end date comes from check_run_window.latest_completed_session(),
+    the single source of truth for which day has finished, which never
+    returns a day whose market hasn't closed.
     """
-    today = pd.Timestamp(today) if today else pd.Timestamp(datetime.now().date())
+    through = pd.Timestamp(through) if through is not None else latest_completed_session()
     market_open_dates = load_market_open_dates()
     last_run = get_last_run_date()
 
     if last_run is None:
-        return [today] if today in market_open_dates else []
+        return [through] if through in market_open_dates else []
 
     days = []
     d = last_run + timedelta(days=1)
-    while d <= today:
+    while d <= through:
         if d in market_open_dates:
             days.append(d)
         d += timedelta(days=1)
@@ -898,14 +988,23 @@ def main():
         # was any market activity to report. Note this writes the real
         # Eastern calendar date, matching how check_run_window.py
         # compares it.
+        #
+        # SUPERSEDED (2026-09-22): the date stamp below is gone. The
+        # 2026-09-13 duplicate-email bug it fixed came from the old
+        # clock-window design, where the 8pm retry needed proof that
+        # "a run happened today". check_run_window.py now asks a
+        # different question -- has the latest FINISHED session been
+        # processed? -- and state/last_run_date.txt means "last session
+        # processed". Stamping today's calendar date here is now actively
+        # harmful: a midday manual run with nothing to do would stamp
+        # today, and that evening's run would then skip today as done.
+        # A quiet run now leaves the file untouched; the duplicate-email
+        # case can't recur because the workflow only runs when a session
+        # is actually pending.
         if not days:
-            today_eastern = pd.Timestamp(
-                datetime.now(ZoneInfo("America/New_York")).date()
-            )
-            print(f"No trading days to process -- recording "
-                  f"{today_eastern.date()} as last successful run "
-                  f"(no market activity).")
-            set_last_run_date(today_eastern)
+            last = get_last_run_date()
+            print(f"No trading days to process -- already up to date "
+                  f"through {last.date() if last is not None else 'nothing yet'}.")
     except Exception as e:
         print(f"ORCHESTRATOR FAILED: {e}", file=sys.stderr)
         import traceback
