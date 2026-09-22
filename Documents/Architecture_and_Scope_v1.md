@@ -695,6 +695,12 @@ identical from the workflow's point of view. Verified both paths
 directly: a forced exception correctly produced exit code 1 with a clean
 traceback, and a normal run correctly exited 0.
 
+> **SUPERSEDED 2026-09-22.** The 6pm/8pm clock-window design described
+> below was replaced by a work-based check after GitHub's late firing
+> skipped Monday 2026-09-21 entirely. See "Scheduling: Work-Based Run
+> Check Replaces the 6pm/8pm Clock Windows (2026-09-22)" at the end of
+> this document.
+
 **Built `pipeline/check_run_window.py`** - solves the fact that GitHub
 Actions "schedule" triggers only run on UTC, while US Eastern time shifts
 between UTC-4 (EDT) and UTC-5 (EST) twice a year. Rather than hardcode
@@ -4194,3 +4200,259 @@ suppressed zero trades, printed a success line, and left the trade count
 unchanged at exactly 3,039. **A filter that changes nothing at all is a bug
 signature, not a null result.** The fix is `pd.notna()`; a comment to that
 effect is now in the source.
+
+
+---
+
+## Entry Price: Bidding Below the 50-Day MA (2026-09-19)
+
+**DECISION: ADOPTED (pending paper trading). Place the entry limit at
+`MA50 - 0.10 * ATR14`, measured on the touch day, instead of at the MA50
+value itself.**
+
+### Question
+
+The production entry is a resting limit at the 50-day MA. Two alternatives
+were tested in the same session: entering HIGHER after a confirmation candle,
+and entering LOWER by bidding a fraction of an ATR beneath the MA. The second
+is this finding; the first is recorded in the section below it.
+
+### Method
+
+Baseline is the 1,404-trade clean sample in
+`Staged_Pipeline_Results_10yr_CLEAN.csv` (post-Stage-6b, one position per
+ticker). For each offset, the SAME signal set is used -- only the fill price
+changes. A signal is taken only if the touch day's Low reached the bid;
+otherwise it is a MISS and the trade never happens. Fills are AT the bid, with
+no gap improvement. Exits run through production `sim.simulate_trail`, rule
+`atr_sched_c`, `grace_R=0.5`. Portfolio figures come from
+`portfolio_replay.load_staged()` + `replay_dollars()` -- the production loader,
+so outlier trimming and production ranking both apply -- at 8 slots, $25,000
+start, averaged over 20 tie-break seeds.
+
+### Trade-level result (infinite capital)
+
+| bid offset | n | missed | avgR | win% | totalR | immediate-fail% |
+|---|---|---|---|---|---|---|
+| at the MA (baseline) | 1,404 | 0% | +0.594 | 50.1 | +833.5 | 26.4 |
+| 0.10 ATR below | 1,080 | 23.1% | +0.723 | 52.5 | +780.7 | 21.9 |
+| 0.25 ATR below | 701 | 50.1% | +0.918 | 58.9 | +643.3 | 17.0 |
+| 0.50 ATR below | 322 | 77.1% | +1.442 | 67.4 | +464.2 | 4.3 |
+| 0.75 ATR below | 129 | 90.8% | +1.651 | 79.1 | +213.0 | 4.7 |
+
+Every per-trade statistic improves monotonically as the bid drops. Total R
+falls monotonically, because the miss rate grows faster than the quality gain.
+**On total R alone the baseline wins and the change would be rejected.**
+
+### Portfolio result -- why the decision flips
+
+Total R is not account return (the standing lesson from Option B). With 8
+slots and the cost cap applied, the baseline is already turning away
+signals it cannot fund: 1,374 signals in, 1,065 taken. The trades a lower bid
+gives up are disproportionately trades the account was never going to take.
+
+| bid offset | signals | CAGR mean (20 seeds) | sd | min | max | median closed DD |
+|---|---|---|---|---|---|---|
+| at the MA | 1,374 | 23.3% | 0.7 | 21.4 | 24.8 | -8.9% |
+| 0.05 ATR | 1,186 | 26.2% | 1.0 | 24.2 | 27.5 | -8.0% |
+| 0.10 ATR | 1,058 | 26.9% | 1.0 | 25.3 | 29.0 | -7.1% |
+| 0.15 ATR | 911 | 26.4% | 0.4 | 25.7 | 27.3 | -6.1% |
+| 0.20 ATR | 783 | 28.0% | 0.5 | 27.1 | 29.2 | -4.9% |
+| 0.25 ATR | 687 | 26.2% | 0.5 | 25.3 | 27.1 | -4.3% |
+| 0.35 ATR | 499 | 23.5% | 0.6 | 22.3 | 24.8 | -3.7% |
+| 0.50 ATR | 316 | 21.4% | 0.3 | 20.8 | 21.7 | -2.9% |
+
+Return improves AND drawdown falls, simultaneously, across the whole 0.05-0.25
+band. The seed ranges for 0.05 through 0.25 do not overlap the baseline range,
+so the improvement is not tie-break luck.
+
+**0.20 ATR scores highest and was NOT chosen.** Its neighbours at 0.15 and 0.25
+both print ~26.2%, making 0.20 a single-cell spike between two lower values --
+the signature of sampling noise, not of an optimum. 0.10 sits in the middle of
+a broad plateau and is the most conservative offset that captures the effect.
+Selecting the best cell of a sweep is how a sweep gets overfitted.
+
+### Robustness: per-year portfolio return (10 seeds per year)
+
+| year | at the MA | 0.10 ATR |
+|---|---|---|
+| 2017 | +16.9% | +12.2% |
+| 2018 | +4.8% | +5.1% |
+| 2019 | +7.7% | +4.2% |
+| 2020 | +19.4% | +14.0% |
+| 2021 | +29.4% | +44.6% |
+| 2022 | -4.5% | +0.0% |
+| 2023 | +7.8% | +12.6% |
+| 2024 | +36.5% | +55.5% |
+| 2025 | +82.6% | +82.2% |
+| 2026 | +32.0% | +53.4% |
+
+Six years better, three worse, one level. The three losing years (2017, 2019,
+2020) are among the thinnest in the sample -- 26 and 44 trades for the first
+two. The single losing year of the whole sample, 2022, improves from -4.5% to
+flat: the lower bid helps most when conditions are worst, which is consistent
+with the mechanism (paying less for the same setup widens the margin for error).
+
+### Mechanism
+
+Median penetration below the MA on a touch day is 0.25 ATR (mean 0.33, 90th
+percentile 0.73). A 0.10 ATR bid therefore fills on 77% of touch days while
+buying about 0.10 ATR cheaper, with the stop distance recomputed from the lower
+entry. Cheaper entry plus unchanged setup equals more room before the initial
+stop, which is why the immediate-failure rate drops from 26.4% to 21.9%.
+
+### Caveats -- do not let this harden into certainty
+
+1. One 10-year sample with known survivorship bias in the ticker universe.
+2. Closed-equity drawdown understates real drawdown by roughly 4 points;
+   the -7.1% figure is a floor, not an estimate.
+3. Same-day fills only. A bid that rests for multiple days was tested and
+   REJECTED as a measurement: it readmits exactly the repeat-entry duplication
+   Stage 6b removed, and inflated the baseline from +0.594 to +0.805 avgR.
+4. The per-year table shows the sample leans heavily on 2024, 2025 and 2026.
+   2025 returns ~82% under BOTH entry styles. The lifetime CAGR of either
+   variant depends more on those years being repeatable than on this decision.
+5. Not yet validated in the live staged pipeline. UPDATED 2026-09-22:
+   `orchestrator.py` now bids `SMA50 - ENTRY_BID_ATR_MULT * ATR14`, reading
+   the `ATR14` column `sim.load_ticker()` already provides rather than
+   recomputing it, and logs unfilled bids as the `bid_not_filled` funnel
+   gate. Replaying the production gate logic over the sample reproduces the
+   backtest's 23.1% unfilled rate exactly. First live run: the 2026-09-22
+   push. An earlier draft of that patch called a `wilder_atr()` function
+   that exists nowhere in the codebase -- it compiled cleanly and would have
+   crashed on the first live run. Compiling is not testing.
+
+### Harness errors made and corrected while producing this finding
+
+Recorded because both produced plausible-looking wrong answers that were
+caught only by checking the baseline row against production.
+
+- **Gap-improved fills.** The first version filled at `min(bid, Open)`. 34.3%
+  of touch-day bars OPEN below the MA50, so on a third of the sample the
+  harness handed itself a better price than production would get. This alone
+  lifted the baseline to +0.805 avgR and drove win rate to 82% at the wider
+  offsets. Production fills AT the level; the `min()` was an invention.
+- **Multi-day patience.** Allowing the bid to rest 3 days admitted entries
+  blocked in production by the one-position-per-ticker and setup-reset rules.
+
+**Standing check, reinforced: any entry-variant harness MUST reproduce the
+production baseline exactly (n=1,404, avgR +0.594, totalR +833.5) at zero
+offset before any other row in the table is read.** Both errors above were
+invisible in the variant rows and obvious in the baseline row.
+
+---
+
+## Scheduling: Work-Based Run Check Replaces the 6pm/8pm Clock Windows (2026-09-22)
+
+### What happened
+
+Monday 2026-09-21 was never processed. The only scheduled triggers GitHub
+delivered that evening landed at 8:30pm and 1:51am Eastern.
+`check_run_window.py` accepted a run only within 20 minutes of 6pm or 8pm
+Eastern, so both logged `should_run: False` and skipped every real step.
+Monday was meant to be the first live test of the SPY data fix; it never
+happened.
+
+GitHub does not fire scheduled workflows on time. Its documentation warns
+they can be delayed or dropped under load, especially at the top of the
+hour. Friday 2026-09-18's four triggers landed 6 to 13 minutes late;
+Monday's were hours late. **A clock-window gate turns every late trigger
+into a lost day.** The design was wrong, not unlucky.
+
+### Second defect found in the same review (latent)
+
+`get_trading_days_to_process()` in `orchestrator.py` took its end date from
+`datetime.now().date()` -- the GitHub runner's clock, which is UTC. From
+8pm EDT (7pm EST) onward the UTC date is already tomorrow. A run then would
+"process" a day whose market hadn't opened: `find_new_signals_for_date()`
+skips every ticker that has no bar for the date, yet `process_single_day()`
+still stamps that date into `state/last_run_date.txt`. That day is then
+marked done and never processed -- silently lost. A midday manual run would
+instead process a partial intraday bar.
+
+The old 8pm retry path would have hit this whenever it actually ran on a
+trading day. Monday's late triggers were blocked by the window check before
+reaching the orchestrator, so nothing was corrupted.
+
+### The new rule
+
+`check_run_window.py` now asks one question: **has the most recent finished
+trading session been processed yet?**
+
+- `latest_completed_session(now)` returns the most recent NYSE trading day
+  whose session has finished. Today counts only if it is a trading day and
+  it is past 5:30pm Eastern (`SESSION_READY_TIME`); otherwise it is the
+  previous trading day. It can never return a day whose market hasn't
+  closed. Weekends and holidays come from the existing NYSE calendar file.
+- `should_run` is true only if `state/last_run_date.txt` is older than that
+  session.
+- **`state/last_run_date.txt` now means "last session processed", not "the
+  date a run happened".** A 1:51am Tuesday run that processes Monday stamps
+  Monday.
+- `orchestrator.py` imports `latest_completed_session()` from
+  `check_run_window.py` instead of keeping its own date logic. One
+  implementation, so the gate and the orchestrator cannot disagree.
+- The 2026-09-13 "stamp today's date when there's nothing to process" fix is
+  removed. It solved a problem of the old design and is harmful under the
+  new one: a midday manual run with nothing to do would stamp today, and
+  that evening's run would skip today as already done.
+
+`daily_scorecard_automation.yml`:
+
+- Fires nine times per trading day, always at :17 past the hour to avoid
+  the top-of-hour load: hourly 6:17pm-1:17am EDT (5:17pm-12:17am EST), plus
+  an 8:17am EDT (7:17am EST) next-morning safety net. The first trigger that
+  lands does the work; the rest find nothing pending and exit in seconds.
+- A `concurrency` group stops two delayed triggers from running at once.
+  The second waits, checks out the first one's committed state, and exits.
+- `git pull --rebase` before `git push`, so a commit Dave makes to `main`
+  while a run is working doesn't reject the bot's push. The bot writes only
+  `data/` and `state/`; Dave edits only code and docs.
+- `is_retry_slot` keeps its name so the email step still works, but now
+  means "failed at or after 8pm Eastern". Earlier failures stay quiet
+  because the next hourly trigger retries automatically.
+- When a run catches up several days, the summary email covers only the
+  last day processed. Earlier days are in `state/daily_funnel.csv`.
+- `FORCE_RUN` is kept, and is now safe: a forced midday run still processes
+  only finished sessions.
+
+### Verification
+
+- **Decision logic, 15 scenarios, all correct:** on-time and late Monday
+  fires, both of the actual 2026-09-21 fire times, midday, just before the
+  ready time, duplicate fires, weekends, Thanksgiving, the half-day after
+  Thanksgiving, winter EST, and no state file.
+- **The production `get_trading_days_to_process()` itself** (not a copy)
+  was run at simulated times. With the state file at 2026-09-19, a 6:17pm
+  run on 2026-09-22 processes 2026-09-21 and 2026-09-22; a noon run on
+  2026-09-22 processes only 2026-09-21.
+- **Schedule simulation:** every cron trigger over roughly six weeks in
+  each clock season (EDT Sep-Oct, EST Nov-Dec), with each trigger randomly
+  delayed 0-5 hours and randomly dropped at 0%, 50% and 80%.
+  - 1,200 runs: zero sessions processed twice, zero processed before their
+    session finished.
+  - 360 runs: zero sessions ever skipped, at every drop rate.
+  - Done before the next morning's open: 100% of sessions at 0% dropped,
+    99.8% or better at 50% dropped, about 83% at 80% dropped. The rest are
+    processed late, never lost.
+
+### Known limits
+
+1. **Not yet validated live.** First live run: evening of 2026-09-22.
+2. The 5:30pm ready time assumes the data source has the final daily bar
+   by then. The old design pulled data from 5:40pm without issue.
+3. Processing late is harmless now, while the system records signals after
+   the fact. It stops being harmless once Phase 3 places real orders, which
+   must be in before the next open. Revisit when Phase 3 starts.
+4. The NYSE calendar file covers 2026-2029. When it runs out,
+   `latest_completed_session()` now raises an error (a failure email after
+   8pm) instead of silently doing nothing.
+5. Nine triggers a day is about 200 GitHub Actions minutes a month, since
+   GitHub rounds each job up to a minute. Within the free allowance.
+
+### Lesson
+
+**Gate on whether the work is done, not on what time it is.** A scheduler
+you don't control will eventually fire late, fire twice, or not fire. A
+check that asks "is anything pending?" is correct under all three; a check
+that asks "is it 6pm?" is correct only when the scheduler behaves.
