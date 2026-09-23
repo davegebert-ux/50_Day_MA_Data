@@ -81,7 +81,21 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pandas numpy requests lxml
+        # FIX (2026-09-22): tradingview-screener was missing. scripts/
+        # pull_data.py stopped scraping Wikipedia for S&P 400/600 membership
+        # on 2026-09-10 and now defines the universe from a live TradingView
+        # screen via `from tradingview_screener import Query, Column` -- but
+        # this install line was never updated, so the run died with
+        # ModuleNotFoundError before pulling a single price. It had never
+        # actually surfaced: the old clock-window gate skipped nearly every
+        # trigger, so the data-pull step rarely ran at all. Two bugs hid each
+        # other; fixing the scheduler exposed this one on the very next run.
+        #
+        # Version pinned deliberately. This package wraps an API TradingView
+        # does not document or guarantee, and an unpinned upgrade could break
+        # the universe definition on a random weekday evening with no code
+        # change on our side. Bump it consciously, not by accident.
+        run: pip install pandas numpy requests lxml "tradingview-screener==3.2.0"
 
       - name: Determine if this trigger should actually run (has the latest finished session been processed?)
         id: check_time
