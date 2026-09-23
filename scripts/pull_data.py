@@ -55,6 +55,40 @@ LOOKBACK_DAYS = int(3.6 * 365)
 END_TS = int(time.time())
 START_TS = END_TS - LOOKBACK_DAYS * 86400
 
+# ----------------------------------------------------------------------
+# COMPLETED-SESSION GUARD (added 2026-09-23)
+#
+# WHY: a run at 09:38 Eastern on 2026-09-23 wrote that day's PARTIAL bar
+# into every ticker file -- SPY showed O=774.03 H=773.02 V=1,546,858,
+# i.e. a "high" BELOW the open and ~3% of a normal day's volume, because
+# the session was eight minutes old. Yahoo serves the in-flight bar as
+# the newest row and nothing in this script distinguished it from a
+# finished one. Writing it corrupts MA50/ATR14/ADR10 for every ticker,
+# and because the file is overwritten each run the bad values propagate
+# straight into scoring.
+#
+# The cutoff is NOT "today minus one" -- that would discard a legitimate
+# same-day bar after the close. It is latest_completed_session(), the
+# same function check_run_window.py and orchestrator.py already use, so
+# all three agree on what "finished" means (a session counts only once
+# it is past SESSION_READY_TIME, 17:30 Eastern). One definition, three
+# callers -- if that rule ever changes it changes in one place.
+# ----------------------------------------------------------------------
+import sys
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from pipeline.check_run_window import latest_completed_session
+    _SESSION_GUARD_AVAILABLE = True
+except Exception as _e:  # pragma: no cover
+    latest_completed_session = None
+    _SESSION_GUARD_AVAILABLE = False
+    print(f"WARNING: could not import latest_completed_session ({_e}); "
+          f"partial-bar guard is DISABLED for this run.")
+
+
 MAX_WORKERS = 8
 MAX_RETRIES = 5
 
@@ -355,6 +389,17 @@ def parse_chart_json(payload):
         df[col] = df[col].round(4)
 
     df = df.drop_duplicates(subset="Date").sort_values("Date").reset_index(drop=True)
+
+    # Drop any bar for a session that has not finished yet. See the
+    # COMPLETED-SESSION GUARD note at the top of this file.
+    if _SESSION_GUARD_AVAILABLE and len(df):
+        cutoff = latest_completed_session().date()
+        n_before = len(df)
+        df = df[df["Date"] <= cutoff].reset_index(drop=True)
+        parse_chart_json.last_partial_dropped = n_before - len(df)
+    else:
+        parse_chart_json.last_partial_dropped = 0
+
     return df
 
 
