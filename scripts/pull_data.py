@@ -150,6 +150,106 @@ def get_open_position_tickers():
     return set(df["ticker"].dropna().astype(str).str.strip())
 
 
+# ----------------------------------------------------------------------
+# RAW-PAYLOAD DIAGNOSTIC (added 2026-09-23, temporary)
+#
+# WHY: every one of the 67 tickers came back ending 2026-09-21 on both
+# 2026-09-22 and 2026-09-23, while the market traded normally on the
+# 22nd. Uniformity does NOT tell us whose fault it is: a deterministic
+# rule on our side (the dropna on OHLC, or the Volume.notna() filter in
+# parse_chart_json) would remove the last bar from all 67 identically,
+# exactly like Yahoo never sending it.
+#
+# So look at the payload BEFORE we touch it. For one symbol we print:
+#   - the window we asked for (period1/period2 as real datetimes)
+#   - the last raw timestamps Yahoo returned, and the dates they map to
+#   - the raw OHLCV values on those last bars, so a None volume or a
+#     None open is visible rather than silently dropped
+#   - the row count before and after each cleaning step
+#   - Yahoo's own meta block (regularMarketTime, timezone, gmtoffset)
+#
+# Remove this block once the cause is identified.
+# ----------------------------------------------------------------------
+DIAGNOSTIC_SYMBOL = "SPY"
+
+
+def _print_raw_diagnostic(symbol, payload):
+    """Dump the tail of Yahoo's raw response for one symbol."""
+    print(f"\n----- RAW PAYLOAD DIAGNOSTIC: {symbol} -----")
+    print(f"Requested period1: {dt.datetime.utcfromtimestamp(START_TS)} UTC "
+          f"({START_TS})")
+    print(f"Requested period2: {dt.datetime.utcfromtimestamp(END_TS)} UTC "
+          f"({END_TS})")
+
+    try:
+        result = payload["chart"]["result"][0]
+    except Exception as e:
+        print(f"  could not read result block: {e}")
+        print("----- END DIAGNOSTIC -----\n")
+        return
+
+    meta = result.get("meta", {}) or {}
+    for key in ("exchangeTimezoneName", "gmtoffset", "regularMarketTime",
+                "currentTradingPeriod"):
+        if key in meta:
+            val = meta[key]
+            if key == "regularMarketTime":
+                try:
+                    val = f"{val} -> {dt.datetime.utcfromtimestamp(int(val))} UTC"
+                except Exception:
+                    pass
+            print(f"  meta.{key}: {val}")
+
+    timestamps = result.get("timestamp") or []
+    print(f"  raw timestamps returned: {len(timestamps)}")
+
+    quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    vols = quote.get("volume") or []
+
+    print("  last 3 raw bars (as returned, before any cleaning):")
+    for i in range(max(0, len(timestamps) - 3), len(timestamps)):
+        ts = timestamps[i]
+        try:
+            as_utc = dt.datetime.utcfromtimestamp(int(ts))
+        except Exception:
+            as_utc = "?"
+        def _at(seq):
+            return seq[i] if i < len(seq) else "MISSING"
+        print(f"    ts={ts} -> {as_utc} UTC | "
+              f"O={_at(opens)} H={_at(highs)} L={_at(lows)} "
+              f"C={_at(closes)} V={_at(vols)}")
+
+    # Row counts through each cleaning step, so a filter that eats the
+    # final bar is visible as a drop rather than an absence.
+    try:
+        df = pd.DataFrame({
+            "Date": pd.to_datetime(timestamps, unit="s", utc=True).date,
+            "Open": quote.get("open"),
+            "High": quote.get("high"),
+            "Low": quote.get("low"),
+            "Close": quote.get("close"),
+            "Volume": quote.get("volume"),
+        })
+        n_raw = len(df)
+        after_ohlc = df.dropna(subset=["Open", "High", "Low", "Close"])
+        after_vol = after_ohlc[after_ohlc["Volume"].notna()]
+        print(f"  rows: raw={n_raw} "
+              f"after OHLC dropna={len(after_ohlc)} "
+              f"after Volume filter={len(after_vol)}")
+        if n_raw:
+            print(f"  last date raw: {df['Date'].iloc[-1]}")
+        if len(after_vol):
+            print(f"  last date after cleaning: {after_vol['Date'].iloc[-1]}")
+    except Exception as e:
+        print(f"  could not build comparison frame: {e}")
+
+    print("----- END DIAGNOSTIC -----\n")
+
+
 def fetch_chart(symbol):
     """Fetch raw chart JSON for one symbol, with retry/backoff on 429s."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -224,6 +324,12 @@ def process_ticker(symbol):
     if not ok:
         return {"symbol": symbol, "status": "FAILED", "reason": err, "rows": 0,
                 "start": None, "end": None}
+
+    if symbol == DIAGNOSTIC_SYMBOL:
+        try:
+            _print_raw_diagnostic(symbol, payload)
+        except Exception as e:
+            print(f"diagnostic failed for {symbol}: {e}")
 
     try:
         df = parse_chart_json(payload)
