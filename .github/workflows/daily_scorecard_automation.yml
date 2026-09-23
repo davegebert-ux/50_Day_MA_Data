@@ -147,7 +147,19 @@ jobs:
             # offending file instead of leaving us guessing.
             echo "Working tree state before rebase:"
             git status --porcelain
-            git pull --rebase --autostash origin main
+            # FIX (2026-09-22, third attempt): this said "origin main" and
+            # died with "fatal: couldn't find remote ref main". The branch
+            # is named "Main" with a capital M -- visible in git's own commit
+            # line, "[Main 2a28719]". Git branch names are case-sensitive, so
+            # "main" is simply a branch that does not exist. Nothing else in
+            # the workflow had ever named the branch explicitly (checkout and
+            # push both infer it), so the typo could not surface until the
+            # rebase line was added earlier today.
+            # Rather than hardcode "Main" and depend on the capitalisation
+            # never changing, ask git what branch we are actually on.
+            BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+            echo "Rebasing onto origin/$BRANCH"
+            git pull --rebase --autostash origin "$BRANCH"
             git push
           fi
 
