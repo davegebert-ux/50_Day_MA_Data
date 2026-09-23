@@ -836,10 +836,64 @@ def check_capital_committed(open_df):
 
 
 # ============================================================
+# PRE-FLIGHT DATA CHECK (added 2026-09-22)
+# ============================================================
+def count_tickers_with_bar(target_date):
+    """
+    Counts how many ticker files in data/ actually contain a bar for
+    target_date. Deliberately a light scan -- reads ONLY the Date column,
+    not the full OHLCV load sim.load_ticker() does -- because this runs
+    over every file in data/ purely to answer "did the data arrive?"
+
+    WHY THIS EXISTS (2026-09-22): the 2026-09-22 run completed green and
+    stamped the session as processed while holding ZERO bars for that
+    date. Yahoo had not yet published the daily bar -- every fetch
+    "succeeded" and returned a valid file ending 2026-09-21 -- so
+    find_new_signals_for_date() logged all 1,060 tickers as
+    no_data_for_date and process_single_day() marked the day done
+    anyway. Under the work-based run gate that silently loses the
+    session forever, because state/last_run_date.txt then says it was
+    handled. See Architecture_and_Scope_v1.md, 2026-09-22.
+    """
+    n = 0
+    target_date = pd.Timestamp(target_date)
+    for fpath in sorted(glob.glob(os.path.join(DATA_DIR, "*_1d_data.csv"))):
+        try:
+            dates = pd.read_csv(fpath, usecols=["Date"], parse_dates=["Date"])
+        except Exception:
+            continue
+        if target_date in set(dates["Date"]):
+            n += 1
+    return n
+
+
+# ============================================================
 # PROCESS ONE TRADING DAY (real day or a single day of a missed-day replay)
 # ============================================================
 def process_single_day(target_date):
+    """
+    Returns True if the day was processed and may be marked done, False if
+    the run bailed out because the price data for target_date had not
+    arrived yet (see count_tickers_with_bar). A False return MUST leave
+    state/last_run_date.txt untouched so a later run retries the session.
+    """
     print(f"\n=== Processing {pd.Timestamp(target_date).date()} ===")
+
+    # PRE-FLIGHT (2026-09-22): refuse to process a session we have no
+    # price data for. Without this the day gets stamped as done while
+    # every ticker falls out at the no_data_for_date gate, and the
+    # work-based run gate never comes back for it.
+    n_with_bar = count_tickers_with_bar(target_date)
+    n_files = len(glob.glob(os.path.join(DATA_DIR, "*_1d_data.csv")))
+    print(f"  Data check: {n_with_bar} of {n_files} ticker files have a bar "
+          f"for {pd.Timestamp(target_date).date()}")
+    if n_with_bar == 0:
+        print(f"  NO DATA YET for {pd.Timestamp(target_date).date()} -- "
+              f"the daily bars have not been published. Leaving this "
+              f"session UNPROCESSED so a later run picks it up. "
+              f"state/last_run_date.txt is unchanged.")
+        return False
+
     open_df = load_open_positions()
 
     open_df = check_open_positions_for_exits(open_df, target_date)
@@ -882,6 +936,8 @@ def process_single_day(target_date):
     except Exception as e:
         print(f"  [DEBUG] Could not list _STATE_DIR: {e}")
     print(f"  [DEBUG] Current working directory: {os.getcwd()}")
+
+    return True
 
 
 # ============================================================
@@ -971,7 +1027,19 @@ def main():
     try:
         days = get_trading_days_to_process()
         for day in days:
-            process_single_day(day)
+            # STOP ON MISSING DATA (2026-09-22): process_single_day()
+            # returns False when the bars for that session have not been
+            # published yet. Break rather than continue -- days must be
+            # processed in order, since each one's exits and open
+            # positions feed the next, so skipping ahead to a later day
+            # would corrupt the sequence. Leaving the loop here leaves
+            # state/last_run_date.txt pointing at the last COMPLETED
+            # session, which is exactly what makes the next scheduled
+            # run come back and retry.
+            if not process_single_day(day):
+                print(f"Stopping here -- {pd.Timestamp(day).date()} will be "
+                      f"retried on the next scheduled run.")
+                break
 
         # FIX (2026-09-13): stamp today's date even when there were NO
         # trading days to process. Previously set_last_run_date() was
