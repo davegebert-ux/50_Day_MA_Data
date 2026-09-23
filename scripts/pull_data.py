@@ -324,6 +324,42 @@ def main():
     for f in sorted(failures, key=lambda x: x["symbol"]):
         print(f"  {f['symbol']}: {f['reason']}")
 
+    # ------------------------------------------------------------------
+    # LATEST-BAR SUMMARY (added 2026-09-23)
+    #
+    # WHY: on 2026-09-22 and 2026-09-23 the pull reported 67 successes /
+    # 0 failures while every file it wrote still ended 2026-09-21 --
+    # Yahoo returned a valid 900-row payload that simply did not contain
+    # the most recent session. "Success" here only means the HTTP call
+    # worked and the payload parsed; it says nothing about how RECENT
+    # the data is. That distinction was invisible in the log, so the
+    # orchestrator was the first thing to notice, one step too late.
+    #
+    # This prints the distribution of last-bar dates actually received.
+    # It is the difference between "Yahoo isn't serving Tuesday" and
+    # "Yahoo served Tuesday and we dropped it in parsing" -- two
+    # different bugs in two different places.
+    # ------------------------------------------------------------------
+    end_dates = {}
+    for r in successes:
+        if r.get("end"):
+            end_dates[r["end"]] = end_dates.get(r["end"], 0) + 1
+
+    if end_dates:
+        newest = max(end_dates)
+        print(f"\nNewest bar received: {newest} "
+              f"({end_dates[newest]} of {len(successes)} tickers)")
+        print("Last-bar date distribution:")
+        for d in sorted(end_dates, reverse=True)[:5]:
+            print(f"  {d}: {end_dates[d]} tickers")
+        stale = [r["symbol"] for r in successes if r.get("end") != newest]
+        if stale:
+            print(f"Tickers behind the newest bar ({len(stale)}): "
+                  f"{', '.join(sorted(stale)[:15])}"
+                  f"{' ...' if len(stale) > 15 else ''}")
+    else:
+        print("\nNewest bar received: NONE -- no successful pulls.")
+
     return results, universe
 
 
