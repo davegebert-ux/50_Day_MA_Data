@@ -134,7 +134,20 @@ jobs:
             # this run was working (e.g. pasting an updated pipeline file),
             # so the push isn't rejected. The bot only writes data/ and
             # state/, Dave only edits code and docs, so these never overlap.
-            git pull --rebase origin main
+            # FIX (2026-09-22, same evening): the line above was
+            # "git pull --rebase origin main" and it failed with
+            # "cannot pull with rebase: You have unstaged changes."
+            # "git add data/ state/" stages only those two folders, so any
+            # tracked file the run touches OUTSIDE them stays dirty in the
+            # working tree, and rebase refuses to start on a dirty tree.
+            # --autostash tells git to stash whatever is left, rebase, then
+            # put it back, which is exactly the desired behaviour here: that
+            # leftover is incidental, it is not what we are committing.
+            # The status line below is logged so the next failure names the
+            # offending file instead of leaving us guessing.
+            echo "Working tree state before rebase:"
+            git status --porcelain
+            git pull --rebase --autostash origin main
             git push
           fi
 
