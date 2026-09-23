@@ -287,6 +287,43 @@ def _print_raw_diagnostic(symbol, payload):
     except Exception as e:
         print(f"  could not build comparison frame: {e}")
 
+    # ------------------------------------------------------------------
+    # SECOND ASK, DIFFERENT PHRASING (added 2026-09-23)
+    #
+    # Yahoo accepts EITHER period1/period2 (an explicit timestamp window,
+    # what we use everywhere else) OR range=<span> -- not both. They are
+    # two ways of asking the same question and they do not always come
+    # back from the same cache. This re-asks for SPY using range=1mo
+    # purely to see whether the 2026-09-22 bar exists down that path.
+    # Nothing is written from this call; it only prints. If range shows
+    # the bar and period1/period2 does not, the fix is to change how we
+    # ask. If neither shows it, the data is not being served at all and
+    # no amount of retrying this source will produce it.
+    # ------------------------------------------------------------------
+    try:
+        alt_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        alt_params = {"range": "1mo", "interval": "1d"}
+        alt = requests.get(alt_url, params=alt_params, headers=HEADERS,
+                           timeout=25)
+        print(f"  [range=1mo re-ask] HTTP {alt.status_code}")
+        if alt.status_code == 200:
+            ar = alt.json()["chart"]["result"][0]
+            ats = ar.get("timestamp") or []
+            aq = (ar.get("indicators", {}).get("quote") or [{}])[0]
+            acl = aq.get("close") or []
+            avl = aq.get("volume") or []
+            print(f"  [range=1mo re-ask] bars returned: {len(ats)}")
+            for i in range(max(0, len(ats) - 3), len(ats)):
+                try:
+                    d = dt.datetime.utcfromtimestamp(int(ats[i])).date()
+                except Exception:
+                    d = "?"
+                c = acl[i] if i < len(acl) else "MISSING"
+                v = avl[i] if i < len(avl) else "MISSING"
+                print(f"    {d} | C={c} V={v}")
+    except Exception as e:
+        print(f"  [range=1mo re-ask] failed: {e}")
+
     print("----- END DIAGNOSTIC -----\n")
 
 
