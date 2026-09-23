@@ -4450,6 +4450,47 @@ trading session been processed yet?**
 5. Nine triggers a day is about 200 GitHub Actions minutes a month, since
    GitHub rounds each job up to a minute. Within the free allowance.
 
+### Follow-on failure, same evening: missing `tradingview-screener` dependency
+
+The first run under the new schedule fired on time, and the run check
+correctly reported the session as pending and let the run proceed. It then
+failed in the next step:
+
+    ModuleNotFoundError: No module named 'tradingview_screener'
+    scripts/pull_data.py, line 86, in get_tradingview_screen_tickers
+
+**Cause.** On 2026-09-10 `pull_data.py` stopped scraping Wikipedia for S&P
+400/600 membership and began defining the universe from a live TradingView
+screen, importing `Query` and `Column` from `tradingview_screener`. The
+workflow's install line still read `pip install pandas numpy requests lxml`
+and was never updated.
+
+**Why it took twelve days to surface.** The old clock-window gate skipped
+nearly every trigger, so the data-pull step almost never ran. The scheduling
+bug was hiding the dependency bug. Fixing the scheduler exposed it on the
+very next run. This is the second time in this project that a green or
+skipped run concealed a failure further down the pipeline -- see also the
+53 green runs that never scored a signal because SPY was never pulled.
+
+**Fix.** `pip install pandas numpy requests lxml
+"tradingview-screener==3.2.0"`. The version is pinned on purpose: the
+package wraps an API TradingView does not document or guarantee, so an
+unpinned upgrade could change the universe definition on a random weekday
+evening with no code change on our side.
+
+**Audit done at the same time.** Every import in every file the workflow
+executes -- `pull_data.py`, `orchestrator.py`, `sim.py`, `scorecard.py`,
+`check_run_window.py`, `overhead_resistance_and_smoothness_checks.py`,
+`touch_scan_and_momentum_screen.py`, `send_summary_email.py`,
+`send_failure_email.py` -- was listed and checked against the install line.
+`tradingview_screener` was the only third-party package missing; everything
+else is pandas, numpy, requests, or the standard library.
+
+**Standing risk.** The install line is a hand-maintained list that duplicates
+what the code imports, with nothing enforcing agreement. A `requirements.txt`
+would at least put the list in one place. Not done yet; noted so the next
+import added to any pipeline file prompts a check of this line.
+
 ### Lesson
 
 **Gate on whether the work is done, not on what time it is.** A scheduler
