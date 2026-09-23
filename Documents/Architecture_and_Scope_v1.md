@@ -4569,3 +4569,155 @@ untracked and should be ignored outright.
 you don't control will eventually fire late, fire twice, or not fire. A
 check that asks "is anything pending?" is correct under all three; a check
 that asks "is it 6pm?" is correct only when the scheduler behaves.
+
+---
+
+## 2026-09-23 -- The Missing 2026-09-22 Session: Four Layers, One Stalled Day
+
+### What the user saw
+
+Five consecutive green runs of "Daily Scorecard Automation" -- 67 successes,
+0 failures, every time -- and no result for the 2026-09-22 session. The
+pipeline reported total health while doing no work. This is the same class of
+failure as the 53 green runs with zero trades (see the SPY benchmark entry):
+**a green run proves the workflow completed, not that the work happened.**
+
+### Layer 1 -- The day was being silently consumed (FIXED 2026-09-22 evening)
+
+`process_single_day()` called `set_last_run_date(target_date)` unconditionally.
+With no bars for 2026-09-22 in `data/`, `find_new_signals_for_date()` skipped
+every ticker, the day produced nothing, and the date was then stamped as done.
+The work-based scheduler correctly concluded there was nothing left to do and
+never retried it.
+
+**Fix:** new `count_tickers_with_bar(target_date)` performs a pre-flight scan
+reading only the Date column of every `data/*_1d_data.csv`. `process_single_day()`
+runs it first, prints `Data check: N of M ticker files have a bar for <date>`,
+and on N == 0 returns False WITHOUT stamping the date. `main()` **breaks** on a
+False return rather than continuing, because each day's exits feed the next and
+days must process in order.
+
+**Risk accepted and named:** a session that never publishes now stalls the
+pipeline indefinitely, with later days queued behind it. An escape hatch for a
+day stale beyond a couple of sessions is an OPEN ITEM.
+
+**Confirmed live:** `Data check: 0 of 1060 ticker files have a bar for 2026-09-22`
+/ `Stopping here -- 2026-09-22 will be retried on the next scheduled run.`
+
+### Layer 2 -- "Success" meant the HTTP call worked, not that the data was current
+
+The pull logged `Successes: 67 / Failures: 0` while every file it wrote still
+ended 2026-09-21. `process_ticker()` already captured each file's last date into
+`pull_report.csv`, but that file sits in the repo root and is never committed,
+so the information existed and was invisible.
+
+**Fix:** the pull now prints, after the success/failure counts, the newest bar
+date actually received, how many tickers carry it, a distribution of the last
+five distinct end-dates, and a list of tickers lagging the newest bar.
+
+First run output: `Newest bar received: 2026-09-21 (67 of 67 tickers)`.
+
+**Lesson recorded:** a success counter that measures whether a request completed,
+while the thing you care about is whether the request returned current data, will
+report health indefinitely. Instrument the property you actually depend on.
+
+### Layer 3 -- Our own cleaning was discarding the bar (the near-miss)
+
+Uniform staleness across all 67 tickers was initially read as evidence of an
+upstream problem. **That reasoning was wrong and was corrected:** a deterministic
+rule on our side -- the `dropna` on OHLC, or the `Volume.notna()` filter in
+`parse_chart_json()` -- removes the final bar from all 67 files identically,
+producing output indistinguishable from the source never sending it.
+
+A raw-payload diagnostic printing the last three bars for SPY *before* any
+cleaning settled it. On 2026-09-23 it returned:
+
+    ts=1790083800 -> 2026-09-22 | O=774.03 H=775.14 L=772.59 C=None V=34483102
+    rows: raw=901 after OHLC dropna=900 after Volume filter=900
+    last date raw: 2026-09-22
+    last date after cleaning: 2026-09-21
+
+Yahoo **was** sending the session. Open, high, low and volume were all present.
+Close was null, and our own `dropna` deleted the row.
+
+**Fix:** a last-row-only fallback to Yahoo's `adjclose` series. `adjclose`
+adjusts each bar for splits and dividends occurring *after* it; for the newest
+bar nothing has occurred after it yet, so `adjclose` equals `close` by
+construction. On any older bar the two are genuinely different numbers, and
+substituting would inject an adjusted price into an unadjusted series --
+so the fallback is restricted to the final row and fires only when `close`
+is null. If `adjclose` is also null, no price is invented and the bar is
+dropped as before.
+
+Tested across four cases: null close with adjclose present (bar recovered);
+both null (bar correctly dropped, nothing fabricated); normal day (untouched);
+null close on a *historical* row (dropped, no substitution).
+
+### Layer 4 -- The partial-bar corruption (found only because Layer 3 was fixed)
+
+The run that proved the fallback worked was executed at 09:38 Eastern, eight
+minutes into the 2026-09-23 session. The diagnostic showed:
+
+    ts=1790170200 -> 2026-09-23 | O=774.03 H=773.02 L=772.04 C=772.25 V=1546858
+    Newest bar received: 2026-09-23 (67 of 67 tickers)
+
+A high of 773.02 *below* an open of 774.03, and 1.5M volume against a normal
+~50M. This is an in-flight snapshot, not a finished session -- and it was
+written into all 67 price files as though it were a completed day.
+
+This has been latent since the project began. It never surfaced because the old
+clock-window scheduler only fired in the evening. The work-based scheduler fires
+during market hours, which exposed it. **One fix routinely reveals the next.**
+
+Consequences had it persisted: MA50, ATR14 and ADR10 computed from a partial bar
+for every ticker, feeding directly into scoring and entry-bid calculation. Files
+are overwritten each run, so each intraday run rewrites history with a different
+wrong value.
+
+**Fix:** `parse_chart_json()` now drops any bar dated later than
+`latest_completed_session()`, imported from `pipeline/check_run_window.py`.
+The cutoff is deliberately NOT "today minus one day" -- that would discard a
+legitimate same-day bar after the close. It is the same function the scheduler
+and orchestrator already use, so all three agree on what a finished session is
+(past `SESSION_READY_TIME`, 17:30 Eastern). One definition, three callers.
+If the import fails the script prints an explicit warning that the guard is
+disabled rather than running silently unprotected.
+
+**Note on what caught this:** the pre-flight check from Layer 1 prevented the
+partial bar from being processed -- it was looking for 2026-09-22, found none,
+and stopped. That was a guard written for a different purpose happening to
+catch an unrelated fault. Fortunate, not designed.
+
+### Layer 5 -- The 2026-09-22 session itself: STILL UNRESOLVED
+
+By 2026-09-23 the 09-22 bar had *regressed*: previously it carried O/H/L/V with
+a null close; it now returns with every field null, `adjclose` included. The
+fallback cannot fire because there is nothing to fall back to.
+
+The market traded normally that day (S&P closed ~7,764; Nasdaq +122 to a record).
+Null fields are documented normal behaviour in this endpoint for holidays and
+missing data points, and an open yfinance issue ("Yahoo Historical Stock data Has
+No OHLC Data for Yesterday") reports the same signature -- unchanged code, every
+ticker, one day absent. So the day exists; it is not being served through this
+endpoint.
+
+**Still open:** a `range=1mo` re-ask for SPY has been added to the diagnostic.
+Yahoo accepts either `period1`/`period2` or `range`, never both, and the two do
+not always resolve from the same cache. If `range` returns the bar, the fix is
+to change how we ask. If it does not, the data is not available from this source
+and no retry schedule will produce it.
+
+**Structural point raised, not yet addressed:** a single free, unofficial,
+undocumented feed is a single point of failure for a system intended to trade
+real capital. A second source for cross-checking is an OPEN ITEM.
+
+### Methodological lessons
+
+- A green run proves the workflow completed, not that work happened.
+- Instrument the property you depend on, not the one that is easy to count.
+- Uniform failure across every ticker does NOT localise the fault: a
+  deterministic rule on either side produces identical output.
+- Look at the raw payload before your own code touches it.
+- Fixing one bug routinely exposes the next; five runs produced five findings.
+- A guard that catches a fault it was not written for is luck, not design --
+  write the guard the fault deserves.
