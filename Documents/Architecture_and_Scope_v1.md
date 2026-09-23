@@ -4527,6 +4527,42 @@ failure, because each bug had been preventing its successor from ever
 executing. A pipeline that has never completed end to end has no evidence
 behind any step past the first failure.
 
+### Fourth failure, same evening: the branch is `Main`, not `main`
+
+The autostash fix worked -- rebase no longer complained about the dirty
+tree -- and the `git status --porcelain` line added alongside it paid for
+itself on its first run, printing exactly what had been dirty:
+
+    Working tree state before rebase:
+     M pull_report.csv
+    ?? pipeline/__pycache__/
+    fatal: couldn't find remote ref main
+
+Two separate findings in four lines.
+
+**The failure.** The branch is named `Main`, capital M. Git's own commit
+line says so -- `[Main 2a28719]`. Branch names are case-sensitive, so
+`origin main` referred to a branch that does not exist. Nothing in the
+workflow had ever named the branch explicitly before: `actions/checkout`
+takes the branch that triggered the run, and a bare `git push` uses the
+tracking branch. The rebase line added earlier the same day was the first
+place the name was ever typed, so the mismatch could not have surfaced
+until then.
+
+**Fix.** Do not hardcode either spelling. `BRANCH="$(git rev-parse
+--abbrev-ref HEAD)"` and rebase onto `origin/$BRANCH`, so the step follows
+whatever branch the run is actually on.
+
+**The dirty file, now identified.** `pull_report.csv` is written to the
+repository root by `pull_data.py` on every run, and it is tracked. Since
+the commit step stages only `data/` and `state/`, it is modified on every
+run and committed on none -- which is what blocked the rebase before
+autostash. Harmless now, but worth a decision later: either move it under
+`state/` so it is versioned with everything else the run produces, or add
+it to a `.gitignore` if the daily churn is not wanted in history. There is
+no `.gitignore` on either branch at present. `pipeline/__pycache__/` is
+untracked and should be ignored outright.
+
 ### Lesson
 
 **Gate on whether the work is done, not on what time it is.** A scheduler
