@@ -210,6 +210,11 @@ def _print_raw_diagnostic(symbol, payload):
     closes = quote.get("close") or []
     vols = quote.get("volume") or []
 
+    try:
+        adjclose = result["indicators"]["adjclose"][0]["adjclose"]
+    except Exception:
+        adjclose = []
+
     print("  last 3 raw bars (as returned, before any cleaning):")
     for i in range(max(0, len(timestamps) - 3), len(timestamps)):
         ts = timestamps[i]
@@ -221,7 +226,8 @@ def _print_raw_diagnostic(symbol, payload):
             return seq[i] if i < len(seq) else "MISSING"
         print(f"    ts={ts} -> {as_utc} UTC | "
               f"O={_at(opens)} H={_at(highs)} L={_at(lows)} "
-              f"C={_at(closes)} V={_at(vols)}")
+              f"C={_at(closes)} V={_at(vols)} "
+              f"ADJCLOSE={_at(adjclose)}")
 
     # Row counts through each cleaning step, so a filter that eats the
     # final bar is visible as a drop rather than an absence.
@@ -306,6 +312,39 @@ def parse_chart_json(payload):
             "Volume": quote.get("volume"),
         }
     )
+
+    # ------------------------------------------------------------------
+    # FINAL-BAR CLOSE FALLBACK (added 2026-09-23)
+    #
+    # WHY: on 2026-09-22 Yahoo returned the 09-22 bar with Open, High,
+    # Low and Volume all populated but Close = None. The dropna below
+    # then removed the row, so every ticker file silently ended 09-21
+    # while the pull reported 67 successes / 0 failures. The session was
+    # unprocessable for two days because of one null field.
+    #
+    # Yahoo sends a second close series, adjclose, adjusted for splits
+    # and dividends occurring AFTER each bar. For the most recent bar
+    # nothing has occurred after it, so adjclose equals close by
+    # construction -- which makes it a safe substitute THERE and only
+    # there. On an older bar adjclose is genuinely a different number,
+    # so filling one in would inject an adjusted price into an
+    # unadjusted series. Hence: last row only, never historical rows.
+    # ------------------------------------------------------------------
+    adjclose = None
+    try:
+        adjclose = result["indicators"]["adjclose"][0]["adjclose"]
+    except Exception:
+        adjclose = None
+
+    close_was_backfilled = False
+    if (len(df) and pd.isna(df["Close"].iloc[-1])
+            and adjclose is not None and len(adjclose) == len(df)):
+        candidate = adjclose[-1]
+        if candidate is not None and not pd.isna(candidate):
+            df.iloc[len(df) - 1, df.columns.get_loc("Close")] = float(candidate)
+            close_was_backfilled = True
+
+    parse_chart_json.last_close_backfilled = close_was_backfilled
 
     # Drop rows with no real trading data (holidays / partial-day artifacts)
     df = df.dropna(subset=["Open", "High", "Low", "Close"])
