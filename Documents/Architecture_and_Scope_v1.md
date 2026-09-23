@@ -4491,6 +4491,42 @@ what the code imports, with nothing enforcing agreement. A `requirements.txt`
 would at least put the list in one place. Not done yet; noted so the next
 import added to any pipeline file prompts a check of this line.
 
+### Third failure, same evening: rebase refused on a dirty working tree
+
+With the dependency fixed, the run got all the way through. Data pull
+succeeded in 2 seconds, the orchestrator ran for 14 seconds, and the commit
+step staged and committed 69 files, 5,817 insertions, including brand-new
+price files for tickers the screen had never returned before. Then:
+
+    error: cannot pull with rebase: You have unstaged changes.
+    error: Please commit or stash them.
+    Error: Process completed with exit code 128.
+
+**Cause.** The commit step stages narrowly -- `git add data/ state/` -- which
+is deliberate, so the bot can never commit code. But the `git pull --rebase`
+added earlier that same day inspects the *whole* working tree, and rebase
+refuses to start when anything tracked is modified and unstaged. Something
+the run touches outside `data/` and `state/` was left dirty. The narrow add
+and the rebase were each correct in isolation and incompatible together.
+
+**Fix.** `git pull --rebase --autostash origin main`. Autostash stashes the
+leftover, rebases, and restores it, which is the intended semantics here:
+the leftover is incidental to the run, not something we mean to commit. A
+`git status --porcelain` was added immediately before the rebase so that if
+this recurs the log names the file instead of leaving it to be guessed.
+
+**Note on recovery.** The failed push means the commit existed only on the
+runner and was discarded with it, including the update to
+`state/last_run_date.txt`. Under the new work-based gate that is
+self-correcting rather than damaging: the session is still recorded as
+unprocessed, so the next trigger simply does the work again. Under the old
+clock-window gate the same failure would have burned the day.
+
+**Pattern, third instance in one evening.** Each fix exposed the next
+failure, because each bug had been preventing its successor from ever
+executing. A pipeline that has never completed end to end has no evidence
+behind any step past the first failure.
+
 ### Lesson
 
 **Gate on whether the work is done, not on what time it is.** A scheduler
