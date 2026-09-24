@@ -490,7 +490,7 @@ def parse_chart_json(payload):
 #
 # Set PROBE_SESSION to "" to turn this off.
 # ----------------------------------------------------------------------
-PROBE_SESSION = "2026-09-22"
+PROBE_SESSION = ""
 PROBE_MAX_SYMBOLS = 5
 
 
