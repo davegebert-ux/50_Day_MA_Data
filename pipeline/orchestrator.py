@@ -838,12 +838,56 @@ def check_capital_committed(open_df):
 # ============================================================
 # PRE-FLIGHT DATA CHECK (added 2026-09-22)
 # ============================================================
+# ------------------------------------------------------------------
+# SESSION COVERAGE GUARD (2026-09-24)
+#
+# The original guard below refused a session only when ZERO tickers
+# carried a bar for it. That is too weak. On 2026-09-22 EIGHT tickers
+# carried the bar and on 2026-09-23 FIVE did, against a healthy count of
+# 67 -- so both sessions cleared the zero test, were processed against
+# almost no data, and were stamped done. They cannot be revisited,
+# because state/last_run_date.txt now says they were handled.
+#
+# The fix is a relative test rather than an absolute one. The screen
+# universe changes size daily, so there is no fixed number to compare
+# against; instead we compare today's coverage with the BEST coverage
+# seen over the previous fortnight of weekdays. Taking the best rather
+# than the most recent matters -- otherwise one thin day that slips
+# through lowers the bar for the next one, and the standard ratchets
+# down a day at a time.
+# ------------------------------------------------------------------
+MIN_COVERAGE_FRACTION = 0.50   # need half the recent best to proceed
+COVERAGE_LOOKBACK_DAYS = 20    # calendar days scanned for a reference
+SKIP_SESSIONS_PATH = os.path.join(_STATE_DIR, "skip_sessions.txt")
+
+
+def coverage_for_dates(target_dates):
+    """
+    One pass over data/ returning ({date: n_files_holding_that_date},
+    n_files). Deliberately a light scan -- reads ONLY the Date column,
+    not the full OHLCV load sim.load_ticker() does. Counting several
+    dates in a single pass rather than calling the old one-date helper
+    repeatedly keeps this at one read of each file no matter how wide
+    the reference window is.
+    """
+    counts = {pd.Timestamp(d).normalize(): 0 for d in target_dates}
+    n_files = 0
+    for fpath in sorted(glob.glob(os.path.join(DATA_DIR, "*_1d_data.csv"))):
+        n_files += 1
+        try:
+            dates = pd.read_csv(fpath, usecols=["Date"], parse_dates=["Date"])
+        except Exception:
+            continue
+        have = set(pd.to_datetime(dates["Date"]).dt.normalize())
+        for d in counts:
+            if d in have:
+                counts[d] += 1
+    return counts, n_files
+
+
 def count_tickers_with_bar(target_date):
     """
-    Counts how many ticker files in data/ actually contain a bar for
-    target_date. Deliberately a light scan -- reads ONLY the Date column,
-    not the full OHLCV load sim.load_ticker() does -- because this runs
-    over every file in data/ purely to answer "did the data arrive?"
+    Counts how many ticker files in data/ contain a bar for target_date.
 
     WHY THIS EXISTS (2026-09-22): the 2026-09-22 run completed green and
     stamped the session as processed while holding ZERO bars for that
@@ -852,19 +896,45 @@ def count_tickers_with_bar(target_date):
     find_new_signals_for_date() logged all 1,060 tickers as
     no_data_for_date and process_single_day() marked the day done
     anyway. Under the work-based run gate that silently loses the
-    session forever, because state/last_run_date.txt then says it was
-    handled. See Architecture_and_Scope_v1.md, 2026-09-22.
+    session forever. See Architecture_and_Scope_v1.md, 2026-09-22.
+
+    Retained as a thin wrapper over coverage_for_dates() so any other
+    caller keeps working.
     """
-    n = 0
-    target_date = pd.Timestamp(target_date)
-    for fpath in sorted(glob.glob(os.path.join(DATA_DIR, "*_1d_data.csv"))):
-        try:
-            dates = pd.read_csv(fpath, usecols=["Date"], parse_dates=["Date"])
-        except Exception:
-            continue
-        if target_date in set(dates["Date"]):
-            n += 1
-    return n
+    counts, _ = coverage_for_dates([target_date])
+    return counts[pd.Timestamp(target_date).normalize()]
+
+
+def load_skipped_sessions():
+    """
+    Sessions an operator has declared permanently unavailable, one
+    ISO date per line in state/skip_sessions.txt ('#' starts a comment).
+
+    WHY (2026-09-24): the coverage guard refuses to process a session
+    whose data never arrived, and main() breaks rather than continues,
+    so every later session queues behind it. That is correct while the
+    data might still turn up and a permanent stall once it will not.
+    This is the release valve, and it is deliberately MANUAL: a session
+    is only ever written off by a human decision, recorded in a file in
+    the repo, where it can be read back later. Nothing auto-skips.
+    """
+    out = set()
+    try:
+        with open(SKIP_SESSIONS_PATH) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                try:
+                    out.add(pd.Timestamp(line).normalize())
+                except Exception:
+                    print(f"  WARNING: unparseable date in "
+                          f"skip_sessions.txt: {line!r} -- ignored")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"  WARNING: could not read skip_sessions.txt ({e})")
+    return out
 
 
 # ============================================================
@@ -883,15 +953,54 @@ def process_single_day(target_date):
     # price data for. Without this the day gets stamped as done while
     # every ticker falls out at the no_data_for_date gate, and the
     # work-based run gate never comes back for it.
-    n_with_bar = count_tickers_with_bar(target_date)
-    n_files = len(glob.glob(os.path.join(DATA_DIR, "*_1d_data.csv")))
+    tgt = pd.Timestamp(target_date).normalize()
+
+    # OPERATOR OVERRIDE: a session written off by hand is stamped done
+    # and skipped, so the queue behind it drains. No signals are
+    # evaluated -- there is no data to evaluate -- and no exits are
+    # checked, which is the honest treatment of a session we simply do
+    # not have.
+    if tgt in load_skipped_sessions():
+        print(f"  SKIPPED BY OPERATOR: {tgt.date()} is listed in "
+              f"state/skip_sessions.txt as permanently unavailable. "
+              f"Marking it done and moving on WITHOUT processing it. "
+              f"No exits were checked and no entries were taken for "
+              f"this session.")
+        set_last_run_date(target_date)
+        return True
+
+    window = [tgt - pd.Timedelta(days=i)
+              for i in range(1, COVERAGE_LOOKBACK_DAYS + 1)]
+    window = [d for d in window if d.weekday() < 5]
+    counts, n_files = coverage_for_dates([tgt] + window)
+
+    n_with_bar = counts[tgt]
+    reference = max([counts[d] for d in window], default=0)
+    threshold = int(reference * MIN_COVERAGE_FRACTION)
+
     print(f"  Data check: {n_with_bar} of {n_files} ticker files have a bar "
-          f"for {pd.Timestamp(target_date).date()}")
-    if n_with_bar == 0:
-        print(f"  NO DATA YET for {pd.Timestamp(target_date).date()} -- "
-              f"the daily bars have not been published. Leaving this "
-              f"session UNPROCESSED so a later run picks it up. "
-              f"state/last_run_date.txt is unchanged.")
+          f"for {tgt.date()}")
+    if reference:
+        print(f"  Reference coverage (best weekday in the previous "
+              f"{COVERAGE_LOOKBACK_DAYS} days): {reference} tickers; "
+              f"need at least {threshold} to proceed")
+
+    if n_with_bar == 0 or (reference and n_with_bar < threshold):
+        if n_with_bar == 0:
+            print(f"  NO DATA for {tgt.date()} -- the daily bars have not "
+                  f"been published.")
+        else:
+            print(f"  PARTIAL DATA for {tgt.date()} -- only {n_with_bar} "
+                  f"tickers carry this bar against a recent best of "
+                  f"{reference}. Processing it now would consume the "
+                  f"session against an unrepresentative slice of the "
+                  f"universe and stamp it done permanently.")
+        print(f"  Leaving this session UNPROCESSED so a later run picks it "
+              f"up. state/last_run_date.txt is unchanged.")
+        print(f"  If this session is never going to publish, add the line "
+              f"'{tgt.date()}' to state/skip_sessions.txt and re-run -- it "
+              f"will then be marked done and the queue behind it will "
+              f"drain.")
         return False
 
     open_df = load_open_positions()
