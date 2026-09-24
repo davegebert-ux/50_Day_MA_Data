@@ -472,6 +472,149 @@ def parse_chart_json(payload):
 # they disagree materially, that is a re-adjustment and the fresh series
 # replaces the file wholesale.
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# MISSING-SESSION PROBE (added 2026-09-24)
+#
+# The raw-payload diagnostic points at SPY, and SPY is one of the eight
+# tickers that DOES carry the 2026-09-22 bar. So every run so far has
+# confirmed the session exists for a symbol where it already works, and
+# we have never looked at a symbol that is missing it. That is the wrong
+# sample.
+#
+# This probe inverts it: after the pull, find tickers whose file LACKS
+# the session, re-ask Yahoo for a few of them both ways (the
+# period1/period2 window we normally use, and range=1mo), and report
+# whether the bar appears in the RAW payload. One ticker that HAS the
+# session is probed too, as a control -- without it a row of "absent"
+# results cannot be distinguished from a broken probe.
+#
+# Set PROBE_SESSION to "" to turn this off.
+# ----------------------------------------------------------------------
+PROBE_SESSION = "2026-09-22"
+PROBE_MAX_SYMBOLS = 5
+
+
+def _raw_bar_for_date(payload, target):
+    """Look for target in a chart payload BEFORE any cleaning.
+
+    Returns (present, close, adjclose, volume). present is True whenever
+    the timestamp is in the payload at all, even if every price field
+    beside it is null -- that distinction is the whole point: a bar
+    present with null fields and a bar absent entirely are two different
+    failures with two different fixes.
+    """
+    try:
+        result = payload["chart"]["result"][0]
+    except Exception:
+        return (None, None, None, None)
+    ts = result.get("timestamp") or []
+    quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+    closes = quote.get("close") or []
+    vols = quote.get("volume") or []
+    try:
+        adj = result["indicators"]["adjclose"][0]["adjclose"]
+    except Exception:
+        adj = []
+    for i, t in enumerate(ts):
+        try:
+            d = dt.datetime.utcfromtimestamp(int(t)).date()
+        except Exception:
+            continue
+        if d == target:
+            return (True,
+                    closes[i] if i < len(closes) else "MISSING",
+                    adj[i] if i < len(adj) else "MISSING",
+                    vols[i] if i < len(vols) else "MISSING")
+    return (False, None, None, None)
+
+
+def _fetch_range(symbol, span="1mo"):
+    """Second phrasing of the same question. Yahoo accepts EITHER
+    period1/period2 OR range, never both, and the two do not always
+    resolve from the same cache."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    r = requests.get(url, params={"range": span, "interval": "1d"},
+                     headers=HEADERS, timeout=25)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    return r.json()
+
+
+def probe_missing_session(results, probe_date):
+    """Report whether a session Yahoo is not serving us is retrievable
+    at all, sampled from tickers that ACTUALLY LACK IT."""
+    target = pd.Timestamp(probe_date).date()
+    have, lack = [], []
+    for r in results:
+        if r.get("status") != "OK":
+            continue
+        try:
+            d = pd.read_csv(DATA_DIR / f"{r['symbol']}_1d_data.csv",
+                            usecols=["Date"], parse_dates=["Date"])
+        except Exception:
+            continue
+        if target in set(d["Date"].dt.date):
+            have.append(r["symbol"])
+        else:
+            lack.append(r["symbol"])
+
+    print(f"\n----- MISSING-SESSION PROBE: {target} -----")
+    print(f"  On disk after this pull: {len(have)} tickers HAVE this "
+          f"session, {len(lack)} LACK it")
+    if not lack:
+        print("  Nothing to probe -- every ticker carries the session.")
+        print("----- END PROBE -----\n")
+        return
+
+    sample = sorted(lack)[:PROBE_MAX_SYMBOLS]
+    control = sorted(have)[0] if have else None
+    if control:
+        print(f"  Probing {len(sample)} tickers missing it, plus "
+              f"{control} as a control (it HAS the session)")
+    else:
+        print(f"  Probing {len(sample)} tickers missing it. NO CONTROL "
+              f"AVAILABLE -- no ticker on disk has this session, so an "
+              f"all-absent result below cannot rule out a broken probe.")
+
+    for sym in sample + ([control] if control else []):
+        tag = "CONTROL" if sym == control else "missing "
+        # 1) the production request shape
+        try:
+            ok, payload, err = fetch_chart(sym)
+            if ok:
+                present, c, a, v = _raw_bar_for_date(payload, target)
+                if present:
+                    print(f"  [{tag}] {sym:6s} period1/period2: PRESENT "
+                          f"C={c} ADJCLOSE={a} V={v}")
+                else:
+                    print(f"  [{tag}] {sym:6s} period1/period2: ABSENT "
+                          f"(timestamp not in payload)")
+            else:
+                print(f"  [{tag}] {sym:6s} period1/period2: FETCH FAILED "
+                      f"({err})")
+        except Exception as e:
+            print(f"  [{tag}] {sym:6s} period1/period2: ERROR {e}")
+
+        # 2) the other phrasing
+        try:
+            payload = _fetch_range(sym, "1mo")
+            present, c, a, v = _raw_bar_for_date(payload, target)
+            if present:
+                print(f"  [{tag}] {sym:6s} range=1mo      : PRESENT "
+                      f"C={c} ADJCLOSE={a} V={v}")
+            else:
+                print(f"  [{tag}] {sym:6s} range=1mo      : ABSENT "
+                      f"(timestamp not in payload)")
+        except Exception as e:
+            print(f"  [{tag}] {sym:6s} range=1mo      : ERROR {e}")
+
+    print("  READING THIS: PRESENT under either phrasing for a ticker that")
+    print("  lacks the session means the bar is retrievable and the fix is")
+    print("  on our side. ABSENT under both, with the control PRESENT,")
+    print("  means the source does not hold this session for these symbols.")
+    print("----- END PROBE -----\n")
+
+
 REQUIRED_COLS = ["Date", "Open", "High", "Low", "Close", "Volume"]
 READJUST_TOLERANCE = 0.005    # >0.5% median difference = re-adjustment
 READJUST_MIN_SHARED = 20      # need this many shared old bars to judge
@@ -756,6 +899,12 @@ def main():
         print(f"Files replaced wholesale ({len(replaced)}): "
               f"{', '.join(sorted(replaced)[:15])}"
               f"{' ...' if len(replaced) > 15 else ''}")
+
+    if PROBE_SESSION:
+        try:
+            probe_missing_session(results, PROBE_SESSION)
+        except Exception as e:
+            print(f"\nMissing-session probe failed: {e}")
 
     return results, universe
 
