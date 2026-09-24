@@ -858,10 +858,27 @@ def check_capital_committed(open_df):
 # ------------------------------------------------------------------
 MIN_COVERAGE_FRACTION = 0.50   # need half the recent best to proceed
 COVERAGE_LOOKBACK_DAYS = 20    # calendar days scanned for a reference
+LIVE_FILE_STALENESS_DAYS = 10  # a file this far behind is not being refreshed
+
+# CORRECTION (2026-09-24, same day): the first version of this guard
+# counted every file in data/. That directory still holds ~993 orphan
+# files from the pre-2026-09-10 S&P 400+600 universe, which pull_data.py
+# no longer refreshes; they are frozen with bars ending around
+# 2026-09-09. So for any target in late September the 20-day reference
+# window reaches back into dates where ALL ~1,060 files have data, the
+# reference comes out at ~1,057 instead of ~67, and the threshold lands
+# near 528 -- which blocks a perfectly healthy session. Reproduced: a
+# complete 2026-09-21 with 67 of 67 screen tickers was refused.
+#
+# The reference therefore has to be drawn from the same population that
+# actually gets refreshed. A file counts only if its own last bar is
+# within LIVE_FILE_STALENESS_DAYS of the session being judged; the
+# orphans fail that test at every date in the window, so they drop out
+# of both the numerator and the denominator.
 SKIP_SESSIONS_PATH = os.path.join(_STATE_DIR, "skip_sessions.txt")
 
 
-def coverage_for_dates(target_dates):
+def coverage_for_dates(target_dates, live_as_of=None):
     """
     One pass over data/ returning ({date: n_files_holding_that_date},
     n_files). Deliberately a light scan -- reads ONLY the Date column,
@@ -872,6 +889,12 @@ def coverage_for_dates(target_dates):
     """
     counts = {pd.Timestamp(d).normalize(): 0 for d in target_dates}
     n_files = 0
+    n_live = 0
+    live_cutoff = None
+    if live_as_of is not None:
+        live_cutoff = (pd.Timestamp(live_as_of).normalize()
+                       - pd.Timedelta(days=LIVE_FILE_STALENESS_DAYS))
+
     for fpath in sorted(glob.glob(os.path.join(DATA_DIR, "*_1d_data.csv"))):
         n_files += 1
         try:
@@ -879,10 +902,15 @@ def coverage_for_dates(target_dates):
         except Exception:
             continue
         have = set(pd.to_datetime(dates["Date"]).dt.normalize())
+        if not have:
+            continue
+        if live_cutoff is not None and max(have) < live_cutoff:
+            continue          # frozen orphan -- not part of the live universe
+        n_live += 1
         for d in counts:
             if d in have:
                 counts[d] += 1
-    return counts, n_files
+    return counts, n_files, n_live
 
 
 def count_tickers_with_bar(target_date):
@@ -901,7 +929,7 @@ def count_tickers_with_bar(target_date):
     Retained as a thin wrapper over coverage_for_dates() so any other
     caller keeps working.
     """
-    counts, _ = coverage_for_dates([target_date])
+    counts, _, _ = coverage_for_dates([target_date])
     return counts[pd.Timestamp(target_date).normalize()]
 
 
@@ -972,18 +1000,20 @@ def process_single_day(target_date):
     window = [tgt - pd.Timedelta(days=i)
               for i in range(1, COVERAGE_LOOKBACK_DAYS + 1)]
     window = [d for d in window if d.weekday() < 5]
-    counts, n_files = coverage_for_dates([tgt] + window)
+    counts, n_files, n_live = coverage_for_dates([tgt] + window,
+                                                 live_as_of=tgt)
 
     n_with_bar = counts[tgt]
     reference = max([counts[d] for d in window], default=0)
     threshold = int(reference * MIN_COVERAGE_FRACTION)
 
-    print(f"  Data check: {n_with_bar} of {n_files} ticker files have a bar "
-          f"for {tgt.date()}")
+    print(f"  Data check: {n_with_bar} of {n_live} live ticker files have a "
+          f"bar for {tgt.date()} ({n_files} files in data/, "
+          f"{n_files - n_live} frozen/orphaned and excluded)")
     if reference:
         print(f"  Reference coverage (best weekday in the previous "
-              f"{COVERAGE_LOOKBACK_DAYS} days): {reference} tickers; "
-              f"need at least {threshold} to proceed")
+              f"{COVERAGE_LOOKBACK_DAYS} days, live files only): "
+              f"{reference} tickers; need at least {threshold} to proceed")
 
     if n_with_bar == 0 or (reference and n_with_bar < threshold):
         if n_with_bar == 0:
