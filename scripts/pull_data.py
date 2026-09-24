@@ -703,6 +703,188 @@ def merge_with_existing(symbol, df_new):
     return combined, preserved, note
 
 
+# ----------------------------------------------------------------------
+# STALE-FILE PRUNE + FUNNEL TRUNCATION (added 2026-09-24)
+#
+# WHY: data/ holds ~1,060 ticker files but pull_data.py refreshes only the
+# ~65 that pass today's screen. The other ~995 are frozen leftovers from
+# the pre-2026-09-10 S&P 400+600 proof-of-concept universe, which the
+# system no longer trades. They are not merely untidy:
+#
+#   - orchestrator.py walks EVERY file in data/, so each one emits a
+#     no_data_for_date row into state/daily_funnel.csv every single run.
+#     On 2026-09-21 -- a session where all 67 live tickers had their bar
+#     and everything worked -- 993 of 1,060 funnel rows still read
+#     no_data_for_date. The log therefore reports catastrophe on a
+#     perfectly healthy day, and the ~65 rows that matter are buried.
+#   - they forced the LIVE_FILE_STALENESS_DAYS machinery in the
+#     orchestrator's coverage guard, because a reference window drawn over
+#     all files was inflated by orphans to ~1,057 and blocked healthy
+#     sessions.
+#
+# Deleting them is safe: everything in data/ is committed to git, so a
+# file removed here is still recoverable from history, and any ticker that
+# re-enters the screen is simply refetched with its full 3.6-year window
+# on the next run.
+#
+# RELATIVE, NOT ABSOLUTE: the cutoff is measured from the newest bar found
+# across all files, not from today's calendar date. If the feed itself
+# goes dark for a fortnight, every file ages together, the reference ages
+# with them, and nothing is deleted. An absolute "older than today minus
+# ten days" rule would empty the entire data directory in exactly the
+# situation where the data is most precious. This is the same lesson as
+# the coverage guard: judge against what good currently looks like.
+# ----------------------------------------------------------------------
+PRUNE_ENABLED = True
+PRUNE_STALENESS_DAYS = 10
+
+FUNNEL_PATH = STATE_DIR / "daily_funnel.csv"
+
+# One-time cleanup. state/daily_funnel.csv accumulated thousands of orphan
+# rows from before the pipeline worked end to end; Dave asked to keep the
+# record from Monday 2026-09-21 forward and discard what came before it.
+# Re-running this is a no-op once those rows are gone, so it is harmless
+# to leave in place. Set to "" to disable.
+FUNNEL_KEEP_FROM = "2026-09-21"
+
+
+def _last_bar_date(fpath):
+    """Newest Date in a ticker file, or None if unreadable or empty.
+
+    Reads ONLY the Date column -- this runs over every file in data/ and
+    has no use for the prices.
+    """
+    try:
+        d = pd.read_csv(fpath, usecols=["Date"], parse_dates=["Date"])
+    except Exception:
+        return None
+    if d.empty:
+        return None
+    m = d["Date"].max()
+    if pd.isna(m):
+        return None
+    return m.date()
+
+
+def prune_stale_data_files(protected_symbols):
+    """Delete ticker files that are no longer being refreshed.
+
+    protected_symbols is today's full pull universe -- the screen, plus
+    any open position, plus the SPY benchmark. Those are never deleted
+    regardless of how stale they look, because a pull failure today must
+    not be able to destroy a position's price history.
+    """
+    paths = sorted(DATA_DIR.glob("*_1d_data.csv"))
+    if not paths:
+        print("\nPrune: data/ is empty -- nothing to do.")
+        return
+
+    last_dates = {}
+    unreadable = []
+    for fp in paths:
+        symbol = fp.name[:-len("_1d_data.csv")]
+        d = _last_bar_date(fp)
+        if d is None:
+            unreadable.append(symbol)
+        else:
+            last_dates[symbol] = d
+
+    if not last_dates:
+        print("\nPrune: no readable ticker files -- refusing to delete "
+              "anything.")
+        return
+
+    reference = max(last_dates.values())
+    cutoff = reference - dt.timedelta(days=PRUNE_STALENESS_DAYS)
+
+    stale = sorted(sym for sym, d in last_dates.items()
+                   if d < cutoff and sym not in protected_symbols)
+    protected_but_stale = sorted(
+        sym for sym, d in last_dates.items()
+        if d < cutoff and sym in protected_symbols)
+
+    print(f"\n----- STALE-FILE PRUNE -----")
+    print(f"  Files in data/: {len(paths)}  "
+          f"(protected this run: {len(protected_symbols)})")
+    print(f"  Newest bar anywhere in data/: {reference}")
+    print(f"  Deleting files whose newest bar is before {cutoff} "
+          f"({PRUNE_STALENESS_DAYS}-day staleness window)")
+    if unreadable:
+        print(f"  Unreadable/empty files left alone ({len(unreadable)}): "
+              f"{', '.join(unreadable[:15])}"
+              f"{' ...' if len(unreadable) > 15 else ''}")
+    if protected_but_stale:
+        print(f"  Stale but PROTECTED, kept ({len(protected_but_stale)}): "
+              f"{', '.join(protected_but_stale[:15])}"
+              f"{' ...' if len(protected_but_stale) > 15 else ''}")
+
+    if not stale:
+        print("  Nothing to prune -- every unprotected file is current.")
+        print("----- END PRUNE -----\n")
+        return
+
+    # Print a sample, not all of them. The first run deletes ~995 files
+    # and 83 lines of filenames would bury the rest of the log -- which is
+    # the very problem this prune exists to fix. The authoritative record
+    # is the git commit: its diff lists every deleted file by name, and
+    # any of them can be restored from history.
+    PRINT_CAP = 40
+    print(f"  Pruning {len(stale)} file(s)"
+          f"{f' (first {PRINT_CAP} shown; full list is in the commit diff)' if len(stale) > PRINT_CAP else ''}:")
+    for i in range(0, min(len(stale), PRINT_CAP), 12):
+        print("    " + ", ".join(stale[i:i + 12]))
+    if len(stale) > PRINT_CAP:
+        print(f"    ... and {len(stale) - PRINT_CAP} more")
+
+    deleted, failed = 0, []
+    for sym in stale:
+        try:
+            (DATA_DIR / f"{sym}_1d_data.csv").unlink()
+            deleted += 1
+        except Exception as e:
+            failed.append(f"{sym} ({e})")
+
+    print(f"  Deleted {deleted} file(s); {len(paths) - deleted} remain.")
+    if failed:
+        print(f"  FAILED to delete {len(failed)}: {', '.join(failed[:10])}")
+    print("----- END PRUNE -----\n")
+
+
+def truncate_funnel_log(keep_from):
+    """Drop funnel rows older than keep_from. One-time cleanup; a no-op
+    on every subsequent run."""
+    if not keep_from:
+        return
+    if not FUNNEL_PATH.exists():
+        print(f"Funnel truncation: {FUNNEL_PATH.name} not found -- skipped.")
+        return
+    try:
+        df = pd.read_csv(FUNNEL_PATH)
+    except Exception as e:
+        print(f"Funnel truncation: could not read {FUNNEL_PATH.name} "
+              f"({e}) -- left untouched.")
+        return
+    if "run_date" not in df.columns or df.empty:
+        print("Funnel truncation: no run_date column or file empty -- "
+              "left untouched.")
+        return
+
+    before = len(df)
+    keep = df[df["run_date"].astype(str) >= keep_from]
+    dropped = before - len(keep)
+    if dropped <= 0:
+        return
+
+    if keep.empty:
+        print(f"Funnel truncation: keeping rows from {keep_from} would "
+              f"empty the file -- refusing, left untouched.")
+        return
+
+    keep.to_csv(FUNNEL_PATH, index=False)
+    print(f"Funnel truncation: dropped {dropped} row(s) before {keep_from}; "
+          f"{len(keep)} row(s) kept.")
+
+
 def process_ticker(symbol):
     ok, payload, err = fetch_chart(symbol)
     if not ok:
@@ -905,6 +1087,21 @@ def main():
             probe_missing_session(results, PROBE_SESSION)
         except Exception as e:
             print(f"\nMissing-session probe failed: {e}")
+
+    # Housekeeping runs LAST, after every file this run is going to write
+    # has been written, so today's pulls are current on disk and cannot be
+    # mistaken for stale. Both are wrapped: neither is worth failing the
+    # pull over, since the pipeline works fine with a cluttered data/.
+    if PRUNE_ENABLED:
+        try:
+            prune_stale_data_files(set(universe.keys()))
+        except Exception as e:
+            print(f"\nStale-file prune failed: {e}")
+
+    try:
+        truncate_funnel_log(FUNNEL_KEEP_FROM)
+    except Exception as e:
+        print(f"Funnel truncation failed: {e}")
 
     return results, universe
 
