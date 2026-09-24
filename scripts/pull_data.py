@@ -440,6 +440,126 @@ def parse_chart_json(payload):
     return df
 
 
+# ----------------------------------------------------------------------
+# MERGE INSTEAD OF OVERWRITE (added 2026-09-24)
+#
+# WHY: until now every run rewrote each ticker file from scratch with
+# whatever the fetch happened to return. That is harmless when the
+# source is complete and destructive when it is not.
+#
+# Evidence from state/daily_funnel.csv: on 2026-09-22 SPY was processed
+# twice for the same session -- once WITH its bar and once without. We
+# had that bar, wrote it to disk, and a later run in which Yahoo
+# declined to serve it overwrote the file and threw it away.
+#
+# The wider pattern in the same funnel: 8 tickers carried a 2026-09-22
+# bar, a completely different 5 carried 2026-09-23, and the two sets do
+# not overlap at all. So this is not "Yahoo is missing one day" -- it is
+# Yahoo returning the newest bar with null price fields for most
+# tickers, with a different subset resolving on each request. Under
+# overwrite semantics coverage shuffles instead of accumulating, and we
+# can lose ground on a day we had already won.
+#
+# Merging makes capture permanent: any bar we ever successfully fetch
+# stays, and successive runs fill the gaps in rather than reshuffling
+# them.
+#
+# SPLIT SAFETY: Yahoo's quote series is split-adjusted, so after a split
+# every historical bar changes. Blindly merging old unadjusted bars with
+# newly adjusted ones would fabricate a price gap that never happened --
+# and MA50/ATR14/ADR10 would be computed straight off it. So before
+# merging we compare the two series on the older bars they share; if
+# they disagree materially, that is a re-adjustment and the fresh series
+# replaces the file wholesale.
+# ----------------------------------------------------------------------
+REQUIRED_COLS = ["Date", "Open", "High", "Low", "Close", "Volume"]
+READJUST_TOLERANCE = 0.005    # >0.5% median difference = re-adjustment
+READJUST_MIN_SHARED = 20      # need this many shared old bars to judge
+READJUST_RECENT_SKIP = 5      # ignore newest bars when comparing
+
+
+def merge_with_existing(symbol, df_new):
+    """Combine freshly fetched bars with what is already on disk.
+
+    Returns (df_out, preserved_count, note). preserved_count counts bars
+    that survive only because they were already on disk -- i.e. bars
+    INSIDE the fetch's own date range that the fetch did not return.
+    """
+    out_path = DATA_DIR / f"{symbol}_1d_data.csv"
+    if not out_path.exists():
+        return df_new, 0, "new file"
+
+    try:
+        old = pd.read_csv(out_path)
+    except Exception as e:
+        return df_new, 0, f"existing file unreadable ({e}); replaced"
+
+    if not all(c in old.columns for c in REQUIRED_COLS):
+        return df_new, 0, "existing file has unexpected columns; replaced"
+
+    old = old[REQUIRED_COLS].copy()
+    old["Date"] = pd.to_datetime(old["Date"], errors="coerce")
+    old = old.dropna(subset=["Date"])
+    if old.empty:
+        return df_new, 0, "existing file had no usable dates; replaced"
+    old["Date"] = old["Date"].dt.date
+    old = old.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    if old.empty:
+        return df_new, 0, "existing file had no complete bars; replaced"
+
+    # --- re-adjustment check, on shared OLDER bars only ---
+    if len(df_new) > READJUST_RECENT_SKIP:
+        cmp_new = df_new.iloc[:-READJUST_RECENT_SKIP]
+    else:
+        cmp_new = df_new
+    shared = cmp_new.merge(old, on="Date", suffixes=("_new", "_old"))
+    if len(shared) >= READJUST_MIN_SHARED:
+        denom = shared["Close_old"].abs()
+        valid = denom > 0
+        if valid.any():
+            rel = ((shared.loc[valid, "Close_new"]
+                    - shared.loc[valid, "Close_old"]).abs() / denom[valid])
+            med = float(rel.median())
+            if med > READJUST_TOLERANCE:
+                return (df_new, 0,
+                        f"price series re-adjusted (median diff "
+                        f"{med * 100:.1f}%); replaced wholesale")
+
+    # --- merge. Fresh bars win on a shared date; old bars survive when
+    #     the fetch did not return them at all. ---
+    combined = pd.concat([old, df_new], ignore_index=True)
+    combined = combined.drop_duplicates(subset="Date", keep="last")
+    combined = combined.sort_values("Date").reset_index(drop=True)
+
+    # Re-apply the completed-session cutoff. Files written before the
+    # partial-bar guard existed may contain an in-flight bar; without
+    # this, merging would preserve that corruption permanently.
+    if _SESSION_GUARD_AVAILABLE and len(combined):
+        cutoff = latest_completed_session().date()
+        combined = combined[combined["Date"] <= cutoff].reset_index(drop=True)
+
+    if combined.empty:
+        return df_new, 0, "merge produced no rows; wrote fetch only"
+
+    combined["Volume"] = combined["Volume"].round().astype("int64")
+    for col in ["Open", "High", "Low", "Close"]:
+        combined[col] = combined[col].astype(float).round(4)
+
+    preserved = 0
+    if len(df_new):
+        new_dates = set(df_new["Date"])
+        lo = df_new["Date"].iloc[0]
+        # Bounded below by the fetch window start (so deeper history in an
+        # older file is not miscounted as a rescue) but NOT bounded above:
+        # the bar most often rescued is the newest one, which by
+        # definition sits past the end of a fetch that failed to return it.
+        preserved = sum(1 for d in combined["Date"]
+                        if d >= lo and d not in new_dates)
+
+    note = f"merged (+{preserved} preserved)" if preserved else "merged"
+    return combined, preserved, note
+
+
 def process_ticker(symbol):
     ok, payload, err = fetch_chart(symbol)
     if not ok:
@@ -462,16 +582,28 @@ def process_ticker(symbol):
         return {"symbol": symbol, "status": "FAILED", "reason": "no usable rows after cleaning",
                 "rows": 0, "start": None, "end": None}
 
+    fetch_rows = len(df)
+    fetch_end = str(df["Date"].iloc[-1])
+
+    try:
+        df_out, preserved, merge_note = merge_with_existing(symbol, df)
+    except Exception as e:
+        df_out, preserved, merge_note = df, 0, f"merge failed ({e}); wrote fetch only"
+
     out_path = DATA_DIR / f"{symbol}_1d_data.csv"
-    df.to_csv(out_path, index=False, date_format="%Y-%m-%d")
+    df_out.to_csv(out_path, index=False, date_format="%Y-%m-%d")
 
     return {
         "symbol": symbol,
         "status": "OK",
         "reason": "",
-        "rows": len(df),
-        "start": str(df["Date"].iloc[0]),
-        "end": str(df["Date"].iloc[-1]),
+        "rows": len(df_out),
+        "start": str(df_out["Date"].iloc[0]),
+        "end": str(df_out["Date"].iloc[-1]),
+        "fetch_rows": fetch_rows,
+        "fetch_end": fetch_end,
+        "preserved": preserved,
+        "merge_note": merge_note,
     }
 
 
@@ -533,7 +665,8 @@ def main():
     with open(report_path, "w", newline="") as f:
         writer = csv.DictWriter(
             f, fieldnames=["symbol", "index", "security", "status", "reason",
-                           "rows", "start", "end"]
+                           "rows", "start", "end", "fetch_rows", "fetch_end",
+                           "preserved", "merge_note"]
         )
         writer.writeheader()
         for r in sorted(results, key=lambda x: x["symbol"]):
@@ -567,25 +700,62 @@ def main():
     # "Yahoo served Tuesday and we dropped it in parsing" -- two
     # different bugs in two different places.
     # ------------------------------------------------------------------
-    end_dates = {}
-    for r in successes:
-        if r.get("end"):
-            end_dates[r["end"]] = end_dates.get(r["end"], 0) + 1
+    # Since 2026-09-24 files are merged rather than overwritten, so the
+    # last date IN THE FILE and the last date THIS FETCH RETURNED are
+    # two different facts. Both are printed: the first is what the
+    # orchestrator will actually read, the second is the health of the
+    # data source. Collapsing them would hide a source that has stopped
+    # serving recent bars behind files that look fine.
+    def _dist(key):
+        d = {}
+        for r in successes:
+            if r.get(key):
+                d[r[key]] = d.get(r[key], 0) + 1
+        return d
 
-    if end_dates:
-        newest = max(end_dates)
-        print(f"\nNewest bar received: {newest} "
-              f"({end_dates[newest]} of {len(successes)} tickers)")
-        print("Last-bar date distribution:")
-        for d in sorted(end_dates, reverse=True)[:5]:
-            print(f"  {d}: {end_dates[d]} tickers")
+    file_dates = _dist("end")
+    fetch_dates = _dist("fetch_end")
+
+    if file_dates:
+        newest = max(file_dates)
+        print(f"\nNewest bar in files: {newest} "
+              f"({file_dates[newest]} of {len(successes)} tickers)")
+        print("Last-bar date distribution (files on disk):")
+        for d in sorted(file_dates, reverse=True)[:5]:
+            print(f"  {d}: {file_dates[d]} tickers")
         stale = [r["symbol"] for r in successes if r.get("end") != newest]
         if stale:
             print(f"Tickers behind the newest bar ({len(stale)}): "
                   f"{', '.join(sorted(stale)[:15])}"
                   f"{' ...' if len(stale) > 15 else ''}")
     else:
-        print("\nNewest bar received: NONE -- no successful pulls.")
+        print("\nNewest bar in files: NONE -- no successful pulls.")
+
+    if fetch_dates:
+        f_newest = max(fetch_dates)
+        print(f"\nNewest bar THIS FETCH returned: {f_newest} "
+              f"({fetch_dates[f_newest]} of {len(successes)} tickers)")
+        print("Last-bar date distribution (this fetch):")
+        for d in sorted(fetch_dates, reverse=True)[:5]:
+            print(f"  {d}: {fetch_dates[d]} tickers")
+
+    total_preserved = sum(r.get("preserved", 0) for r in successes)
+    kept = [r["symbol"] for r in successes if r.get("preserved", 0)]
+    if total_preserved:
+        print(f"\nBars kept from existing files that this fetch did NOT "
+              f"return: {total_preserved} across {len(kept)} tickers")
+        print(f"  {', '.join(sorted(kept)[:15])}"
+              f"{' ...' if len(kept) > 15 else ''}")
+    else:
+        print("\nBars kept from existing files: 0 "
+              "(fetch covered everything on disk)")
+
+    replaced = [r["symbol"] for r in successes
+                if "replaced" in str(r.get("merge_note", ""))]
+    if replaced:
+        print(f"Files replaced wholesale ({len(replaced)}): "
+              f"{', '.join(sorted(replaced)[:15])}"
+              f"{' ...' if len(replaced) > 15 else ''}")
 
     return results, universe
 
