@@ -5138,3 +5138,169 @@ the first time. Both positions were bound by the 12.5% cost cap rather than the
 7. Carried, unchanged: `pull_report.csv` in the repo root dirties the tree every
    run and there is still no `.gitignore` on either branch (would also cover
    `pipeline/__pycache__/`).
+
+---
+
+## 2026-09-24 (final) -- The Orphan Prune: the Funnel Was Counting Corpses
+
+### The question that prompted it
+
+Dave read `state/daily_funnel.csv` after the first successful end-to-end run
+and concluded the system still had no data -- only two tickers appeared to have
+worked. That reading was reasonable and the file deserved it. Two separate
+things were wrong with the file, neither of them a data fault.
+
+**One: the copy in hand predated the successful run.** Proof without needing the
+repo -- not a single row anywhere in it had a filled-in `disposition`, and both
+PBF and LFST appeared on 2026-09-23 marked `no_data_for_date`, when the
+orchestrator had been watched opening both. The successful run appended another
+1,062 rows that were not in that copy.
+
+**Two, and the real problem: `no_data_for_date` does not measure data health.**
+
+| run_date | no_data_for_date | tickers WITH data |
+|---|---|---|
+| 2026-09-15 | 992 | 57 |
+| 2026-09-16 | 994 | 57 |
+| 2026-09-17 | 994 | 58 |
+| 2026-09-18 | 993 | 62 |
+| **2026-09-21** | **993** | **67** |
+
+2026-09-21 was a flawless session. Every live ticker had its bar, the pull was
+clean, nothing failed -- and 993 of 1,060 rows still read `no_data_for_date`.
+The metric reports catastrophe on a perfect day, and the ~65 rows that matter
+are buried under the ones that never will.
+
+The orchestrator's own log had already been saying so since the coverage-guard
+fix: *"1062 files in data/, 983 frozen/orphaned and excluded."*
+
+### What the orphans actually are
+
+`data/` holds ~1,060 ticker files. `pull_data.py` refreshes only the ~65 that
+pass the day's TradingView momentum screen. The rest are frozen leftovers from
+the pre-2026-09-10 S&P 400+600 universe -- the initial proof of concept, which
+the system no longer trades. Their last bars sit around 2026-09-09 and will
+never advance.
+
+They were previously logged as cosmetic. They are not:
+
+- `find_new_signals_for_date()` walks every file in `data/`, so each orphan
+  emits a `no_data_for_date` funnel row on every run, every day, forever.
+- They forced `LIVE_FILE_STALENESS_DAYS` into the coverage guard, because a
+  reference window drawn over all files was inflated by orphans to ~1,057 and
+  blocked healthy sessions. That machinery exists solely to work around them.
+- They made the one instrument Dave actually reads unreadable.
+
+### The prune
+
+`prune_stale_data_files()` in `scripts/pull_data.py`, called at the end of
+`main()` after every file this run will write has been written. Deletes any
+`data/*_1d_data.csv` whose newest bar is more than `PRUNE_STALENESS_DAYS = 10`
+behind the reference. `PRUNE_ENABLED` turns it off.
+
+**Protected, always:** today's full pull universe -- the screen, every open
+position, and the SPY benchmark. A pull failure today must never be able to
+destroy a position's price history, so protection is by membership, not by
+freshness. Stale-but-protected files are reported separately rather than
+silently kept.
+
+**Ten days rather than "today's screen only":** Dave's call, and the right one.
+History is worth keeping for review; the aim is to remove records that hold
+nothing, not to minimise the folder. Ten days keeps roughly 80 files against
+the ~65 screened on any single day, so a ticker that flickers in and out of the
+screen does not lose its history to a one-day absence.
+
+**RELATIVE, NOT ABSOLUTE -- the safety property that matters.** The cutoff is
+measured from the newest bar found anywhere in `data/`, not from today's
+calendar date. If the feed goes dark for a fortnight, every file ages together,
+the reference ages with them, and nothing is deleted. An absolute "older than
+today minus ten days" rule would empty the entire data directory in precisely
+the situation where the data is most precious and least replaceable. Same
+lesson as the coverage guard: judge against what good currently looks like, not
+against a fixed number.
+
+**Reversible.** Everything in `data/` is committed to git, so a pruned file
+remains in history, and any ticker re-entering the screen is refetched with its
+full 3.6-year window on the next run. The commit diff names every deleted file,
+which is why the log prints only the first 40 -- 995 filenames would bury the
+log this prune exists to unbury.
+
+### Funnel truncation
+
+`truncate_funnel_log()`, same file, drops rows before `FUNNEL_KEEP_FROM =
+"2026-09-21"`. On the pre-success copy that is 4,207 rows dropped and 4,244
+kept. One-time by nature and a no-op on every subsequent run, so it is harmless
+left in place; `""` disables it.
+
+Refuses to write if the cutoff would empty the file, and leaves an unreadable
+or column-less file untouched rather than replacing it.
+
+Scope note: `data/` files hold years of real price history and were never the
+thing to delete. The funnel rows genuinely are empty records from before the
+pipeline worked. Those are two different cleanups and were kept separate on
+purpose.
+
+### Verified
+
+Prune, against a synthetic directory built to match the real one (995 orphans
+frozen at 2026-09-09 plus 65 live through 2026-09-23): 995 deleted and 65 kept
+with SPY intact; a stale-but-protected open position survives; **the entire feed
+going stale deletes nothing**; an unreadable file is left alone and reported.
+
+Funnel, against the real `daily_funnel.csv`: 4,207 dropped / 4,244 kept with
+columns preserved; re-run is a no-op; a cutoff that would empty the file is
+refused; a missing file and a garbage file are both handled without crashing;
+`""` disables.
+
+Integration, through the real `process_single_day()`: a healthy session passes
+the coverage guard both before and after the prune, and a genuinely thin
+session (6 of 65) is still blocked afterwards. Pruning does not weaken the
+guard -- it removes the reason the guard needed the staleness filter.
+
+### Effect
+
+The funnel drops from ~1,062 rows a day to ~70, and every row in it will
+describe a ticker the system actually trades.
+
+### Lesson recorded
+
+**An instrument that reports the same alarming number on good days and bad days
+is not reporting anything.** `no_data_for_date` at 993 was constant across five
+sessions of wildly differing health. The fix was not a better label -- it was
+removing the things being counted. This is the fourth variant of one pattern in
+this project: the workflow that was green while doing nothing, the counter that
+measured HTTP status instead of freshness, the guard that tested existence
+instead of sufficiency, and now a log whose dominant signal was structural
+rather than informative. Each time, the number was easy to produce and did not
+answer the question anyone was asking.
+
+---
+
+## OPEN ITEMS -- revised 2026-09-24 (final)
+
+1. **`PROBE_SESSION` is stale.** Still `"2026-09-22"`, a session written off.
+   Every pull now spends six extra HTTP requests re-confirming a closed
+   question and prints a probe block that reads as a live problem. Set to `""`.
+2. **pandas `FutureWarning` at `orchestrator.py:821`** --
+   `pd.concat([open_df, new_df], ignore_index=True)` with empty or all-NA
+   entries. Becomes a breaking change on a pandas upgrade.
+3. ~~Prune the ~993 orphan files in `data/`.~~ **DONE 2026-09-24.**
+4. **Decide paper vs. live for the two open positions** (PBF, LFST). The system
+   trails and exits them by itself from here. Given the documented gap-fill
+   optimism and the -5R gap taken live in Sept 2026, this wants a conscious
+   decision.
+5. **Second data source for cross-checking.** A single free, unofficial,
+   undocumented feed has now cost three days and one permanently lost session.
+   The failure observed -- a syntactically valid payload holding a null
+   placeholder -- is exactly what a second source catches and no amount of
+   local validation can.
+6. **Watch `skip_sessions.txt` for casual use.** Any future entry should meet
+   the standard applied to 2026-09-22: a probe distinguishing absent from
+   placeholder, a reason written in the file, and an entry in this document.
+7. **`pull_report.csv` in the repo root** dirties the tree every run, and there
+   is still no `.gitignore` on either branch (would also cover
+   `pipeline/__pycache__/`).
+8. **Re-check `LIVE_FILE_STALENESS_DAYS` once the prune has run.** It exists to
+   exclude orphans from the coverage guard's reference window. With the orphans
+   gone it is inert but harmless; it should stay as a defence against the
+   folder silting up again, not be removed as dead code.
