@@ -4721,3 +4721,420 @@ real capital. A second source for cross-checking is an OPEN ITEM.
 - Fixing one bug routinely exposes the next; five runs produced five findings.
 - A guard that catches a fault it was not written for is luck, not design --
   write the guard the fault deserves.
+
+---
+
+## 2026-09-24 -- Layer 6: We Were Overwriting Bars We Had Already Captured
+
+### What the funnel showed
+
+`state/daily_funnel.csv` was reviewed directly rather than the run logs. Rows
+per session, broken down by the gate each ticker died at:
+
+| run_date | tickers WITH data | no_data_for_date | no_50ma_touch | momentum_screen |
+|---|---|---|---|---|
+| 2026-09-15 | 57 | 992 | 51 | 4 |
+| 2026-09-16 | 57 | 994 | 52 | 4 |
+| 2026-09-17 | 58 | 994 | 52 | 5 |
+| 2026-09-18 | 62 | 993 | 57 | 4 |
+| 2026-09-21 | 67 | 993 | 54 | 13 |
+| 2026-09-22 | 8 | 2114 | 5 | 3 |
+| 2026-09-23 | 5 | 1057 | 2 | 3 |
+
+(The ~993 `no_data_for_date` rows on healthy days are the known orphan files
+from the pre-2026-09-10 universe -- cosmetic, tracked separately.)
+
+### The finding that killed the working theory
+
+The tickers that DID carry a bar:
+
+- **2026-09-22:** AMC, BFLY, CLOV, DELL, IOVA, NNBR, RUM, SPY
+- **2026-09-23:** ADP, AGEN, CLBK, NXDR, RLAY
+
+**The two sets do not overlap at all.** Not one ticker appears in both.
+
+This falsifies the framing carried since 2026-09-22. If the source were simply
+missing a session, the same tickers would be absent on both days. Instead a
+small, different, apparently arbitrary subset resolves on each request. The
+correct description is: **Yahoo returns the newest bar with null price fields
+for most tickers, and which tickers come back populated varies from request to
+request.** It is a cache-population race, not an absent day.
+
+### The second finding, which is worse
+
+SPY appears **twice** in the 2026-09-22 rows -- once dropped at
+`no_data_for_date`, once reaching `momentum_screen`. Two runs processed that
+session, and in one of them SPY carried its 09-22 bar.
+
+We had the bar. We wrote it to disk. A later run, in which Yahoo declined to
+serve it, **overwrote the file and threw it away.**
+
+`process_ticker()` ended with an unconditional `df.to_csv(out_path)`. Every run
+replaced each ticker file wholesale with whatever that fetch returned. That is
+harmless when the source is complete and destructive when it is not. Under
+overwrite semantics, coverage does not accumulate across retries -- it
+reshuffles, and ground already won can be lost.
+
+### The fix: merge, do not overwrite
+
+New `merge_with_existing(symbol, df_new)` in `scripts/pull_data.py`, called by
+`process_ticker()` before the write:
+
+1. No existing file -> write the fetch as-is.
+2. Otherwise load the existing file, concatenate, and de-duplicate on Date
+   keeping the **fresh** row where both have the same date. A bar the fetch did
+   not return survives because it is simply not in the incoming frame.
+3. Re-apply the completed-session cutoff to the merged result, so an in-flight
+   bar written before the Layer 4 guard existed is cleaned out rather than
+   preserved forever.
+
+Capture is now permanent. Any bar we ever successfully fetch stays, and
+successive runs fill gaps in instead of trading one gap for another.
+
+### Split safety -- the reason this is not a two-line change
+
+Yahoo's `quote` series is split-adjusted, so after a split **every historical
+bar changes**. Merging old unadjusted bars with newly adjusted ones would
+fabricate a price gap that never happened -- and MA50, ATR14 and ADR10 would be
+computed straight off it. A silent corruption, worse than the problem being
+fixed.
+
+So before merging, the two series are compared on the older bars they share
+(`READJUST_RECENT_SKIP = 5` newest bars excluded, `READJUST_MIN_SHARED = 20`
+bars minimum to judge). If the median relative difference exceeds
+`READJUST_TOLERANCE = 0.005` (0.5%), this is a re-adjustment and the fresh
+series replaces the file wholesale. Dividends do not trip this -- `quote.close`
+is not dividend-adjusted -- so in practice it fires on splits and on the legacy
+orphan files, which is correct in both cases.
+
+### Reporting change
+
+Because files are now merged, "the last date in the file" and "the last date
+this fetch returned" are two different facts. Collapsing them would hide a
+source that has stopped serving recent data behind files that look healthy. The
+pull now prints both distributions, plus the count of bars kept from disk that
+the fetch did not return, and any file replaced wholesale.
+
+### Verified
+
+Eight cases against the real `latest_completed_session()` (cutoff 2026-09-23):
+new file; rescue of a mid-series bar; fresh bar wins on a shared date; 2:1
+split triggers wholesale replacement; stale partial bar dropped from a merged
+file; deeper history preserved and not miscounted; corrupt existing file
+replaced without crashing; and a four-run sequence dropping 09-22, then 09-23,
+then both -- with both sessions still present on disk at the end.
+
+### What this does and does not solve
+
+**Does:** stops us losing sessions we have already captured, and makes coverage
+accumulate across runs instead of reshuffling.
+
+**Does not:** make Yahoo serve the 2026-09-22 bar. Those files have already been
+overwritten, so that session is currently gone from disk. The pipeline remains
+stopped on it, and will unstick only if a later fetch returns 09-22 for at least
+one ticker. If the source never serves it again, the pipeline stays stuck --
+which promotes the escape-hatch item (marking a permanently unavailable session
+dead so the queue drains) from "nice to have" to required, and sharpens the case
+for a second data source.
+
+### Lesson recorded
+
+**Overwrite is a destructive default whenever the source is less reliable than
+the store.** The code was written as though the feed were authoritative and the
+disk disposable. It is the other way round: the disk holds bars confirmed
+received, the feed holds whatever it feels like returning today. Also: the
+funnel log answered in one query what five runs of log-reading had not -- when
+an aggregate counter is confusing, go to the per-item record.
+
+---
+
+## 2026-09-24 (later) -- Layer 7: The Sessions Were Not Stalled, They Were Consumed Empty
+
+### How this surfaced
+
+After the merge fix was committed, the workflow was re-run manually. Every step
+after the run gate showed as skipped: no pull, no orchestrator, no commit. The
+gate step itself completed green.
+
+That is the gate working correctly and reporting something we had wrong. A skip
+means `state/last_run_date.txt` is not older than the latest completed session
+-- so it already read 2026-09-23.
+
+### The correction
+
+The standing assumption since 2026-09-22 was that the pipeline had **stalled**
+on that session and was waiting for it. It had not. It **processed** 2026-09-22
+with 8 tickers of data and 2026-09-23 with 5, stamped both done, and moved on.
+
+The Layer 1 pre-flight guard refuses a session only when the count is exactly
+zero. Eight cleared it. Five cleared it. Both sessions were consumed against an
+unrepresentative sliver of the universe and are now unrevisitable, because the
+state file says they were handled.
+
+This is the third variant of the same underlying mistake in this project: a
+check that is technically satisfied while the thing it exists to protect is not.
+A green workflow that did no work; a success counter that measured HTTP status
+rather than data recency; and now a data-presence guard that measures presence
+rather than sufficiency. **A threshold of zero is not a quality bar, it is an
+existence bar.**
+
+### Fix 1 -- relative coverage instead of an absolute floor
+
+The screen universe changes size daily, so there is no fixed number to test
+against. `process_single_day()` now compares the session's coverage with the
+**best** coverage seen over the previous 20 calendar days of weekdays
+(`COVERAGE_LOOKBACK_DAYS = 20`) and requires at least half of it
+(`MIN_COVERAGE_FRACTION = 0.50`).
+
+Best rather than most-recent is deliberate. Against the most recent day, one
+thin session that slipped through would lower the bar for the next one, and the
+standard would ratchet down a day at a time -- which is precisely how 8 tickers
+came to look acceptable.
+
+`count_tickers_with_bar()` is replaced by `coverage_for_dates()`, which counts
+every date in the reference window in a **single** pass over `data/` rather than
+one pass per date. It remains a light scan reading only the Date column.
+
+### Fix 2 -- a manual release valve
+
+The coverage guard returns False without stamping, and `main()` breaks rather
+than continues, so every later session queues behind the blocked one. That is
+right while the data might still arrive and a permanent stall once it will not.
+
+`state/skip_sessions.txt` is the release valve: one ISO date per line, `#` for
+comments. A listed session is stamped done and skipped without processing --
+no exits checked, no entries taken, which is the honest treatment of a session
+we do not have. The file is optional; its absence is handled silently.
+
+It is deliberately **manual**. An auto-skip after N attempts would quietly
+discard real sessions, and the whole lesson of the last three days is that
+automatic tolerance of missing data is how data goes missing unnoticed. A
+session is written off only by a human decision, recorded in a file in the repo
+where it can be read back later. The bail message prints the exact line to add.
+
+### Verified
+
+Five cases run through the real `process_single_day()` in a fake repo layout,
+with `load_open_positions()` monkeypatched to a sentinel so a pass through the
+guard is provable: healthy session (70 of 70) passes; thin session (8 of 70)
+blocked as PARTIAL DATA; empty session (0 of 70) blocked as NO DATA; a listed
+session skipped and stamped, with `last_run_date.txt` confirmed written; and a
+malformed skip file warning on the bad line without crashing.
+
+### Consequence for the current state
+
+2026-09-22 and 2026-09-23 are recorded as processed but hold almost no trades
+data. To redo them, `state/last_run_date.txt` is rolled back to 2026-09-21 and
+the workflow re-run. Per `state/daily_funnel.csv` neither session opened any
+position -- every ticker died at `no_50ma_touch` or `momentum_screen` -- so
+there is no position state to unwind, and duplicate funnel rows are cosmetic.
+
+Open-position exits are self-healing here: `check_open_positions_for_exits()`
+re-runs `simulate_trail()` from the original entry point against current price
+data on every run, so an exit missed while the data was thin is detected once
+the data is complete. It is not a missed exit permanently, only a late one.
+
+### CORRECTION, same day: the reference was drawn from the wrong population
+
+The guard as first written counted every file in `data/`. That directory still
+holds the ~993 orphan files from the pre-2026-09-10 S&P 400+600 universe, which
+`pull_data.py` no longer refreshes and which are frozen with bars ending around
+2026-09-09. For any target in late September the 20-day reference window
+therefore reaches back into dates where ALL ~1,060 files have data. The
+reference came out at ~1,057 rather than ~67 and the threshold at ~528 -- so a
+**complete** 2026-09-21, with 67 of 67 screen tickers present, was refused.
+
+Reproduced before it ran in production, but only after the first test suite had
+already passed. That suite built a clean `data/` directory containing nothing
+but the tickers under test. The real directory is three-quarters dead files, and
+the bug lived entirely in the difference. **A guard that reads the whole data
+directory has to be tested against a data directory that looks like the real
+one, junk included.** This is the same failure as the earlier scratch-harness
+bugs: the test environment was tidier than production, so the test agreed with
+the code instead of checking it.
+
+Fix: `coverage_for_dates()` takes `live_as_of` and skips any file whose own last
+bar is more than `LIVE_FILE_STALENESS_DAYS = 10` behind the session being
+judged. The orphans fail that at every date in the window and drop out of both
+numerator and denominator. The log now prints live count, total files, and how
+many were excluded, so the population being judged is visible rather than
+assumed.
+
+Re-verified on a directory of 67 live tickers plus 990 frozen orphans: healthy
+session passes, 8-of-67 blocked, the same session passes once all 67 carry the
+bar, and the operator skip still stamps and moves on.
+
+### Lesson recorded
+
+**An existence check is not a sufficiency check.** Every guard written in this
+project so far has been satisfiable by a technicality: the workflow ran, the
+request returned 200, one file had the bar. When the thing being guarded is
+quality, the test has to be relative to what good looks like -- and the
+reference for "good" must not be allowed to drift downward toward the failures
+it is meant to catch.
+
+---
+
+## 2026-09-24 (later still) -- The Probe Was Pointed at the Wrong Sample
+
+### The flaw
+
+`DIAGNOSTIC_SYMBOL = "SPY"`. SPY is one of the eight tickers that DOES carry the
+2026-09-22 bar. So every diagnostic run since the session went missing has
+confirmed the day exists -- for a symbol where it already worked. We never once
+looked at a symbol that lacked it.
+
+Five runs of evidence gathered from a sample selected, by accident, to exclude
+the failure being investigated.
+
+### Why the two sessions now look different
+
+2026-09-23 went from 5 tickers to 64 in roughly a day: a late session filling
+in. 2026-09-22 has sat at 8 for two days and has not moved. Those are different
+shapes, and there are now enough runs to distinguish them. The "Yahoo is just
+slow" explanation fits the 23rd and does not fit the 22nd.
+
+### The probe
+
+`probe_missing_session()` in `scripts/pull_data.py`, run at the end of the pull,
+controlled by `PROBE_SESSION` (set to `""` to disable):
+
+1. Partition the pulled tickers into those whose file HAS the session and those
+   that LACK it.
+2. Take up to `PROBE_MAX_SYMBOLS = 5` from the ones that lack it, plus one that
+   has it **as a control**. Without the control, a row of all-absent results
+   cannot be told apart from a broken probe.
+3. Re-ask for each under both phrasings -- the production `period1`/`period2`
+   window and `range=1mo` -- and report whether the bar is in the RAW payload.
+
+`_raw_bar_for_date()` distinguishes **present with null fields** from **absent
+entirely**, which are two different failures with two different fixes: the first
+is recoverable through the adjclose fallback, the second is not recoverable from
+this source at all.
+
+### Verified
+
+Offline with stubbed HTTP: real close, present-but-null, absent, and malformed
+payloads all classified correctly; partitioning and control selection correct;
+the "range has it" case renders as a clearly readable fixable result; the
+no-control case says so explicitly; and network errors are contained per request
+without aborting the pull.
+
+### Decision rule set in advance
+
+PRESENT under either phrasing for a ticker that lacks the session -> the bar is
+retrievable and the fix is on our side. ABSENT under both with the control
+PRESENT -> the source does not hold this session for these symbols, and
+2026-09-22 gets written off in `state/skip_sessions.txt`.
+
+**Cost of writing it off, recorded:** 8 files would carry the session and ~56
+would not, so 50-day averages and ATR would be computed over slightly different
+windows per ticker. Small, permanent, and uneven. Accepted only if the probe
+comes back absent.
+
+### Lesson recorded
+
+**Check what your diagnostic is sampling before you trust what it reports.** A
+control costs one extra request and is the difference between evidence and a
+guess.
+
+---
+
+## 2026-09-24 -- RESOLVED: 2026-09-22 Written Off, Pipeline Current, First Live Trades
+
+### Probe result -- a third outcome the decision rule did not cover
+
+The rule written in advance had two branches: PRESENT under either phrasing
+meant retrievable; ABSENT under both meant gone. The actual result was neither.
+
+For all five probed tickers that lacked the session, under BOTH phrasings:
+
+    PRESENT  C=None  ADJCLOSE=None  V=None
+
+against the control, AMC, which returned C=2.97, ADJCLOSE=2.97, V=30,766,500.
+
+The timestamp is in the payload. Every value beside it is null. Yahoo is not
+missing the row -- it is serving an empty placeholder where the data should be.
+This is why the adjclose fallback cannot help: there is nothing to fall back to.
+And because both phrasings return the identical empty row, changing how we ask
+cannot fix it either.
+
+**Recorded honestly: read literally, the pre-written rule returns the wrong
+answer here.** "Present" was assumed to imply "recoverable". Present with every
+field null is functionally absent. Writing the rule in advance was still right;
+the error was in the taxonomy, not the discipline. The corrected classification
+is three-way, and `_raw_bar_for_date()` already reports the fields needed to
+tell the middle case apart -- it was the rule, not the instrument, that was
+short.
+
+### Decision
+
+2026-09-22 written off in `state/skip_sessions.txt`. The deciding factor was not
+the 22nd itself but the queue behind it: the 23rd had filled to 64 of 64 tickers
+within a day while the 22nd sat at 8 for two, so waiting cost current signals to
+buy a session that was not coming.
+
+The 8 tickers that DO carry the session keep it. Deleting real data to make the
+universe uniform would destroy information to buy tidiness.
+
+**Accepted cost:** ~56 of 64 files have a one-bar hole at 2026-09-22, so MA50,
+ATR14 and ADR10 are computed over marginally different windows per ticker for
+the next 50 sessions. Small, permanent, uneven.
+
+### First complete end-to-end run
+
+    === Processing 2026-09-22 ===
+      SKIPPED BY OPERATOR ...
+    === Processing 2026-09-23 ===
+      Data check: 69 of 79 live ticker files ... need at least 39 to proceed
+      OPENED PBF:  score 3.5, 45 shares,  3108.56 committed, 213.15 at risk (limited by cost)
+      OPENED LFST: score 4.0, 263 shares, 3118.10 committed, 126.71 at risk (limited by cost)
+      Total capital committed: 6226.66 (account balance: 25000.00)
+
+Screen, pull, score, size, open and summary email all completed in sequence for
+the first time. Both positions were bound by the 12.5% cost cap rather than the
+1% risk rule -- correct behaviour for lower-priced stocks, not a defect.
+
+---
+
+## OPEN ITEMS as of 2026-09-24
+
+1. **`PROBE_SESSION` is now stale.** It is still set to `"2026-09-22"`, a
+   session that has been written off, so every future pull spends six extra HTTP
+   requests re-confirming a closed question and prints a probe block that will
+   read as a live problem to anyone skimming the log. Set it to `""` until the
+   next time a session goes missing. Low effort, and it stops a diagnostic from
+   becoming noise -- which is how the SPY diagnostic came to be trusted while
+   pointing at the wrong sample.
+
+2. **pandas `FutureWarning` at `orchestrator.py:821`** --
+   `pd.concat([open_df, new_df], ignore_index=True)` with empty or all-NA
+   entries. Harmless today; this is exactly the class of thing that becomes a
+   breaking change on a pandas upgrade and takes the daily run down with it.
+   Fix by excluding empty frames before the concat.
+
+3. **Prune the ~993 orphan files in `data/`.** Now costing more than cosmetics:
+   `state/daily_funnel.csv` grew by 1,062 rows on a day with 64 live tickers,
+   and they also forced the `LIVE_FILE_STALENESS_DAYS` machinery in the coverage
+   guard. Removing them simplifies both.
+
+4. **Decide paper vs. live for the two open positions.** The system will trail
+   and exit them by itself from here. Given the documented gap-fill optimism
+   (`min(stop, Open)`, no slippage) and the -5R gap taken live in Sept 2026,
+   this should be a conscious decision rather than a default.
+
+5. **Second data source for cross-checking** (carried, now better justified).
+   A single free, unofficial, undocumented feed just cost three days and one
+   permanently lost session. The failure mode observed -- a syntactically valid
+   payload containing a null placeholder -- is exactly what a second source
+   catches and no amount of local validation can.
+
+6. **Watch `skip_sessions.txt` for casual use.** It is a deliberate, manual,
+   recorded write-off. The risk is that it becomes the easy answer to any
+   awkward session. Any future entry should carry the same standard applied
+   here: a probe that distinguishes absent from placeholder, a reason written in
+   the file, and an entry in this document.
+
+7. Carried, unchanged: `pull_report.csv` in the repo root dirties the tree every
+   run and there is still no `.gitignore` on either branch (would also cover
+   `pipeline/__pycache__/`).
