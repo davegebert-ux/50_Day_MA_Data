@@ -179,8 +179,21 @@ FUNNEL_COLUMNS = [
 # ticker survived all of them.
 FUNNEL_GATES = [
     "already_open",         # dedup: ticker already in an open trade
-    "no_data_for_date",
+    # SPLIT 2026-10-11 (see load_fetched_symbols): "no_data_for_date" meant
+    # two completely different things -- a ticker that quietly fell out of
+    # the screen, and a ticker we asked Yahoo for that came back without
+    # its bar. The first is routine churn, the second is a data fault. One
+    # label for both made the funnel unreadable: on a healthy session it
+    # showed the same alarming count as on a broken one.
+    "no_longer_fit_screen",   # not in this run's pull -- never requested
+    "missing_data_for_date",  # REQUESTED and still has no bar -- REAL FAULT
+    "no_data_for_date",       # retained ONLY as "could not classify":
+                              # the pull report was absent or stale
     "insufficient_history",
+    # ADDED to the list 2026-10-11: both of these already fired in
+    # production but were never listed here, despite the docstring above
+    # requiring this list to stay in sync with the gates.
+    "no_setup_reset",
     "momentum_screen",
     "no_50ma_touch",
     "bid_not_filled",       # ADDED 2026-09-19: touched the MA but never reached our bid
@@ -190,6 +203,7 @@ FUNNEL_GATES = [
     "no_atr_for_entry_bid",   # ADDED 2026-09-19 with ENTRY_BID_ATR_MULT
     "no_spy_data",
     "score_below_threshold",
+    "no_slot_available",    # fired in size_and_open_trades(), not the scan
 ]
 
 OPEN_POSITIONS_COLUMNS = [
@@ -254,6 +268,68 @@ def _log(funnel_rows, run_date, ticker, dropped_at=None, disposition="", **field
     if funnel_rows is None:
         return
     funnel_rows.append(funnel_row(run_date, ticker, dropped_at, disposition, **fields))
+
+
+# ============================================================
+# WHICH TICKERS DID THIS RUN ACTUALLY ASK FOR?  (added 2026-10-11)
+# ============================================================
+# scripts/pull_data.py writes pull_report.csv to the repo root listing every
+# symbol it attempted this run. The workflow runs the pull immediately before
+# this script in the same job, so when things are healthy the file on disk
+# describes THIS session's fetch.
+#
+# WHY IT MATTERS: a ticker with no bar for the session is either (a) not in
+# today's screen, so nothing ever requested it -- routine churn, roughly 10-20
+# names a day -- or (b) requested and returned without its bar, which is the
+# 2026-09-22 null-placeholder failure and a genuine fault. Those were logged
+# under one name until today, so the funnel reported the same number on a
+# healthy day as on a broken one, and the only instrument Dave actually reads
+# could not tell him which he was looking at.
+#
+# FRESHNESS GUARD -- do not remove. pull_report.csv is written to the repo
+# ROOT, and the workflow only commits data/ and state/, so the copy in the
+# repository is never updated: on 2026-10-11 it held 1,003 rows every one of
+# which ended 2026-08-19, nearly two months stale. Classifying against that
+# would have labelled churn as faults and faults as churn with total
+# confidence. So the report is trusted only if the newest bar it reports is
+# at least as recent as the session being processed. A stale, missing or
+# malformed report classifies NOTHING -- those tickers keep the old
+# no_data_for_date label, which now means exactly "could not classify" and
+# is itself the signal that the report needs looking at.
+PULL_REPORT_PATH = os.path.join(_REPO_ROOT, "pull_report.csv")
+
+
+def load_fetched_symbols(target_date):
+    """Symbols this run's pull attempted, or None if that can't be trusted.
+
+    Returns (symbols_or_None, reason) -- reason is a short string for the log
+    explaining what was used or why it was rejected.
+    """
+    if not os.path.exists(PULL_REPORT_PATH):
+        return None, f"{os.path.basename(PULL_REPORT_PATH)} not found"
+    try:
+        pr = pd.read_csv(PULL_REPORT_PATH)
+    except Exception as e:
+        return None, f"could not read pull report ({e})"
+    if "symbol" not in pr.columns or len(pr) == 0:
+        return None, "pull report empty or missing the symbol column"
+
+    # Freshness: the report must cover the session being judged.
+    if "end" in pr.columns:
+        ends = pd.to_datetime(pr["end"], errors="coerce").dropna()
+        if len(ends) == 0:
+            return None, "pull report has no usable end dates"
+        newest = ends.max().normalize()
+        tgt = pd.Timestamp(target_date).normalize()
+        if newest < tgt:
+            return None, (f"pull report is STALE -- newest bar in it is "
+                          f"{newest.date()}, older than the session being "
+                          f"processed ({tgt.date()})")
+    else:
+        return None, "pull report has no end column (old schema)"
+
+    return set(pr["symbol"].dropna().astype(str).str.strip()), (
+        f"{len(pr)} symbols from pull_report.csv")
 
 
 # ============================================================
@@ -430,6 +506,21 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
 
     last_exits = _last_closed_exit_dates() if ENFORCE_SETUP_RESET else {}
 
+    # Which tickers this run actually requested -- decides whether a missing
+    # bar is churn or a fault. None means we could not tell; see
+    # load_fetched_symbols().
+    fetched_symbols, fetch_note = load_fetched_symbols(target_date)
+    if fetched_symbols is None:
+        print(f"  WARNING: cannot classify missing bars -- {fetch_note}. "
+              f"Tickers with no bar will be logged as 'no_data_for_date' "
+              f"(unclassified) rather than split into churn vs fault.")
+    else:
+        print(f"  Missing-bar classifier: {fetch_note}")
+
+    n_churn = 0
+    n_fault = 0
+    n_unclassified = 0
+
     signals = []
     files = sorted(glob.glob(os.path.join(DATA_DIR, "*_1d_data.csv")))
     for fpath in files:
@@ -441,8 +532,18 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
 
         df = sim.load_ticker(fpath)
         if target_date not in set(df["Date"]):
-            # ticker didn't trade / no data for this date
-            _log(funnel_rows, target_date, ticker, "no_data_for_date")
+            # No bar for this session. WHICH of the two reasons decides
+            # whether this is routine or an alarm -- see load_fetched_symbols().
+            if fetched_symbols is None:
+                gate = "no_data_for_date"          # could not classify
+                n_unclassified += 1
+            elif ticker in fetched_symbols:
+                gate = "missing_data_for_date"     # asked for it, got no bar
+                n_fault += 1
+            else:
+                gate = "no_longer_fit_screen"      # never requested today
+                n_churn += 1
+            _log(funnel_rows, target_date, ticker, gate)
             continue
         if len(df[df["Date"] <= target_date]) < 260:
             # insufficient history, same floor as the historical scan
@@ -612,6 +713,15 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
             "adr10_pct": round(float(adr10_pct), 4),
             "overhead_R": or_result.get("overhead_R"),
         })
+
+    # One line that answers "is the data healthy today?" without opening the
+    # funnel. n_fault is the number that matters: anything above zero means a
+    # ticker we requested came back without its bar.
+    if n_churn or n_fault or n_unclassified:
+        print(f"  Missing bars: {n_churn} no_longer_fit_screen (routine), "
+              f"{n_fault} missing_data_for_date"
+              f"{' <-- INVESTIGATE' if n_fault else ''}"
+              f"{f', {n_unclassified} unclassified' if n_unclassified else ''}")
 
     return signals
 
