@@ -105,6 +105,38 @@ def build_summary_body(target_date):
     else:
         lines.append("  (none)")
 
+    # ------------------------------------------------------------------
+    # P&L SNAPSHOT (added 2026-10-11)
+    #
+    # Appended to the bottom of the daily mail so the question "how is the
+    # system actually doing?" is answered where Dave already looks, rather
+    # than requiring him to open closed_trades.csv and sum it by hand.
+    #
+    # as_of is the PROCESSED SESSION, not the calendar date -- the same
+    # distinction this file already makes everywhere else. It drives the
+    # stale-mark flag in the report, so during a missed-day replay the
+    # staleness test refers to the session being reported rather than to
+    # whatever day the runner happens to be awake on.
+    #
+    # TWO DEFENSIVE CHOICES, both deliberate:
+    #
+    # 1. The import is INSIDE the try, not at module level. If
+    #    pipeline/pnl_report.py is missing -- not yet pasted, renamed,
+    #    pasted into the wrong folder (which has happened) -- a top-level
+    #    import would raise before main() ever runs and the email would
+    #    never be sent at all.
+    # 2. The whole block is wrapped. This email is the alert channel; it
+    #    is the last thing in the system that may break. A P&L snapshot
+    #    that cannot be built costs one line of the mail, never the mail.
+    # ------------------------------------------------------------------
+    lines.append("")
+    lines.append("")
+    try:
+        import pnl_report
+        lines.append(pnl_report.build_pnl_report(as_of=target_date))
+    except Exception as e:
+        lines.append(f"P&L snapshot unavailable ({type(e).__name__}: {e})")
+
     return "\n".join(lines)
 
 
