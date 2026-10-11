@@ -5304,3 +5304,417 @@ answer the question anyone was asking.
    exclude orphans from the coverage guard's reference window. With the orphans
    gone it is inert but harmless; it should stay as a defence against the
    folder silting up again, not be removed as dead code.
+
+
+---
+
+## 2026-09-25 -- [DECISION] PHASE 2: OBSERVE, DO NOT TUNE
+
+Dave, in his own words, on what this phase is for:
+
+> "I really think right now what we need to do is let the thing run for at
+> least a week or two, maybe more, probably more, and gather examples and dig
+> into them. What I don't want to start doing is changing all the code and
+> tuning it based off one or two findings immediately."
+
+And on how observations become changes:
+
+> "I don't know if we should change the system. I want to let the statistics
+> tell us what is a good thing to do or not, not just me blindly say what we
+> should do."
+
+**THE RULE.** Strategy parameters and gate logic are FROZEN. Observations are
+collected into the backlog below and become changes only when a staged-pipeline
+test says so -- not because either party feels strongly about a chart.
+
+**CARVED OUT OF THE FREEZE**, because these are not tuning:
+  - bugs and data faults (the pipeline not doing what it is documented to do)
+  - instruments: anything that only READS state and reports, changing no
+    behaviour -- the P&L report and the definition sheet below both qualify
+  - diagnostics and logging
+
+The distinction that matters: a change that alters which trades get taken is
+frozen; a change that alters what you can SEE about the trades taken is not.
+
+---
+
+## 2026-09-26 -- First Two Closed Trades: GEO and CXW, and What "Trail" Actually Means
+
+The first two round trips, from `state/closed_trades.csv`:
+
+| | GEO | CXW |
+|---|---|---|
+| Entry 2026-09-24 | 31.0529 | 32.6031 |
+| Risk/share (1R) | 1.2969 | 1.5908 |
+| Shares / cost | 100 / 3,105.29 | 95 / 3,097.29 |
+| Hard stop (entry - 1R) | 29.7560 | 31.0123 |
+| Exit 2026-09-25 | 31.2202 | 32.1306 |
+| Exit reason | atr_sched_c_trail | atr_sched_c_trail |
+| Result | **+0.129R / +$16.73** | **-0.297R / -$44.88** |
+
+Both sized by the COST cap, not the risk rule -- $129.69 and $151.13 at risk
+against the $250 the 1% rule allows. Expected behaviour on lower-priced names.
+
+### THE MISREADING AT THE CENTRE: a trail exit is a CLOSING PRICE, not a stop
+
+Dave read 31.2202 and 32.1306 as stop levels, and on GEO reasonably asked why
+the stop sat ABOVE the entry. They are not stop levels.
+
+Read from `sim.simulate_trail()`: the trail branch fires when the day CLOSES
+below the trail line, and the fill it books is `exit_price = close`. No resting
+order exists at either price. The ONLY resting stop in the system is the
+initial hard stop at entry - 1R, which is checked first on every bar.
+
+**Consequence for Phase 3 (execution automation):** this system cannot be
+represented by a stop order at the broker. The trail is an after-the-bell
+decision requiring a market-on-close or next-open exit. Anyone wiring this to
+a broker who sets a stop at the trail line will get materially different fills.
+
+### The schedule runs the opposite way to intuition
+
+`atr_sched_c` anchors on the **highest CLOSE since entry** and widens as the
+trade works:
+
+    progress < 1.5R   ->  0.5 x ATR14   (TIGHT -- protect the base)
+    1.5R to 3.0R      ->  1.0 x ATR14
+    3.0R and above    ->  2.0 x ATR14   (let winners breathe)
+
+So sub-1.5R trades are on the tightest setting. One strong day followed by one
+weak day genuinely is enough to end a trade, which is what produced two
+one-day holds.
+
+**Both trails necessarily armed on the ENTRY DAY.** Arming requires a close at
+or above entry + 0.5R, a trail exit on 09-25 requires the trail to be armed
+before that bar, and 09-24 is the only prior close. So both closed 2026-09-24
+at least half an R up, then broke the line on 09-25.
+
+GEO's "stop above entry" is therefore the trail ratcheting into profit -- it
+worked. CXW's -0.297R is also the trail working: it cut what the hard stop
+would have made a -1R, -$151 loss down to -$45. CXW's low never reached
+31.0123.
+
+**Do not "fix" this with a breakeven stop.** Profit floors and ratchet locks
+were tested and REJECTED (see the 2026-09-19 trail-rule section). That ground
+is closed.
+
+### Why the entry was 2026-09-24 and not the pullback
+
+Dave observed both entries landed on the reclaim rather than on the way down.
+Correct, and the cause is in `state/daily_funnel.csv`: CXW and GEO were logged
+`no_data_for_date` on **2026-09-21, 2026-09-22 and 2026-09-23** -- all three
+sessions. The system held no bars for them during the entire drop.
+
+The mechanism: the TradingView screen requires `SMA50 < close`. A stock that
+closes BELOW its 50-day MA fails the screen, drops out of the universe, and
+`pull_data.py` stops fetching it. It reappears only on the day it closes back
+above -- which is, by construction, a reclaim day.
+
+**The system structurally cannot see a stock while it is below its 50-day
+line.** On the daily bar 09-24 was still a genuine limit fill into the MA (the
+bid sits at `SMA50 - 0.10 x ATR14` and filled on the day's low); the reclaim
+character comes from the multi-day context, not the entry bar.
+
+Checked and NOT a backtest/live divergence: the backtest applies the same
+`price_above_50ma` criterion (found dead and fixed 2026-09-11), so reclaim
+entries are already inside the +0.723 avgR figure. Whether they are better or
+worse than true pullbacks has never been separated out. That is backlog item 1.
+
+---
+
+## 2026-10-11 -- The Gate Split Did Not Land, and the Pull Report Was Two Months Stale
+
+### Finding 1: work reported as done was not in production
+
+Dave reported `no_data_for_date` still appearing on 2026-10-09 rows, two weeks
+after the gate split was built. The decisive test needed no code reading --
+search the whole funnel for the new labels:
+
+    no_longer_fit_screen     0 rows
+    missing_data_for_date    0 rows
+    no_data_for_date     5,353 rows, 2026-09-21 through 2026-10-09
+
+Zero, across all 6,259 rows. The production `pipeline/orchestrator.py`, once
+Dave sent it, confirmed it: the old single label at the logging site, neither
+new name anywhere. The split had been built and tested on 2026-09-25 and never
+reached the repository.
+
+### Finding 2: the prune worked, and the residual is benign
+
+| session | rows | no_data | share |
+|---|---|---|---|
+| 2026-09-21 (pre-prune) | 1,060 | 993 | 94% |
+| 2026-09-23 (pre-prune) | 2,124 | 2,050 | 97% |
+| 2026-10-09 (post-prune) | 80 | 17 | 21% |
+
+The 17 are not stuck files -- they FLICKER. HPQ and MNTK missed 1 of the last
+12 sessions; ROKU, TGTX, APPS and NEO missed 4-5; CXW and GEO missed 8. That
+is the signature of tickers sitting on the screen's boundary, dropping out and
+back in, exactly as the 10-day staleness rule intends.
+
+### Finding 3 (the dangerous one): pull_report.csv is never committed
+
+The split classifies a missing bar by asking whether `pull_report.csv` lists
+the ticker. The copy in the repository turned out to hold **1,003 rows, every
+one ending 2026-08-19**, in the pre-merge 8-column schema -- nearly two months
+stale.
+
+The cause: the workflow commits `git add data/ state/`. `pull_report.csv` is
+written to the **repo root**, so every run rewrites it inside the runner and
+discards it. The committed copy has not moved since roughly 20 August.
+
+Classifying Friday's 17 missing tickers against that file produced "7 faults,
+10 churn" with total confidence. Every one of those 17 verdicts was noise. The
+error was caught only because the file's own contents were inspected before
+the result was believed.
+
+### The fix, with the guard that finding forced
+
+`load_fetched_symbols(target_date)` in `pipeline/orchestrator.py` reads the
+pull report and returns the symbol set ONLY if it can be trusted. It is
+rejected as untrustworthy when missing, unreadable, lacking a `symbol` or
+`end` column (old schema), or **stale** -- defined as the newest `end` date in
+the report being older than the session being processed.
+
+Three labels, replacing one:
+
+| label | meaning | action |
+|---|---|---|
+| `no_longer_fit_screen` | not in this run's pull; never requested | routine churn |
+| `missing_data_for_date` | REQUESTED and still no bar | **fault -- investigate** |
+| `no_data_for_date` | retained ONLY as "could not classify" | check the pull report |
+
+Keeping the old label as the explicit unclassified state is deliberate. The
+alternative -- guessing when the report is unusable -- is what the stale file
+would have done. Seeing the old label now carries precise information: the
+report was absent or stale.
+
+Per-run summary line added:
+
+    Missing bars: 10 no_longer_fit_screen (routine), 0 missing_data_for_date
+
+with ` <-- INVESTIGATE` appended whenever the second number is non-zero.
+
+Also corrected: `no_setup_reset` and `no_slot_available` both fire in
+production but were never listed in `FUNNEL_GATES`, despite that list's own
+docstring requiring it stay in sync. Both added.
+
+**Verified** against the real `find_new_signals_for_date()` with the actual
+`sim`, `scorecard` and screen modules: fresh report classifies both ways
+correctly; the exact stale 2026-08-19 report classifies nothing and warns; a
+missing report, an old-schema report and a garbage file all degrade to
+unclassified without raising; a report NEWER than the target (missed-day
+replay) classifies correctly.
+
+**This reverses OPEN ITEM 7.** Gitignoring `pull_report.csv` is still safe for
+the live run, since the pull writes it fresh in the same job before the
+orchestrator reads it -- but it would permanently remove Dave's ability to
+audit the classifier. Committing it is now the better call.
+
+---
+
+## 2026-10-11 -- P&L Snapshot in the Daily Email
+
+Dave was hand-summing `closed_trades.csv` to answer "how is the system doing?".
+The pipeline could say what it did each day and had no instrument for how it
+was performing.
+
+`pipeline/pnl_report.py` (new, 8,490 bytes) builds a plain-text snapshot from
+files the pipeline already writes -- the two state files plus each ticker's
+last Close as the mark. It holds no state, writes nothing, and changes no
+behaviour, so it is inside the freeze carve-out. It also runs standalone:
+`python3 pipeline/pnl_report.py`.
+
+Three blocks: the open book (per position: entry, shares, mark, **mark date**,
+open P&L in dollars and R; then unrealized total, capital committed, initial
+risk live), realized all-time (trades, dollars, R, win rate, average winner vs
+average loser), and the account line (start + realized + unrealized = equity).
+
+**THE MARK'S DATE IS PRINTED, AND THAT IS THE POINT.** Using each file's last
+Close avoids a second data source, but it is not guaranteed to be the session's
+close: on 2026-10-09, 17 of 80 tickers had no bar, and CXW and GEO had gone
+eight sessions without one. Any mark older than the session being reported is
+tagged `STALE MARK` with a note. The number is still shown -- it is the best
+available -- but it is never passed off as live.
+
+**"Initial risk live" is labelled, not overstated.** It is each open position's
+entry-day 1R summed. It is NOT where the trailing stops now sit, which would
+require replaying every open trade through `simulate_trail()` each run. For
+armed trails the true figure is lower, sometimes negative.
+
+`pipeline/send_summary_email.py` (6,639 bytes) appends it, 32 lines at one
+insertion point. Two defensive choices, both deliberate:
+
+1. **The import sits INSIDE the try block, not at module level.** A top-level
+   import of a missing `pnl_report` would raise before `main()` ran and no
+   email would be sent at all -- the worst possible failure for the only alert
+   channel. Tested: module missing, and module present but raising, both yield
+   `P&L snapshot unavailable (...)` and a complete email.
+2. `as_of` is the PROCESSED SESSION from `last_run_date.txt`, not the calendar
+   date, so the stale-mark test stays correct during a missed-day replay.
+
+DEFERRED: an equity CURVE. That needs a stored history we are not keeping. The
+right shape is one appended line per day (date, equity) -- deliberately built,
+not bolted onto the snapshot. Explicitly NOT a daily snapshot file: the funnel
+already demonstrated what append-everything does.
+
+---
+
+## 2026-10-11 -- Disposition Definition Sheet
+
+Dave, reviewing the funnel: *"I'm kind of just guessing at what that
+disposition might mean."* You cannot trust your own review of an instrument
+whose labels you are guessing at, so this is upstream of every other
+observation.
+
+Kept as a living document rather than buried here:
+**https://claude.ai/code/artifact/ac5ca4d0-9fc9-4369-8f14-73aeea41eae9**
+
+It lists the 15 scan gates in true firing order and the 4 sizing dispositions,
+one plain sentence each, marked routine vs investigate.
+
+The specific puzzle that prompted it: `no_50ma_touch` firing on names that look
+like they came very close. The rule is `Low <= SMA50 <= High` -- the day's range
+must actually straddle the line. A bar that stops a few cents short does not
+touch, however it looks on a chart. **"Came close" and "touched" are different
+events in the code**, and that distinction is the sheet's job.
+
+---
+
+## 2026-10-11 -- PHASE 2 OBSERVATION BACKLOG
+
+Collected from Dave's funnel review. **Observations, not decisions.** Nothing
+here changes until a staged-pipeline test says so.
+
+### B1. Long-range ceiling rollover [HEADLINE]
+
+A stock range-bound for a year or eighteen months breaks upward; that leg runs
+into the overhead of its own long range, rolls over at the ceiling, and the
+rollover is what carries it back to the 50-day MA. We register a textbook
+touch, but the move into it is rejection at a multi-year ceiling, not a healthy
+pullback.
+
+Dave's framing: price oscillating like a sine wave for a long period, and the
+latest leg reads as momentum on a six-month window while being just the next
+oscillation inside a horizontal channel. *The momentum is real at six months
+and disappears at eighteen.*
+
+Distinct from the existing gate: `overhead_resistance` asks how close the
+nearest unresolved high is (0.5R). This asks whether the whole structure is a
+range rather than a trend. Likely wants its own measure -- range-boundedness,
+or distance from where price sat one to two years ago.
+
+### B2. Pullback vs reclaim: require price above the 50 for the prior N sessions
+
+Dave's reasoning: *"the real point is that we want to find support from the
+50-day moving average for momentum stocks. And if they're coming from the
+bottom, that is not support. And arguably says that the momentum has already
+been lost."*
+
+Sound, and the counter-caution is his own standing rule: reclaims are ALREADY
+inside the +0.723 avgR. Test as a sweep -- prior 5, 10, 20 sessions above the
+MA -- through the full staged pipeline. It may cost more good trades than bad.
+It would have excluded both GEO and CXW.
+
+Feasible: when a ticker rejoins the screen the pull refetches years of history
+and merges it, so the bars are there.
+
+### B3. Reclaim entries slipping through via delayed fills
+
+Distinct from B2. Dave suspects trades entering as reclaims even where the
+ticker stayed visible -- touched cleanly on the way down with no capital free,
+then filled later on the way back up. Same ticker, setup character changed
+between touch and fill.
+
+Testable against the code: the bid is same-day only by construction (see the
+`bid_not_filled` comment -- a multi-day resting bid was explicitly rejected as
+readmitting Stage 6b duplication). Confirm that is what production does before
+theorising further.
+
+His risk-management point is the substantive one: the stop logic assumes entry
+on the way down. Enter on a reclaim and the stop's relationship to structure
+differs -- potentially buying straight into overhead just cleared.
+
+### B4. Correlated / sector exposure, now observed live
+
+GEO and CXW are the two US private-prison operators -- effectively one bet.
+Same entry day, same exit day, same sector move. Combined risk $280.82 against
+the $250 the 1% rule allows for a single position. Small here; with 8 slots a
+correlated cluster could put 4% on one theme. This is open item P8 arriving
+with real money.
+
+### B5. Equity curve over time (deferred from the P&L work) -- see above.
+
+---
+
+## PROCESS FINDING -- Work Reported Done That Never Reached Production
+
+This has now cost measurable time twice, and the doc should carry it.
+
+On 2026-10-11, three separate pieces of work reported as complete turned out
+not to be in the repository:
+  - the gate split in `orchestrator.py` (built and tested 2026-09-25)
+  - the 2026-09-25/26 architecture-doc sections (freeze decision, GEO/CXW
+    analysis, backlog) -- Dave's doc was byte-for-byte identical to the
+    2026-09-24 copy, 270,908 bytes
+  - the P&L module and email edit, lost to a workspace reset before delivery
+
+Two distinct mechanisms, and they compound:
+  1. **Claude's workspace resets between sessions.** Files built in one sitting
+     are gone the next, and the surviving copies in outputs silently revert to
+     an older snapshot. Twice this session a working copy was confidently
+     believed current and was not.
+  2. **Delivery is manual.** A file that is built, tested and described still
+     has to be pasted. Anything not pasted simply does not exist, and nothing
+     in the loop detects the gap.
+
+**THE RULE ADOPTED:** before editing any pipeline file, Dave sends the current
+production copy and Claude rebuilds on that -- never on a workspace copy.
+Applied today to `orchestrator.py` and `send_summary_email.py`; both turned out
+to matter. A byte count stated at delivery and checked in GitHub's file header
+is the cheap confirmation that a paste landed.
+
+**The generalised lesson, consistent with everything else in this document:**
+a report that something was done is not evidence it was done. Check the
+artefact, not the account of it. This is the same failure as the green workflow
+that did no work, the success counter that measured HTTP status, and the guard
+that tested existence instead of sufficiency.
+
+---
+
+## OPEN ITEMS -- revised 2026-10-11
+
+1. ~~`PROBE_SESSION` is stale.~~ **DONE** -- set to `""` 2026-09-24.
+2. **pandas `FutureWarning` at `orchestrator.py:821`** --
+   `pd.concat([open_df, new_df], ignore_index=True)` with empty or all-NA
+   entries. Harmless today; becomes a breaking change on a pandas upgrade and
+   takes the daily run with it. Fix by excluding empty frames before concat.
+3. ~~Prune the ~993 orphan files in `data/`.~~ **DONE 2026-09-24**, confirmed
+   working 2026-10-11 (1,060 rows/day -> 80).
+4. **Decide paper vs. live.** Eight positions now open and the book has hit
+   the slot cap. Given documented gap-fill optimism and the -5R gap taken live
+   in Sept 2026, this wants a conscious decision rather than a default.
+5. **Second data source for cross-checking.** Unchanged and still justified.
+6. **Watch `skip_sessions.txt` for casual use.** Any future entry meets the
+   2026-09-22 standard: a probe distinguishing absent from placeholder, a
+   reason in the file, an entry here.
+7. **REVERSED 2026-10-11: commit `pull_report.csv`, do not gitignore it.** The
+   orchestrator now reads it to classify missing bars. The live run is fine
+   either way (the pull writes it fresh in the same job), but the committed
+   copy being two months stale is what made Friday's funnel unauditable.
+   Requires a workflow edit -- send the current workflow file first.
+8. **`LIVE_FILE_STALENESS_DAYS` is now inert but should STAY.** It exists to
+   keep orphans out of the coverage guard's reference window. With the orphans
+   gone it does nothing -- keep it as a defence against the folder silting up
+   again, not as dead code to remove.
+9. **Candidate selection when signals exceed capacity is now live, not
+   theoretical.** `no_slot_available` fired on 2026-10-08 and 2026-10-09. The
+   `skipped_no_capital` disposition is the raw material (see `order_candidates`,
+   which documents everything already tested and rejected).
+10. **Still no `.gitignore` on either branch** (would also cover
+    `pipeline/__pycache__/`). Note this now interacts with item 7.
+11. Carried from before and unchanged: `sim.py` live-vs-Claude comparison never
+    done; replay equity discrepancy unreconciled (no absolute dollar figure
+    quotable); `SKIP_SCORE_THRESHOLD`, `ADR_CEILING_PCT` and
+    `OVERHEAD_PROXIMITY_R` not re-checked on the corrected 1,404-trade sample;
+    Relative Strength v2 stability; `research/` pushes outstanding.
+
