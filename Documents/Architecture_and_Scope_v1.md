@@ -5508,7 +5508,7 @@ replay) classifies correctly.
 **This reverses OPEN ITEM 7.** Gitignoring `pull_report.csv` is still safe for
 the live run, since the pull writes it fresh in the same job before the
 orchestrator reads it -- but it would permanently remove Dave's ability to
-audit the classifier. Committing it is now the better call.
+audit the classifier. Committing it is OPTIONAL -- only if you want to audit the classifier directly. The funnel already carries the verdict, so the report is needed only to second-guess the classifier itself. (Softened 2026-10-11 from "the better call", which overstated it.)
 
 ---
 
@@ -5605,6 +5605,8 @@ or distance from where price sat one to two years ago.
 
 ### B2. Pullback vs reclaim: require price above the 50 for the prior N sessions
 
+**[CLOSED 2026-10-12 -- REJECTED. The data went the other way. See "B2 TESTED AND REJECTED" at the end of this document.]**
+
 Dave's reasoning: *"the real point is that we want to find support from the
 50-day moving average for momentum stocks. And if they're coming from the
 bottom, that is not support. And arguably says that the momentum has already
@@ -5619,6 +5621,8 @@ Feasible: when a ticker rejoins the screen the pull refetches years of history
 and merges it, so the bars are there.
 
 ### B3. Reclaim entries slipping through via delayed fills
+
+**[CLOSED 2026-10-12 -- moot. Reclaims turned out to be the BETTER trades, so there is nothing here to catch. See the B2 section at the end of this document.]**
 
 Distinct from B2. Dave suspects trades entering as reclaims even where the
 ticker stayed visible -- touched cleanly on the way down with no capital free,
@@ -5697,7 +5701,7 @@ that tested existence instead of sufficiency.
 6. **Watch `skip_sessions.txt` for casual use.** Any future entry meets the
    2026-09-22 standard: a probe distinguishing absent from placeholder, a
    reason in the file, an entry here.
-7. **REVERSED 2026-10-11: commit `pull_report.csv`, do not gitignore it.** The
+7. **REVERSED 2026-10-11: optionally commit `pull_report.csv` rather than gitignoring it.** The
    orchestrator now reads it to classify missing bars. The live run is fine
    either way (the pull writes it fresh in the same job), but the committed
    copy being two months stale is what made Friday's funnel unauditable.
@@ -5717,4 +5721,140 @@ that tested existence instead of sufficiency.
     quotable); `SKIP_SCORE_THRESHOLD`, `ADR_CEILING_PCT` and
     `OVERHEAD_PROXIMITY_R` not re-checked on the corrected 1,404-trade sample;
     Relative Strength v2 stability; `research/` pushes outstanding.
+
+
+---
+
+## 2026-10-12 -- [CLOSED FINDING] B2 TESTED AND REJECTED: Reclaims Are the BETTER Trades
+
+### The hypothesis
+
+Dave's, from the 2026-10-11 funnel review, after GEO and CXW both entered on
+reclaim days:
+
+> "The real point is that we want to find support from the 50-day moving
+> average for momentum stocks. And if they're coming from the bottom, that is
+> not support. And arguably says that the momentum has already been lost."
+
+Proposed filter: require price to have closed ABOVE the 50-day MA on all of the
+prior N sessions, so only genuine pullbacks-from-above qualify and reclaims-
+from-below are excluded. Swept at N = 5, 10 and 20.
+
+### Method, and the standing check first
+
+The 10-year sample was rebuilt from scratch: all 1,579 ticker files extracted,
+`run_full_historical_scan()` re-run (the production function, not a copy),
+producing **5,165 touches across 896 tickers** -- matching the documented
+10-year figure exactly.
+
+`staged_pipeline_backtest.py` was then run UNMODIFIED to satisfy the standing
+check that any entry-variant harness must reproduce the production baseline
+before any other row is read:
+
+| | reproduced | documented |
+|---|---|---|
+| n | 1,404 | 1,404 |
+| avgR | +0.594 | +0.594 |
+| totalR | +833.5 | +833.5 |
+| win | 50.1% | 50.1% |
+
+Exact on all four. Only then was the filter applied.
+
+**Applied at the TOUCH stage, not post-hoc.** This matters and was done
+deliberately. Filtering the final 1,404 would only subtract trades; filtering
+the touch list and re-running lets Stage 6b re-derive, so removing an early
+reclaim-touch can free a later pullback-touch in the same ticker that the
+one-position rule had been blocking. That is the honest version of the test and
+it is the one reported below.
+
+### Result -- full staged pipeline re-run, prior-10
+
+| | n | avgR | win% | totalR |
+|---|---|---|---|---|
+| Baseline (no filter) | 1,404 | **+0.594** | 50.1% | **+833.5** |
+| B2 prior-10 | 900 | **+0.468** | 49.0% | **+421.3** |
+| Baseline, outliers excluded | 1,374 | +0.419 | 50.1% | +575.8 |
+| B2 prior-10, outliers excluded | 882 | +0.311 | 49.0% | +274.0 |
+
+Worse on every axis. Average R down, win rate down, total R roughly halved.
+The Stage 6b re-derivation did not rescue it.
+
+### WHY: the trades the filter removes are the better ones
+
+| | kept avgR | **cut avgR** |
+|---|---|---|
+| prior 5 | +0.464 | **+0.835** |
+| prior 10 | +0.472 | **+0.792** |
+| prior 20 | +0.490 | **+0.744** |
+
+Reclaims have returned roughly 1.7x what stayed-above-throughout returned. The
+direction is consistent across all three N values.
+
+### Robustness -- it survives every check this project requires
+
+- **Outlier exclusion** (top/bottom 1%): kept +0.340 vs cut +0.549.
+- **Median R**, immune to outliers entirely: kept -0.015 vs cut +0.016. The
+  sign flips, so this is not a tail effect.
+- **Top-10 contributing tickers removed**: kept +0.344 vs cut +0.562. This is
+  the check that killed several earlier candidates; the gap survives it.
+- **Biggest winners split 4-and-4** across the two groups (COGT, XYZ, SMCI,
+  DFTX on the cut side; CELH, NRG, GPCR, VIAV on the kept side), so it is not
+  a handful of monsters sitting on one side.
+
+### [DECISION] B2 REJECTED. B3 CLOSED AS MOOT.
+
+B2 is not adopted. The entry rule is unchanged.
+
+B3 ("reclaim entries slipping through via delayed fills") closes with it, and
+more completely than expected. B3 was a worry that reclaims were sneaking in
+where they should not. If reclaims are the better trades, there is nothing to
+catch. Separately, the mechanism B3 proposed does not exist in the code: the
+bid is same-day only -- an unfilled bid is logged `bid_not_filled` and the
+signal is dropped, never carried to the next session.
+
+### A POSSIBLE MECHANISM -- Dave's, and explicitly NOT established
+
+> "Maybe it makes sense that if price is actually able to reclaim the 50, it's
+> showing strength and buyers are stepping back in."
+
+Plausible: a stock that fell below the line and took it back has demonstrated
+real buying, where one that merely drifted into the line from above has
+demonstrated nothing. **This is a story, not a finding.** Nothing here tests
+it. It is recorded because it is worth remembering, not because it is proven.
+
+### DO NOT INVERT THIS INTO A RULE
+
+The obvious next thought is to prefer reclaims, or filter FOR them. **That must
+not be adopted on this evidence.** It would be selecting a rule from the
+outcome of the very test that produced it -- the same error as the
+least-correlated-first tiebreak, adopted and reverted inside a day on 2026-09-15
+once it was re-run point-in-time. If "prefer reclaims" is worth pursuing it
+needs its own hypothesis, stated in advance, and its own test.
+
+### Honest limits
+
+Survivorship bias, unmodelled overnight gap risk and the static-balance sizing
+simplification all apply here exactly as they do everywhere else in this
+document. They apply to BOTH sides of the split, so they are unlikely to
+create the gap, but they are not zero. One sample, one decade.
+
+### Artifacts
+
+`Staged_Pipeline_Results_10yr_CLEAN.csv` (regenerated baseline, 1,404 passing),
+`Staged_Pipeline_Results_B2_prior10.csv`, `B2_prior_N_flags.csv` (per-touch
+prior-5/10/20 flags), `Historical_Touches_Raw.csv` (the 5,165-touch 10-year
+scan).
+
+### Lesson recorded
+
+**The freeze worked exactly as intended.** This observation came from reading
+two live charts, felt obviously right to both of us, had a clean mechanical
+story behind it, and was wrong. Had it been implemented when it was first
+noticed -- which is precisely what the Phase 2 rule was written to prevent --
+it would have cut total return roughly in half while making every per-trade
+statistic worse.
+
+Dave's rule, from 2026-09-25, in his own words: *"I want to let the statistics
+tell us what is a good thing to do or not, not just me blindly say what we
+should do."* This is the first time that rule has been cashed in, and it paid.
 
