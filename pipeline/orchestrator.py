@@ -1169,6 +1169,42 @@ def process_single_day(target_date):
     save_open_positions(open_df)
     check_capital_committed(open_df)
     append_funnel_rows(funnel_rows)
+
+    # ------------------------------------------------------------------
+    # EQUITY CURVE (added 2026-10-13)
+    #
+    # One row per processed session in state/equity_curve.csv, so the
+    # account has a history that can be charted. Deliberately NOT in the
+    # daily email -- Dave reviews this monthly, not daily -- and
+    # deliberately one row per session rather than a snapshot file per
+    # day: the funnel already demonstrated what append-everything does to
+    # a state folder.
+    #
+    # Placed here, after exits and entries are both settled and
+    # open_positions.csv is written, so the row reflects the end state of
+    # the session rather than a half-processed one. BEFORE
+    # set_last_run_date(), so that a failure here cannot leave the session
+    # stamped done with no curve row -- the next run would not revisit it.
+    #
+    # The import is inside the try for the same reason it is in
+    # send_summary_email.py: if pipeline/equity_curve.py is missing or
+    # mispasted, a top-level import would take down the whole daily run
+    # for the sake of a reporting file. A curve row is never worth a
+    # failed session.
+    # ------------------------------------------------------------------
+    try:
+        import equity_curve
+        _eq = equity_curve.record_session(target_date)
+        print(f"  Equity curve: {_eq['date']} equity {_eq['equity']:,.2f} "
+              f"(realized {_eq['realized_pnl_cum']:+,.2f}, "
+              f"unrealized {_eq['unrealized_pnl']:+,.2f}, "
+              f"{_eq['open_positions']} open"
+              + (f", {_eq['stale_marks']} stale mark(s)" if _eq['stale_marks'] else "")
+              + ")")
+    except Exception as e:
+        print(f"  Equity curve update failed ({type(e).__name__}: {e}) -- "
+              f"continuing; the session is otherwise complete.")
+
     set_last_run_date(target_date)
 
     # TEMP DEBUG (2026-09-09): tracing down a mystery where the orchestrator
