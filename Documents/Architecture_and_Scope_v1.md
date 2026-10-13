@@ -5858,3 +5858,255 @@ Dave's rule, from 2026-09-25, in his own words: *"I want to let the statistics
 tell us what is a good thing to do or not, not just me blindly say what we
 should do."* This is the first time that rule has been cashed in, and it paid.
 
+
+---
+
+## 2026-10-13 -- Equity Curve (B5): BUILT
+
+`pipeline/equity_curve.py` (new) writes one row per processed session to
+`state/equity_curve.csv`. `orchestrator.py` calls it once at the end of
+`process_single_day()`.
+
+**Dave's design calls:** not in the daily email (this is a monthly-review
+artefact), a separate state file, and no per-day snapshot file.
+
+**Columns** -- chart-ready, no pivot required: `date, equity,
+realized_pnl_cum, unrealized_pnl, drawdown_pct, open_positions,
+capital_committed, realized_R_cum, trades_closed_cum, stale_marks`.
+`date` and `equity` are adjacent so charting is select-two-columns-and-
+insert-line. `drawdown_pct` is included because it is the second line
+anyone wants and deriving it monthly by hand is a nuisance.
+
+**IDEMPOTENT BY DATE -- deliberately unlike the funnel.**
+`state/daily_funnel.csv` is append-only and documents that re-processing a
+date duplicates its rows; that is correct there, because the funnel logs
+what each RUN did. It is wrong here: a duplicated date puts two points on
+one day and breaks the chart. So this file is write-or-replace keyed on
+date, and a replayed session overwrites its row with the recomputed value.
+
+**As-of marks, not latest.** Each row marks open positions at that ticker's
+close ON OR BEFORE that row's date. Marking September rows at today's price
+would make the curve fiction. `stale_marks` counts positions priced from a
+bar older than the row's own date -- the same disclosure `pnl_report.py`
+makes, for the same reason: a ticker that leaves the screen stops being
+refreshed.
+
+**SELF-INSTALLING BACKFILL.** Dave cannot run scripts, so a one-time
+backfill script would have been a step he could not perform. Instead the
+first call, finding no file, reconstructs every session from
+`closed_trades.csv`, `open_positions.csv` and the daily closes, then
+appends from there. This matters beyond convenience: once `data/` files age
+past the 10-day prune, that history is unrecoverable. The install captures
+it while it still exists.
+
+**Failure policy:** the import sits inside the try block and the whole call
+is wrapped, placed BEFORE `set_last_run_date()`. A curve row is never worth
+a failed session, and a failure must not leave a session stamped done with
+no row.
+
+**Bug found in testing and fixed:** if the price calendar did not overlap
+the trade dates (SPY's bars lagging the first entry), `backfill_history()`
+raised `KeyError('date')`. It now warns and falls back to the trade dates.
+
+PENDING: first live run. Watch for the backfill line, which appears once.
+
+---
+
+## 2026-10-13 -- [DECISION] Staging to Live Money
+
+Dave's plan, in his words:
+
+> "To me right now we are still in a development stage. Perhaps we could
+> call it forward testing. Soon (probably once we work through this punch
+> card of items) we move to paper trading on a broker. After some period of
+> seeing it executing as expected (maybe a few weeks) we go to live with a
+> reduced position size."
+
+**Stage 1 -- forward testing (current).** The pipeline records what it would
+have done. No orders anywhere.
+**Stage 2 -- broker paper trading**, after the punch list clears.
+**Stage 3 -- live at reduced size**, after a few weeks of execution matching
+expectation.
+
+**THE GAP IN THE PLAN, NAMED: there is no stop criterion.** The plan has
+advance conditions for going forward and none for stepping back. What result
+during paper or early-live would cause a pause -- a drawdown figure, a run of
+losses, a divergence threshold between live and simulated fills? This is the
+same discipline as the Phase 2 freeze: write the rule while it is abstract,
+so it is not decided mid-drawdown. OPEN.
+
+**Also unresolved before Stage 3:** sizing still uses the static $25,000
+rather than running equity (a documented simplification), and slippage and
+commissions are modelled nowhere.
+
+---
+
+## 2026-10-13 -- EXECUTION MECHANISM: the Backtest Describes Orders Nobody Can Place
+
+This is the punch-list item that has to clear before paper trading, because
+"executing as expected" cannot be judged without first defining what the
+orders ARE.
+
+### Half one: the ENTRY is not placeable
+
+`find_new_signals_for_date()` computes `entry_price = row["SMA50"] -
+ENTRY_BID_ATR_MULT * row["ATR14"]`, where `row` is the touch day and its
+SMA50 INCLUDES that day's close. `touched_50ma()` tests against the same
+value. Both are fine as a record and neither is an order: you would need the
+day's close before the day ended.
+
+Measured across all 5,165 touches, comparing the backtest bid against the
+placeable one (yesterday's SMA50 and ATR14):
+
+| | backtest | placeable |
+|---|---|---|
+| Still qualifies as a touch | 100% | **84.6%** |
+| Bid fills | 77.1% | **64.7%** |
+| Entry price vs backtest | -- | **0.073R lower** (median 0.067R) |
+
+So roughly **15% of the trade population does not exist** under a placeable
+rule, fills drop twelve points, and the fills obtained are cheaper. Cheaper
+is not bad -- it is the same direction as the 0.10 ATR bid decision, and
+amounts to running nearer a 0.17 ATR offset. The point is that **the live
+system is a different system from the one +0.594 / +833.5 describes.**
+
+### Half two: the EXIT mechanism, measured
+
+`atr_sched_c_trail` fires on a CLOSE below the trail line and books the fill
+AT that close. The only resting order in the system is the hard stop at
+entry - 1R. Three candidate mechanisms, run through `exit_variants.py`,
+which reuses `sim.get_trail_line()` and `sim.stop_fill_price()` unchanged
+and varies only the moment and price of the fill.
+
+**Validation: mode "close" reproduces `sim.simulate_trail()` on all 1,404
+trades, zero difference.**
+
+| | n | avgR | win% | totalR | avgR (trim) |
+|---|---|---|---|---|---|
+| close -- baseline, NOT placeable | 1,404 | +0.594 | 50.1% | +833.5 | +0.419 |
+| **next_open** | 1,404 | **+0.613** | 50.3% | **+861.2** | +0.444 |
+| resting_stop | 1,404 | +0.516 | **67.4%** | +724.4 | +0.411 |
+
+Where it is decided:
+
+| | close | next_open | resting_stop |
+|---|---|---|---|
+| Top 20 trades | +369.8R | +359.6R | **+153.1R** |
+| Other 1,384 trades | +463.7R | +501.6R | **+571.3R** |
+
+A resting stop is better on 57% of trades and gives back 217R on twenty of
+them. It buys a 67% win rate by clipping the right tail, and the right tail
+is this system's entire edge (see the 2026-09-19 trail work: trail exits
+capture 53.6% of peak MFE and ARE the profit engine). Net cost ~110R, ~13%.
+
+### [RECOMMENDATION] next_open
+
+Placeable, costs nothing (+0.020R per trade versus the unplaceable
+baseline), preserves the tail. Operationally: the hard stop stays a resting
+order at the broker; each evening the orchestrator names the positions that
+closed below their trail; market-on-open orders go in that evening. No
+intraday attention, no 15:50 deadline.
+
+NOT modelled: market-on-open slippage. Small for a universe requiring >1M
+average volume, not zero.
+
+### [METHODOLOGICAL NOTE] The top-10 check misleads on this question
+
+Removing the top-10 contributing tickers FAVOURS resting_stop (+639R vs
++586R). That check exists to catch findings carried by a handful of names.
+Here the difference between mechanisms IS the handful of names, by
+construction -- so for this question the check points the wrong way. A
+standard robustness test is not automatically the right test; it has to be
+asked whether the thing it removes is noise or the subject.
+
+### [INCIDENTAL] Rounding in the results CSV
+
+`Staged_Pipeline_Results_10yr_CLEAN.csv` stores `entry_price` and
+`risk_per_share` rounded to 4 decimals. Feeding them back reproduces R only
+to about +/-0.003, which is why the first validation read 95.9% rather than
+100%. Anything re-derived from that file inherits it.
+
+Artifacts: `Exit_Mechanism_Comparison.csv`, `exit_variants.py`.
+
+---
+
+## 2026-10-13 -- [DAVE'S PROPOSAL, OPEN] The Walking Bid
+
+Raised after seeing the entry analysis, and better than either option
+measured. In his words:
+
+> "What I basically do is look at the slope of the 50-day moving average and
+> kind of come up with an idea of where it will be tomorrow... if it is
+> moving up, say, 10 cents a day, basically just put our bid in 10 cents
+> above the current 50-day moving average."
+
+Rather than bidding at today's unknowable average or yesterday's stale one,
+bid at the PROJECTED average, using the slope as a stand-in for tomorrow's
+close. Placeable the evening before, and it tracks the target down day by
+day, which is what a pullback entry actually is. Likely reads as roughly a
+half- to full-ATR offset above the current average depending on slope.
+
+**The scar to respect:** multi-day resting bids were explicitly REJECTED
+once (see the `bid_not_filled` comment in `orchestrator.py`) because a
+static bid left working for days readmitted the Stage 6b duplicate entries.
+Dave's version is one setup, one bid that walks with the average, which is a
+different thing -- but any test must keep the one-position-and-reset guard
+tight so duplication cannot creep back.
+
+**Dave's cancellation rule:** the bid rests as long as the name is still a
+scored, qualifying setup -- a standing watchlist rescored daily, rather than
+the current event-based one-day touch. Cleaner than a fixed day limit.
+
+**Where it collides with a known finding.** The model assumes that when
+candidates exceed slots you take the BEST one. This system cannot rank. The
+score is a gate, not a ranking: above 2.5, expectancy does not grade with
+score and the correlation with realized R is 0.022. Pullback depth, LTE,
+overhead_R and alphabetical were all tested as ranking keys inside a slot-
+limited portfolio replay and every one landed inside the random baseline's
+own seed range (see `order_candidates()`). So "take the better opportunity"
+currently reduces to "take a random qualifying one." That is not an argument
+against the walking bid -- it is the one piece this project has never been
+able to build, and it remains the biggest single prize.
+
+---
+
+## 2026-10-13 -- [NEW BACKLOG ITEM B6] Bid Over-Booking Policy
+
+Dave's live practice, and the problem it exposes:
+
+> "I kind of figure I want eight positions, but I might have a total of, you
+> know, say five open position and five bids in... that's not very
+> scientific. It's just my observation that you're just not going to fill
+> everything."
+
+Over-book the bids and you can over-consume capital; under-book and capital
+sits idle. This is the candidate-selection problem in work clothes.
+
+**Two implementations.** The heavy one places more bids than capital and
+cancels the rest the moment one fills -- correct, and needs intraday
+monitoring. The light one fits the existing daily rhythm: each evening,
+count free slots, cancel yesterday's unfilled bids (which would be re-placed
+anyway since the average moved) and place tomorrow's. No intraday logic.
+
+**The light version's hidden risk:** the day many bids fill at once is
+probably a sharp down day, which is exactly when sudden over-exposure hurts
+most, and exactly the correlated-cluster worry from GEO and CXW (B4).
+
+**Two things reduce the pressure.** The intraday cancel may not be ours to
+build -- OCO brackets and the broker's own buying-power check are designed
+for it, making this a Phase 3 execution-layer or TradeStation configuration
+question. And Dave's by-feel over-booking is an adequate manual policy for
+the paper stage.
+
+**[MARGIN, correctly scoped]** Dave: a little margin would give "wiggle
+room" if nine fill when eight were wanted. Note this is DIFFERENT from an
+earlier test that measured risk off buying power rather than equity, which
+barely moved anything because the cost cap binds first. That was margin as a
+sizing lever. This is margin as a cushion against over-fill, which is sound
+and pairs with the broker enforcing the hard ceiling.
+
+**THE MEASURABLE TASK:** from historical fill rates, how many bids working
+lands near 8 filled? How often would you over-fill, how often leave capital
+idle? That converts "five and five" into a measured policy. Pure
+measurement, so inside the freeze.
+
