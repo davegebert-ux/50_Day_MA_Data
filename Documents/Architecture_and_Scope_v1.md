@@ -6072,6 +6072,8 @@ able to build, and it remains the biggest single prize.
 
 ## 2026-10-13 -- [NEW BACKLOG ITEM B6] Bid Over-Booking Policy
 
+**[CLOSED 2026-10-14 -- MEASURED. The premise was wrong: the constraint is candidate SUPPLY, not over-booking. See "B6 MEASURED" at the end of this document.]**
+
 Dave's live practice, and the problem it exposes:
 
 > "I kind of figure I want eight positions, but I might have a total of, you
@@ -6109,4 +6111,228 @@ and pairs with the broker enforcing the hard ceiling.
 lands near 8 filled? How often would you over-fill, how often leave capital
 idle? That converts "five and five" into a measured policy. Pure
 measurement, so inside the freeze.
+
+
+---
+
+## 2026-10-14 -- Equity Curve: Delta Columns, and What the First Fortnight Shows
+
+Four columns added to `state/equity_curve.csv` at Dave's request, each next
+to the cumulative it derives from: `equity_delta`, `realized_pnl_delta`,
+`realized_R_delta`, `trades_closed_day`. Like `drawdown_pct` they are
+derived over the WHOLE series in `_finalise()`, because a replayed session
+changes its own row AND the delta of the row after it; computed per row,
+a rewritten date would leave a stale value behind. Verified: all four sum
+exactly to their cumulatives, and a replayed row re-derives its neighbour.
+
+**The question that prompted it, and the answer.** Dave asked why
+`realized_R_cum` moves down as well as up. It is a ledger of CLOSED trades,
+so it falls whenever a loser is booked. Nothing is wrong. The deltas make
+that legible at a glance.
+
+**What the first fortnight actually shows** (through 2026-10-13):
+
+| | |
+|---|---|
+| Equity | 25,000 -> 27,518 (**+10.07%**) |
+| of which REALIZED | **+$354 — 14% of the gain** |
+| of which UNREALIZED | **+$2,164 — 86% of the gain** |
+| Closed trades | 8, cumulative +0.584R, **average +0.073R** |
+| Backtest expectancy | +0.594R |
+
+Both observations are statistically empty at n=8 and are recorded only so
+the framing is on the record: the equity line is dominated by open-position
+mark-to-market, and the trail rule is designed to give back roughly half of
+peak paper profit (53.6% capture, 2026-09-19). **Average R per CLOSED trade
+is the number that reports performance; equity is not.**
+
+One live trade closed at **-1.157R** -- worse than the stop, i.e. a gap
+through it, filled at the open. First instance in the live record of the
+gap risk this document has flagged as under-modelled.
+
+`stale_marks` has been 0 throughout, which is correct and expected: the
+pull unions open positions into the fetch every day (the 2026-09-10 fix),
+so a held position cannot go stale. The column is a canary, not a metric.
+
+---
+
+## 2026-10-14 -- [BUG, CONFIRMED AND FIXED] Duplicate Summary Emails
+
+Dave: "it seems most (maybe all) days I receive what would be yesterday's
+email and then a bit later today's email."
+
+### Confirmed from the repository, not inferred
+
+git records `state/last_run_date.txt` in a commit only when its contents
+change, so that file's history is an exact log of sessions processed -- and
+it shows **exactly one commit per trading day**.
+
+On 2026-10-13 Dave received a summary for **2026-10-12 at 19:16 MT** with no
+commit anywhere near it, and the real **2026-10-13 summary at 22:55 MT**,
+matching that day's only commit to the minute. The 19:16 email came from a
+run that advanced nothing.
+
+### Cause
+
+The workflow runs the email step on `should_run == 'true' && success()`. It
+never asks whether a session was processed -- and **the orchestrator exits 0
+when the coverage guard blocks a session, because a block is not an
+exception**. So a blocked run still emailed, re-reporting whatever
+`last_run_date.txt` still said. Same family as the green workflow that did
+no work and the success counter that measured HTTP status.
+
+### Fix
+
+`state/last_emailed_date.txt` in `send_summary_email.py`: a session can be
+emailed once. Two properties, both deliberate:
+
+**It FAILS OPEN.** Missing, unreadable or unparseable stamp file -> it
+sends. This is the only alert channel, and a suppressed summary is a
+failure you cannot see while a duplicate is merely a nuisance.
+
+**The stamp is written only AFTER a successful send**, so an SMTP failure
+cannot mark a session reported and block its retry.
+
+Six cases verified, including simulated SMTP failure and both fail-open
+paths. One file; the orchestrator is untouched.
+
+### [SIDE EFFECT, INTENDED] Silence now means something
+
+With duplicates gone, "no email tonight" means "no session was processed."
+That is a real signal where before it was noise. Note there is still no
+automated alert for it: a blocked session produces neither a summary nor a
+failure email (exit 0). Dave's chosen backstop for now is noticing the
+absence. OPEN ITEM.
+
+---
+
+## 2026-10-14 -- [FINDING] Every Session Processes 6-9 Hours After the Close
+
+From the same commit history:
+
+| session | processed (ET) | hours after the 16:00 close |
+|---|---|---|
+| Oct 7 | 22:00 | 6.0 |
+| Oct 8 | 22:14 | 6.2 |
+| Oct 9 | 21:47 | 5.8 |
+| Oct 12 | 23:04 | 7.1 |
+| Oct 13 | **00:55 (+1d)** | **8.9** |
+
+The first scheduled run of the evening is 18:17 ET. **Not one session has
+ever been processed by it.** Every night the early runs are turned away --
+almost certainly the coverage guard, with the data source not complete that
+early -- and something hours later does the work.
+
+**The margin is thin and shrinking.** The last cron of the night fires at
+05:17 UTC. Tuesday's session landed at 04:55 UTC: **22 minutes of slack.**
+One more hour of delay and the session falls through to the 08:17 ET run
+the next morning.
+
+[DECISION, Dave] Leave the schedule alone for now and treat a missing email
+as the trigger to revisit. Candidates when it fires: move
+`SESSION_READY_TIME` from 17:30 ET to ~21:00, or extend the cron window past
+05:17 UTC.
+
+**Also noted, pre-existing:** when the orchestrator catches up on several
+sessions in one run, only the LAST one is emailed -- the email reads
+`last_run_date.txt`, not the list of days processed. Intermediate sessions
+are silently unreported. OPEN.
+
+---
+
+## 2026-10-14 -- [CLOSED FINDING] B6 MEASURED: The Constraint Is Supply, Not Over-Booking
+
+### The premise, and why it was wrong
+
+B6 asked how many bids should be working to land near 8 filled positions,
+on the worry that over-booking would over-consume capital. Measured on the
+10-year sample: **over-booking is close to a non-event, and the book is
+nowhere near full in the first place.**
+
+Candidate pool: the 2,153 touches that clear every gate up to the slot rule
+(1,404 that passed plus 749 blocked only because a position was already
+open; the 886 blocked by the setup-reset cooldown are excluded, that rule
+being independent of slot pressure). Each tagged with whether a bid at
+`SMA50 - 0.10 x ATR14` would have filled that day.
+
+### Fill rates
+
+| bid basis | fills |
+|---|---|
+| production bid (SMA50 as of T -- not placeable) | 75.4% |
+| **placeable bid (SMA50 as of T-1)** | **61.4%** |
+
+### Candidate supply is the whole story
+
+Across 10 years there are **0.77 candidates per trading day**. On days that
+produce any at all, the median is **1** and the mean 2.09 (max 21).
+
+Simulated over 8 slots with same-day bids:
+
+| bids placed | filled | avg slots of 8 | % full | % empty | over-fill days | max excess |
+|---|---|---|---|---|---|---|
+| 1.0x free slots | 854 | 2.70 | 6.0 | 26.6 | **0** | 0 |
+| 1.5x free slots | 871 | 2.79 | 9.0 | 26.6 | 29 | **1** |
+| 2.0x free slots | 883 | 2.78 | 9.0 | 26.6 | 31 | 2 |
+| 3.0x free slots | 885 | 2.83 | 9.8 | 26.6 | 36 | 6 |
+| every candidate | 899 | **2.90** | 10.6 | 26.6 | 35 | **12** |
+
+**Average occupancy is under 3 of 8 slots -- about 36% of capital deployed
+-- and bidding harder barely moves it** (2.70 to 2.90 across the whole
+policy range, which is inside noise). The book sits completely empty 26.6%
+of the time. The slot cap binds on 6-11% of days.
+
+### [RECOMMENDATION] Bid 1.5x free slots
+
+Not because it is much better -- the differences are small -- but because
+it bounds the worst case at **one** extra position, which is exactly what
+Dave's margin-as-cushion idea absorbs, while bidding on everything leaves a
+tail of **twelve**. A twelve-position over-fill would arrive on a sharp
+down day, which is when it hurts most and is the same correlated-cluster
+worry as B4.
+
+### THE FINDING THAT MATTERS MORE: occupancy swings 20x with regime
+
+| year | avg slots of 8 | % full | % empty | candidates/day |
+|---|---|---|---|---|
+| 2017 | 1.91 | 0.0 | 2.4 | 0.35 |
+| 2018 | 2.68 | 1.2 | 22.3 | 0.57 |
+| 2019 | 0.92 | 0.0 | 56.0 | 0.27 |
+| 2020 | 1.70 | 1.2 | 45.8 | 0.43 |
+| 2021 | 4.37 | 27.0 | 5.6 | 1.31 |
+| **2022** | **0.32** | 0.0 | **82.9** | 0.16 |
+| 2023 | 2.46 | 0.0 | 17.2 | 0.48 |
+| 2024 | 4.49 | 17.9 | 3.6 | 1.26 |
+| 2025 | 4.25 | 22.8 | 9.6 | 1.22 |
+| **2026** | **6.45** | **39.5** | **0.0** | **1.66** |
+
+In 2022 the book was empty 83% of the time -- the momentum screen simply
+stopped producing candidates through the bear market, which is the system
+declining to trade rather than a fault. In 2026 it is never empty and full
+two days in five.
+
+**[IMPLICATION, IMPORTANT] 2026 is the richest regime in the sample, and it
+is the only one Dave has traded.** The live book standing at 7-8 positions
+with 85% of capital committed is the historical EXTREME, not the norm. Any
+policy calibrated on the last three weeks -- how many bids to work, how much
+margin to hold, what utilisation to expect -- is calibrated on the top of a
+twenty-fold range. The long-run expectation is roughly three positions and
+about a third of capital deployed.
+
+This also reframes `MAX_CONCURRENT_POSITIONS = 8` paired with
+`MAX_POSITION_COST_PCT = 0.125`. That pair was chosen so 8 x 12.5% = 100% of
+equity. In practice the system deploys ~36% on average. The pair is a
+tail-risk cap, not a capital-deployment plan, and should be described that
+way.
+
+### Limits
+
+Same-day bids only, matching current production. Dave's walking bid, which
+rests across days, would fill more often, so **61.4% is a floor**. Exit
+dates come from the simulated run at the at-MA entry; a 0.10 ATR lower
+entry would shift holding periods marginally. Neither affects the
+conclusion, which turns on supply rather than on fill mechanics.
+
+Artifact: `B6_Bid_Fill_Candidates.csv` (2,153 candidates with both bid-fill
+flags, entry and exit dates).
 
