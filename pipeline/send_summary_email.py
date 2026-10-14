@@ -39,6 +39,68 @@ OPEN_POSITIONS_PATH = os.path.join(STATE_DIR, "open_positions.csv")
 CLOSED_TRADES_PATH = os.path.join(STATE_DIR, "closed_trades.csv")
 LAST_RUN_PATH = os.path.join(STATE_DIR, "last_run_date.txt")
 
+# ----------------------------------------------------------------------
+# ONE EMAIL PER SESSION (added 2026-10-14)
+#
+# THE BUG THIS FIXES. The workflow runs this step whenever the run gate
+# said should_run AND the job succeeded. It does NOT check whether a
+# session was actually processed -- and the orchestrator exits 0 when the
+# coverage guard blocks a session, because a block is not an exception. So
+# a run that advanced nothing still sent an email, re-reporting whatever
+# state/last_run_date.txt still said.
+#
+# CONFIRMED FROM THE REPO, not inferred. git only records
+# state/last_run_date.txt in a commit when its contents change, so its
+# history is an exact log of sessions processed -- one commit per trading
+# day. On 2026-10-13 Dave received a summary for 2026-10-12 at 19:16 MT
+# with no commit anywhere near it, and the real 2026-10-13 summary at
+# 22:55 MT, matching that day's only commit to the minute. The 19:16 email
+# was a run that did no work.
+#
+# THE GUARD. state/last_emailed_date.txt records the session last emailed.
+# If the session about to be reported has already been sent, this skips.
+#
+# IT FAILS OPEN, DELIBERATELY. If the stamp file is missing, unreadable or
+# unparseable, the email SENDS. This is the only alert channel and the
+# whole lesson of this project is that silence reads identical to health:
+# a duplicate email is a nuisance, a silently suppressed one is a failure
+# you cannot see. Any doubt resolves toward sending.
+#
+# THE STAMP IS WRITTEN ONLY AFTER A SUCCESSFUL SEND, so an SMTP failure
+# does not mark the session as reported and block the retry.
+#
+# SIDE EFFECT WORTH KNOWING: with duplicates gone, "no email tonight" now
+# means "no session was processed" -- a real signal rather than noise. See
+# the 2026-10-14 note on sessions processing 6-9 hours after the close.
+# ----------------------------------------------------------------------
+LAST_EMAILED_PATH = os.path.join(STATE_DIR, "last_emailed_date.txt")
+
+
+def get_last_emailed_date():
+    """The session last successfully emailed, or None. Any problem reading
+    it returns None, which means 'send' -- see the fail-open note above."""
+    try:
+        with open(LAST_EMAILED_PATH) as f:
+            v = f.read().strip()
+        return v or None
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"Could not read {os.path.basename(LAST_EMAILED_PATH)} ({e}) "
+              f"-- sending anyway rather than risk suppressing a real "
+              f"summary.")
+        return None
+
+
+def set_last_emailed_date(target_date):
+    try:
+        with open(LAST_EMAILED_PATH, "w") as f:
+            f.write(str(target_date))
+    except Exception as e:
+        print(f"WARNING: sent the summary but could not record it in "
+              f"{os.path.basename(LAST_EMAILED_PATH)} ({e}). The next run "
+              f"may send a duplicate.", file=sys.stderr)
+
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
@@ -162,12 +224,20 @@ def main():
         print("No last_run_date.txt found -- nothing to summarize, skipping email.")
         return
 
+    already = get_last_emailed_date()
+    if already is not None and str(already) == str(target_date):
+        print(f"Session {target_date} has already been emailed "
+              f"(state/last_emailed_date.txt) -- skipping. This run did not "
+              f"advance the session, so there is nothing new to report.")
+        return
+
     body = build_summary_body(target_date)
     subject = f"Scorecard Daily Summary -- {target_date}"
 
     try:
         send_email(subject, body)
         print("Summary email sent successfully.")
+        set_last_emailed_date(target_date)
     except Exception as e:
         print(f"Failed to send summary email: {e}", file=sys.stderr)
         sys.exit(1)
