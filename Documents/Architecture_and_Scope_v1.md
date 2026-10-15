@@ -6156,7 +6156,16 @@ so a held position cannot go stale. The column is a canary, not a metric.
 
 ---
 
-## 2026-10-14 -- [BUG, CONFIRMED AND FIXED] Duplicate Summary Emails
+## 2026-10-14 -- [BUG: CAUSE CORRECT, FIX INEFFECTIVE] Duplicate Summary Emails
+
+> **AMENDED 2026-10-15.** The diagnosis below is RIGHT and should be read as
+> written -- "it never asks whether a session was processed" is exactly the
+> defect. The **fix** below never worked and could not have: the stamp file is
+> written by the email step, which runs AFTER the commit step, so it is
+> discarded with the runner and every run starts blank. The guard fails open
+> by design, so it sent every time. Duplicates continued unchanged and were
+> proven still live on 2026-10-15. See the 2026-10-15 entry for the working
+> fix and for what this document got wrong about its own correct diagnosis.
 
 Dave: "it seems most (maybe all) days I receive what would be yesterday's
 email and then a bit later today's email."
@@ -6195,6 +6204,16 @@ cannot mark a session reported and block its retry.
 
 Six cases verified, including simulated SMTP failure and both fail-open
 paths. One file; the orchestrator is untouched.
+
+> **2026-10-15: why this was never going to work.** Both properties above are
+> sound. The mechanism around them is not. Each Actions run is a fresh
+> checkout, so the stamp only survives if it is committed -- and it is written
+> at email time, which is the step AFTER `git add data/ state/`. Nothing ever
+> picked it up. The tell was visible the next morning and nobody looked for
+> it: `state/last_emailed_date.txt` does not exist in the repository. A guard
+> whose memory is thrown away before it is read is not a guard. Six passing
+> tests of the file's internal logic said nothing about this, because the
+> failure is in the environment the file runs in, not in the file.
 
 ### [SIDE EFFECT, INTENDED] Silence now means something
 
@@ -6336,3 +6355,375 @@ conclusion, which turns on supply rather than on fill mechanics.
 Artifact: `B6_Bid_Fill_Candidates.csv` (2,153 candidates with both bid-fill
 flags, entry and exit dates).
 
+
+---
+
+## 2026-10-15 -- [BUG, ACTUALLY FIXED] The Email Gate Asks the Wrong Question
+
+### Proof the bug was still live
+
+Dave had reported the same symptom three times across three days. On
+2026-10-15 he produced the two mails side by side:
+
+| subject | received (MT) | received (UTC) | cron that fired it |
+|---|---|---|---|
+| `Scorecard Daily Summary -- 2026-10-13` | Tue Oct 13, 22:55 | Wed 04:55 | `17 0-5 * * 2-6`, the 04:17 fire |
+| `Scorecard Daily Summary -- 2026-10-13` | Wed Oct 14, 18:34 | Thu 00:34 | `17 0-5 * * 2-6`, the 00:17 fire |
+| `Scorecard Daily Summary -- 2026-10-14` | Wed Oct 14, 22:40 | Thu 04:40 | `17 0-5 * * 2-6`, the 04:17 fire |
+
+Identical subject, identical body, same session reported twice. Every mail
+lands 17-38 minutes after a scheduled fire, so there is no ambiguity about
+which run produced which.
+
+### The run log, which states the mechanism outright
+
+From the 00:17 UTC run on 2026-10-15 (18:17 MT Wednesday):
+
+```
+=== Processing 2026-10-14 ===
+  Data check: 17 of 80 live ticker files have a bar for 2026-10-14
+  Reference coverage (best weekday in the previous 20 days): 80 tickers;
+    need at least 40 to proceed
+  PARTIAL DATA for 2026-10-14 -- only 17 tickers carry this bar against a
+    recent best of 80.
+  Leaving this session UNPROCESSED so a later run picks it up.
+    state/last_run_date.txt is unchanged.
+Stopping here -- 2026-10-14 will be retried on the next scheduled run.
+```
+
+The coverage guard worked exactly as designed and refused to burn a session
+on 21% of the universe. It then exited **0**, because a deferral is not a
+failure. `should_run` was `true` and correct -- 2026-10-14 genuinely was
+unprocessed. `success()` was `true`. So the email step ran, read
+`last_run_date.txt`, found **2026-10-13** still sitting there, and sent that
+session a second time.
+
+### The defect, stated precisely
+
+```
+  should_run  answers   "is there an unprocessed session?"
+  the email   needs     "was a session just processed?"
+```
+
+Those are different questions and they come apart on every deferral. The
+2026-09-22 comment above the email step asserted the opposite -- *"exactly
+one run per session reaches this step"* -- and that claim was wrong for
+three weeks.
+
+### Two things that actively hid it
+
+**The commit step is no tell.** `scripts/pull_data.py` always writes fresh
+`data/` files, so the commit always has something to push even when no
+session was processed. The run above pushed 25 changed files and 928
+insertions while advancing nothing. A green commit step means nothing about
+whether work happened.
+
+**GitHub dropped most of the evening fires.** The 6:17pm and 7:17pm ET fires
+on 2026-10-14 did not run at all. That is the only reason one duplicate
+arrived per day rather than three -- every evening fire that lands while the
+data is partial sends another copy. The duplicate count was governed by how
+many scheduled runs survived, which is why it looked irregular.
+
+### The fix
+
+Read `state/last_run_date.txt` immediately before and immediately after the
+orchestrator and mail only if it MOVED. That is the exact question the email
+needs answered, and the file that answers it already exists.
+
+Three changes, all in `.github/workflows/daily_scorecard_automation.yml`
+(17,534 bytes). No Python touched:
+
+1. **`before_run`** -- captures `last_run_date.txt` ahead of the orchestrator.
+2. **`advanced`** -- reads it again afterwards; sets `advanced=true` only on
+   a change. Runs under `success()`, so a crash leaves it unset.
+3. The email step now additionally requires `steps.advanced.outputs.advanced
+   == 'true'`.
+
+**Why this and not the stamp.** The stamp needs a file to survive a fresh
+checkout, which needs a commit step after the email, which is more
+machinery in the exact path that is least trustworthy when something is
+wrong. `last_run_date.txt` is already committed, already authoritative, and
+already means precisely "the last session processed."
+
+Two alternatives were considered and rejected: having the orchestrator write
+the stamp (it cannot know whether the mail sent, so the stamp would lie), and
+a run-local marker file (works, but a failed send would then be lost forever
+instead of retried).
+
+### Verification
+
+Six scenarios, exercising the real shell extracted from the YAML rather than
+a retyped copy:
+
+| scenario | before | after | advanced |
+|---|---|---|---|
+| deferral, file untouched | 2026-10-13 | 2026-10-13 | false |
+| session processed | 2026-10-13 | 2026-10-14 | true |
+| catch-up across several days | 2026-10-09 | 2026-10-14 | true |
+| first ever run, no file then written | none | 2026-10-14 | true |
+| no file before or after | none | none | false |
+| trailing-newline difference only | 2026-10-13 | 2026-10-13 | false |
+
+The last case matters: `$(cat ...)` strips trailing newlines, so a whitespace
+difference cannot fake a processed session.
+
+Replayed against the three real mails above, Tuesday-Wednesday becomes:
+
+| fire (MT) | orchestrator | gate | mail |
+|---|---|---|---|
+| Tue 22:17 | processed 10-13 | advanced | **10-13 sent** |
+| Wed 06:17 | `should_run` false, never started | -- | none |
+| Wed 18:17 | deferred 10-14, 17/80 | **not advanced** | **suppressed** |
+| Wed 22:17 | processed 10-14 | advanced | **10-14 sent** |
+
+Three mails become two. One per session.
+
+---
+
+## 2026-10-15 -- [PROCESS FINDING] The Correct Answer Was Already in This Document
+
+This one is worth more than the bug.
+
+Dave reported this symptom on 2026-10-13, again on 2026-10-14, and twice more
+on 2026-10-15, each time describing it accurately: *"I really get each day
+twice. I get it on the day I should get it, and then on the next day."*
+
+On 2026-10-15 Claude argued him out of it **twice**:
+
+1. First by reinterpreting the symptom -- two mails with different session
+   dates were explained away as lateness crossing midnight, when the actual
+   mails had identical subjects.
+2. Then, after reading the workflow file, by asserting the bug was
+   structurally impossible, because the email step is gated on `should_run`
+   and "a run that finds nothing to process does not reach the email step."
+
+That second rebuttal leaned on the 2026-09-22 comment block sitting directly
+above the email step -- a comment that asserts an invariant and was wrong.
+Claude read a confident comment, treated it as a description of behaviour,
+and weighed it above the user's direct repeated observation of the system's
+output.
+
+**And the correct diagnosis was already written in this document**, in the
+2026-10-14 entry, one section earlier: *"It never asks whether a session was
+processed."* Claude re-derived that from scratch on 2026-10-15 after first
+arguing against it.
+
+Three rules, all consistent with the rest of this document:
+
+- **A comment asserting an invariant is not evidence the invariant holds.**
+  It is a claim by a past author about intent. The 2026-09-22 note has now
+  been corrected in place, with the reason, so it cannot mislead again.
+- **A user's repeated direct observation of output outranks reasoning about
+  code.** Dave was looking at the artefact. Claude was looking at an account
+  of it -- the same distinction this document already draws about the green
+  workflow that did no work and the report of work never pasted.
+- **Read the document before re-deriving it.** It is 319KB of exactly this
+  kind of finding, and it had the answer.
+
+What broke the loop was Dave ignoring the rebuttal and producing two
+screenshots.
+
+---
+
+## 2026-10-15 -- Overdue-Session Alert: Closing the Silence Gap
+
+### Why it had to be built today
+
+The fix above removed the duplicate. The duplicate was also, accidentally, a
+heartbeat: mail arriving meant the runner was alive. Afterwards silence
+covers two very different states:
+
+```
+  nothing to report       <- fine
+  the automation is dead  <- not fine
+```
+
+Tolerable in development. Not tolerable once paper trading starts and
+positions are managed off these mails, which is Dave's stated next goal. So
+this closes the gap before that, rather than being left to drift.
+
+### Design
+
+New file `pipeline/send_overdue_email.py` (11,343 bytes), plus one workflow
+step.
+
+**Fires on the morning safety-net cron only** (`17 12 * * 2-6`), and only
+when that run had work to do and still did not advance:
+
+```
+  should_run == 'true' && advanced == 'false'
+    && github.event.schedule == '17 12 * * 2-6' && success()
+```
+
+The evening fires defer constantly and legitimately -- 17 of 80 tickers at
+18:17 MT is the normal state of the world, not a fault. By the morning fire
+the data has long been published, so a session still unprocessed then is
+real. This gives one alert per genuinely stuck session and no false alarms
+on ordinary late nights.
+
+**It pairs with `send_failure_email.py` rather than overlapping it.** That
+one catches a crash; this catches the silent case where nothing crashed and
+nothing happened. Between the two there is no longer a failure mode that
+reaches Dave as silence.
+
+**`advanced == 'false'`, not `!= 'true'`** -- it must have run and reported,
+rather than firing on an empty value from a skipped step.
+
+### What the mail says
+
+Last processed session; the session most likely blocking; weekdays elapsed;
+then the two things that decide what to do about it:
+
+```
+  17 of 80 ticker files carry a bar for 2026-10-14.
+  Short of the coverage guard's threshold ... the escape hatch is to add
+  the line '2026-10-14' to state/skip_sessions.txt
+
+  7 open position(s), 7,021.00 dollars committed.
+  Exits are NOT being checked while the session is unprocessed.
+```
+
+The coverage line is the diagnosis in one number: it separates "the feed is
+short" from "the data is there and something else is wrong," and each case
+gets different advice. The open-book line is there because what actually
+matters during a stall is that trailing stops are not being evaluated.
+
+### Three deliberate choices
+
+**It repeats.** A session stuck three days sends three alerts. There is no
+"already warned" stamp, because that would need a file committed back to the
+repo -- and a stuck pipeline is precisely when the commit path cannot be
+trusted. That is the same mistake as the 2026-10-14 stamp, and it is not
+being made twice. An alert that goes quiet while the fault persists is worse
+than one that repeats.
+
+**It imports nothing from the pipeline.** Not the orchestrator, not
+`check_run_window`, not `parameters`, not pandas. It reads two state files
+and counts date strings in `data/`. It runs exactly when something upstream
+is broken, so every import is another thing that could take it down too.
+
+**Every optional section is wrapped.** A failure building the diagnostics
+still sends the alert.
+
+Nine scenarios tested: short coverage, adequate coverage, zero bars, missing
+`data/`, missing `last_run_date.txt`, flat book, header-only
+`open_positions.csv`, the Friday-to-Monday weekend skip, existing
+`skip_sessions.txt` entries, and a week-long stall. A test also asserts that
+the cron string in the workflow step matches a declared cron line, since a
+silent mismatch there is the one way this stops firing unnoticed.
+
+### Known gap
+
+**It cannot catch a dead scheduler.** If the morning fire never runs, no
+alert goes out. GitHub dropped two fires on 2026-10-14 alone, so this is not
+hypothetical. Covering it needs something outside GitHub Actions -- an
+external cron, or a weekly heartbeat -- and was judged not worth building
+today. OPEN.
+
+---
+
+## 2026-10-15 -- [CONSTRAINT] Data Completeness Is the Binding Limit
+
+Sharpening the 2026-10-14 finding with a direct measurement rather than an
+inference from commit times:
+
+| time (ET) | tickers with that session's bar |
+|---|---|
+| 20:17 | **17 of 80** |
+| 00:17 (+1d) | enough to clear the 40-ticker floor |
+
+The system cannot process a session before roughly midnight Eastern because
+the data is not there before roughly midnight Eastern. The late processing
+documented on 2026-10-14 is a symptom of this, not a scheduling mistake:
+moving `SESSION_READY_TIME` or widening the cron window cannot conjure bars
+that have not been published.
+
+This makes the **second data source** item materially more important than it
+read before. It is no longer only a cross-check for correctness; it is the
+only route to processing a session in the evening of the day it happened.
+
+[DECISION, Dave, carried from 2026-10-14] Leave the schedule alone. The
+trigger to revisit is now sharper: the overdue alert firing, rather than Dave
+noticing an absence.
+
+---
+
+## 2026-10-15 -- [DECISIONS] Backlog Pruned Toward Simulated Trading
+
+Dave, reviewing the open items: *"What I really want to do is get this thing
+to a state where we can roll it to a simulated environment. I want to just
+keep pushing this forward, understanding there's going to be corrections over
+time."*
+
+**B4 (correlated / sector exposure) -- DROPPED.** Dave: *"Based on how few
+opportunities we actually have, I don't think it matters that much."*
+Supported by the B6 measurement: average occupancy is 2.70-2.90 of 8 slots
+and the book is empty a quarter of the time. Sector clustering is a small
+risk at that density. Revisit if the regime gets richer; the unblock is still
+one line (`sector` in the TradingView `.select()`).
+
+**B1 (long-range ceiling rollover) -- DOWNGRADED to observe-over-time.** Dave:
+*"it is the headline item, but our statistics also include this. So the good
+news is it isn't the thing that's killing the strategy."* Correct, and the
+key point: the drag is already inside the +0.594 avgR baseline. It is a
+visible cost, not a hidden one, so it does not block progress toward paper
+trading. Keep collecting examples.
+
+**The one item pulled FORWARD was the silence gap**, on the grounds that once
+paper-trading decisions rest on these mails, a dead runner that says nothing
+is the single failure that actually costs money. Built the same day; see
+above.
+
+Everything else in housekeeping is fill-in-over-time by agreement.
+
+---
+
+## OPEN ITEMS -- revised 2026-10-15
+
+**Carried from 2026-10-11, still open:**
+
+1. **pandas `FutureWarning` at `orchestrator.py:821`.** Unchanged. Harmless
+   today, a run-killer on a pandas upgrade. ~20 minutes.
+2. **Second data source.** *Upgraded in importance* -- see the constraint
+   entry above. Now the only route to same-evening processing.
+3. **Stop criterion for paper/live.** Dave has go-forward criteria
+   (forward-testing now, broker paper next, then live at reduced size) but
+   nothing that says when to step BACK. Worth settling before paper starts,
+   not during.
+4. **Commit `pull_report.csv`** (2026-10-11 reversal). Still wants a workflow
+   edit; the workflow was edited twice today without folding it in.
+5. **No `.gitignore`.** Today's run log showed `?? pipeline/__pycache__/` and
+   `M pull_report.csv` dirtying the tree before every rebase, which is the
+   condition `--autostash` was added to work around on 2026-09-22.
+6. **Catch-up runs email only the last session.** Unchanged by today's fix:
+   `advanced` is true once for a run that drains three days, and the mail
+   still reports only the last. Intermediate sessions remain in
+   `daily_funnel.csv` only.
+7. **Watch `skip_sessions.txt` for casual use.** Note the overdue alert now
+   advertises the escape hatch by name in its mail body, which makes casual
+   use easier. The 2026-09-22 standard still applies.
+8. **`LIVE_FILE_STALENESS_DAYS` is inert but stays.**
+9. Carried and unchanged: `sim.py` live-vs-Claude comparison; replay equity
+   discrepancy unreconciled; `SKIP_SCORE_THRESHOLD`, `ADR_CEILING_PCT` and
+   `OVERHEAD_PROXIMITY_R` not re-checked on the corrected 1,404-trade sample;
+   Relative Strength v2 stability; `research/` pushes outstanding.
+
+**New today:**
+
+10. **No alert for a dead scheduler.** The overdue alert catches a stuck
+    pipeline, not a scheduler that never fires. Needs something outside
+    GitHub Actions.
+11. **`state/last_emailed_date.txt` guard is dormant in
+    `send_summary_email.py`.** Left in place deliberately, documented in the
+    workflow header. It fails open and never persists, so it does nothing. If
+    it is ever wanted as a real second line of defence it needs its own
+    commit step after the email -- not a code change.
+12. **The morning safety-net cron string is duplicated** in the workflow: once
+    in `on.schedule`, once in the overdue step's `github.event.schedule`
+    guard. Editing one without the other silently stops the alert. A test
+    asserts they match, but the test is not in CI.
+
+**Closed today:** duplicate summary emails (actually, this time); the silence
+gap (partially -- see item 10).
+
+**Closed by decision:** B4 dropped; B1 downgraded to observation.
