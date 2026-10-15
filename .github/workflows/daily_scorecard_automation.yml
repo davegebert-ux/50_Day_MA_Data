@@ -281,3 +281,38 @@ jobs:
           EMAIL_ADDRESS: ${{ secrets.SCORECARD_EMAIL_ADDRESS }}
           EMAIL_APP_PASSWORD: ${{ secrets.SCORECARD_EMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.SCORECARD_EMAIL_TO }}
+
+      # OVERDUE-SESSION ALERT (ADDED 2026-10-15)
+      # ----------------------------------------
+      # Closes the silence gap the step above opened. Before today a
+      # deferral still sent the previous day's summary, which was noise but
+      # was also an accidental heartbeat. Now a deferral is silent, and
+      # silence covers both "nothing to report" and "the runner is dead" --
+      # fine in development, not fine once paper trading starts.
+      #
+      # Fires on the MORNING SAFETY-NET cron only. The evening fires defer
+      # constantly and legitimately (on 2026-10-14 at 8:17pm only 17 of 80
+      # tickers had a bar yet), so alerting on those would be pure false
+      # alarm. By the morning fire the data is long published, so a session
+      # still unprocessed then is a genuine fault.
+      #
+      # Note it pairs with the failure email above rather than overlapping
+      # it: that one catches a CRASH, this one catches the silent case where
+      # nothing crashed and nothing happened. advanced == 'false' (not
+      # != 'true') is deliberate -- it requires the check to have actually
+      # run and reported, rather than firing on an empty value.
+      #
+      # MAINTENANCE: the schedule string below must match the morning cron
+      # line at the top of this file EXACTLY. If that line is ever edited,
+      # edit this one in the same commit or the alert silently stops firing.
+      - name: Alert that a session is overdue (morning safety-net fire only)
+        if: >-
+          steps.check_time.outputs.should_run == 'true' &&
+          steps.advanced.outputs.advanced == 'false' &&
+          github.event.schedule == '17 12 * * 2-6' &&
+          success()
+        run: python3 pipeline/send_overdue_email.py
+        env:
+          EMAIL_ADDRESS: ${{ secrets.SCORECARD_EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.SCORECARD_EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.SCORECARD_EMAIL_TO }}
