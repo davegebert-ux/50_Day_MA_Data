@@ -42,6 +42,53 @@ name: Daily Scorecard Automation
 # date) and the freshly-pulled data would be thrown away at the end of
 # every run, and the next run would have no memory of what happened
 # before it.
+#
+# DUPLICATE SUMMARY EMAILS, THE REAL CAUSE (FIXED 2026-10-15)
+# -----------------------------------------------------------
+# Dave reported from 2026-10-13 that he was getting each session's
+# summary TWICE -- once on its own evening, then again the next day.
+# Proven on 2026-10-15 with two mails carrying the identical subject
+# "Scorecard Daily Summary -- 2026-10-13", sent 10:55pm Tue Oct 13 and
+# 6:34pm Wed Oct 14 Mountain.
+#
+# The 2026-09-22 note further down claims should_run makes this
+# impossible. It does not, and the gap is precise:
+#
+#   should_run answers "is there an unprocessed session?"
+#   the email needs  "was a session just processed?"
+#
+# Those come apart whenever the orchestrator legitimately DEFERS. On the
+# 8:17pm Eastern fire of 2026-10-14 only 17 of 80 live tickers carried a
+# bar for that session, so the coverage guard refused to burn the session
+# on an unrepresentative slice, left state/last_run_date.txt alone, and
+# exited CLEANLY (exit 0 -- a deferral is not a failure). should_run was
+# true and correct: 2026-10-14 really was unprocessed. success() was true.
+# So the email step ran, read last_run_date.txt, found the PREVIOUS
+# session still sitting there, and mailed it a second time. Four hours
+# later the data landed, the 12:17am fire processed 2026-10-14 properly,
+# and the real mail went out. Two mails, one real.
+#
+# Note the commit step is no help in spotting this: scripts/pull_data.py
+# always writes fresh data/ files, so the commit always has something to
+# push (25 files on the run above) even when no session was processed.
+#
+# THE FIX: read state/last_run_date.txt immediately before and
+# immediately after the orchestrator and send the summary only if it
+# MOVED. That is the exact question the email needs answered, and the
+# file that answers it already exists -- no new state file to keep
+# alive across checkouts, and no change to any Python.
+#
+# Two related notes for whoever reads this next:
+#   - Only ONE duplicate arrived per day rather than three because
+#     GitHub dropped the 6:17pm and 7:17pm fires entirely. Every evening
+#     fire that lands while the data is partial would have sent a copy.
+#   - pipeline/send_summary_email.py carries its own last-emailed guard
+#     (added 2026-10-14). It is dormant: it stamps state/
+#     last_emailed_date.txt AFTER the commit step has already run, so
+#     the stamp never survives into the next checkout and the guard
+#     always fails open. Harmless, and left in place deliberately -- if
+#     it is ever wanted as a real second line of defence it needs its
+#     own commit step after the email, not a code change.
 # ============================================================
 
 on:
@@ -107,10 +154,49 @@ jobs:
         if: steps.check_time.outputs.should_run == 'true'
         run: python3 scripts/pull_data.py
 
+      # ADDED 2026-10-15: snapshot the processed-session marker BEFORE the
+      # orchestrator touches it. Paired with the check further down, this
+      # is what tells the difference between "the orchestrator processed a
+      # session" and "the orchestrator looked, deferred, and changed
+      # nothing" -- see the DUPLICATE SUMMARY EMAILS note in the header.
+      - name: Note which session was already processed before this run
+        if: steps.check_time.outputs.should_run == 'true'
+        id: before_run
+        run: |
+          BEFORE="$(cat state/last_run_date.txt 2>/dev/null || true)"
+          BEFORE="${BEFORE:-none}"
+          echo "date=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "state/last_run_date.txt before the orchestrator: $BEFORE"
+
       - name: Run orchestrator
         if: steps.check_time.outputs.should_run == 'true'
         id: orchestrator
         run: python3 pipeline/orchestrator.py
+
+      # ADDED 2026-10-15: the gate the summary email actually needs.
+      # A deferral (partial data, coverage guard, nothing ready yet) exits
+      # 0 and leaves last_run_date.txt untouched, so comparing the file
+      # across the orchestrator step answers "did a session get processed"
+      # exactly, with no new state and no orchestrator change. On a
+      # catch-up run that drains several sessions at once this is still
+      # true once, and the email still summarises the LAST day processed.
+      - name: Did this run actually process a session?
+        if: steps.check_time.outputs.should_run == 'true' && success()
+        id: advanced
+        env:
+          BEFORE: ${{ steps.before_run.outputs.date }}
+        run: |
+          AFTER="$(cat state/last_run_date.txt 2>/dev/null || true)"
+          AFTER="${AFTER:-none}"
+          echo "state/last_run_date.txt after the orchestrator: $AFTER (was $BEFORE)"
+          if [ "$AFTER" != "$BEFORE" ]; then
+            echo "advanced=true" >> "$GITHUB_OUTPUT"
+            echo "A session was processed -- the summary email will be sent."
+          else
+            echo "advanced=false" >> "$GITHUB_OUTPUT"
+            echo "No session was processed -- the orchestrator deferred this one."
+            echo "Suppressing the summary email so the previous session is not re-sent."
+          fi
 
       - name: Commit updated data and state files back to the repo
         if: steps.check_time.outputs.should_run == 'true' && success()
@@ -171,17 +257,25 @@ jobs:
           EMAIL_APP_PASSWORD: ${{ secrets.SCORECARD_EMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.SCORECARD_EMAIL_TO }}
 
-      # DUPLICATE-EMAIL NOTE (2026-09-13, updated 2026-09-22): on
-      # 2026-09-12 both the primary and the retry sent an identical
-      # summary, because the old clock-window design couldn't tell a
-      # quiet successful run from a run that never happened. Under the
-      # 2026-09-22 design should_run is true only when a finished session
-      # is still unprocessed, so exactly one run per session reaches this
-      # step. When a run catches up several days at once, the email
-      # summarizes the LAST day processed; the earlier days are in
+      # DUPLICATE-EMAIL NOTE (2026-09-13, updated 2026-09-22, CORRECTED
+      # 2026-10-15): on 2026-09-12 both the primary and the retry sent an
+      # identical summary, because the old clock-window design couldn't
+      # tell a quiet successful run from a run that never happened. The
+      # 2026-09-22 design gated this step on should_run and this note
+      # then claimed "exactly one run per session reaches this step."
+      # That claim was WRONG and the duplicates continued for a month:
+      # should_run is true whenever a session is unprocessed, including
+      # on every run where the orchestrator defers it for partial data.
+      # Such a run reaches this step with last_run_date.txt still holding
+      # the PREVIOUS session, and mails that session again. The real gate
+      # is steps.advanced -- did last_run_date.txt actually move -- and
+      # it is now required below. Full account in the header.
+      #
+      # When a run catches up several days at once, the email summarizes
+      # the LAST day processed; the earlier days are in
       # state/daily_funnel.csv.
-      - name: Send daily summary email (only on success)
-        if: steps.check_time.outputs.should_run == 'true' && success()
+      - name: Send daily summary email (only when a session was actually processed)
+        if: steps.check_time.outputs.should_run == 'true' && steps.advanced.outputs.advanced == 'true' && success()
         run: python3 pipeline/send_summary_email.py
         env:
           EMAIL_ADDRESS: ${{ secrets.SCORECARD_EMAIL_ADDRESS }}
