@@ -5587,6 +5587,11 @@ here changes until a staged-pipeline test says so.
 
 ### B1. Long-range ceiling rollover [HEADLINE]
 
+**[CLOSED 2026-10-16 -- MEASURED. The effect is REAL at a 2-year horizon (+0.21R,
+8 of 9 years) and is NOT worth gating on, because the trades it would cut are
+profitable. Recorded as a TIEBREAKER for use when the book is full, not a filter.
+See the B1 section at the end of this document.]**
+
 A stock range-bound for a year or eighteen months breaks upward; that leg runs
 into the overhead of its own long range, rolls over at the ceiling, and the
 rollover is what carries it back to the 50-day MA. We register a textbook
@@ -5639,6 +5644,11 @@ on the way down. Enter on a reclaim and the stop's relationship to structure
 differs -- potentially buying straight into overhead just cleared.
 
 ### B4. Correlated / sector exposure, now observed live
+
+**[DROPPED 2026-10-15 by Dave's decision -- at 2.70-2.90 of 8 slots average
+occupancy, sector clustering is a small risk. Revisit if the regime gets richer;
+the unblock remains one line (`sector` in the TradingView `.select()`). See the
+2026-10-15 decisions section.]**
 
 GEO and CXW are the two US private-prison operators -- effectively one bet.
 Same entry day, same exit day, same sector move. Combined risk $280.82 against
@@ -6669,6 +6679,13 @@ key point: the drag is already inside the +0.594 avgR baseline. It is a
 visible cost, not a hidden one, so it does not block progress toward paper
 trading. Keep collecting examples.
 
+> **SUPERSEDED 2026-10-16, one day later.** Dave reopened it the next morning
+> ("maybe we start scoping the longer term overhead resistance item") and it was
+> measured the same session. The call above was right in its conclusion -- it is
+> not killing the strategy -- and wrong in assuming the question was unanswerable
+> without a long project. It took one session. The measurement is at the end of
+> this document.
+
 **The one item pulled FORWARD was the silence gap**, on the grounds that once
 paper-trading decisions rest on these mails, a dead runner that says nothing
 is the single failure that actually costs money. Built the same day; see
@@ -6727,3 +6744,232 @@ Everything else in housekeeping is fill-in-over-time by agreement.
 gap (partially -- see item 10).
 
 **Closed by decision:** B4 dropped; B1 downgraded to observation.
+
+---
+
+## 2026-10-16 -- [CLOSED FINDING] B1 LONG-RANGE CEILING: REAL AT 2 YEARS, NOT A GATE
+
+The headline item since 2026-10-11, carried for five sessions as "needs a measure
+inventing." It took one session once Dave defined the rule properly.
+
+### How Dave defined it, which is what made it testable
+
+The first attempt that morning tested the wrong thing. Claude measured
+**proximity** -- is the stock range-bound, is it sitting near its ceiling, is the
+ceiling old -- across five measures. Four showed nothing; the fifth (6-month
+return minus 18-month return) showed +0.42R but collapsed under the robustness
+checks: it beat the rest in only 3 of 9 years and fell from 0.879 to 0.335 avgR
+when ten tickers were removed. Ten names in two good years.
+
+Dave then supplied the definition that worked, and it is a different question:
+
+> *"it would make sense not to take anything until it's above its long-term
+> range. That would kind of specify it really is more of a breakout and has
+> momentum."*
+
+Not **avoid the ceiling** -- **require proof it is broken**. And the pullback
+setup gives that a clean reading: a stock above its long-term range that pulls
+back to the 50-day MA has its old ceiling sitting BELOW where price pulled back
+to. Resistance has become support. That is a different and far sharper test than
+proximity, and it is the one that found the effect.
+
+Dave also raised the objection that unlocked the measurement problem: support and
+resistance is **an area, not a level** -- *"maybe, depending on the scale of the
+ticker, it's a five point range or whatever. It really is very situational."*
+That feels like it makes definition harder and does the opposite. Situational is
+only true in dollars. Measure the margin in a scale-free unit and it vanishes.
+
+### The specification
+
+Margin measured as **a fraction of the base's own height**, not in ATR. Dave's
+objection to ATR was correct and worth preserving: *"one ATR still sounds small.
+That really is only one single day's range... to say something went one day's
+range above a several year range, that's very inconsequential."* ATR is a
+two-week volatility gauge and this is a multi-year structural question -- a
+category mismatch. Scaling to the base height means a sprawling five-year base
+demands a big convincing breakout and a tight one needs less.
+
+```
+ceiling   = highest high from 60 trading days back to N years back
+base_low  = lowest low over the same window
+clearance = (entry_price - ceiling) / (ceiling - base_low)
+```
+
+The 60-day exclusion is what makes it the OLD ceiling rather than the breakout
+itself. **Fixed at 60 and deliberately not swept**, so it could not be tuned into
+a result.
+
+Swept N in {1, 2, 3, 4, 5} years x M in {0, 0.05, 0.10, 0.15, 0.25}. Twenty-five
+cells, so the bars were committed in writing before any result was read.
+
+### [PROCESS] The pre-registration was broken, and that is the first finding
+
+Bar 4 -- "survives removing the top 10 contributing tickers" -- returned negative
+in **all 25 cells**, and zero cells passed. That number means nothing, because the
+bar was unpassable as written:
+
+```
+  all 1,404 trades        avgR 0.594    totalR 833.5
+  minus top-10 tickers    avgR 0.427    totalR 585.8
+  10 of 722 tickers carry 247.7R of 833.5R = 30% of all profit
+```
+
+Removing the top 10 costs ~0.17R of average from ANY subgroup of this strategy.
+The bar stripped the kept group's tail and left the excluded group's intact, so it
+charged the rule 0.17R before the rule did anything. Asymmetric and therefore
+impossible.
+
+**The lesson, and it is new to this document:** a robustness bar has to be
+calibrated against the null before it is committed to. "Does the baseline itself
+pass this?" is a one-line check and it was not run. A test nothing can pass
+produces a confident "no finding" that is indistinguishable from a real one.
+
+Repaired by removing the top 10 from BOTH groups. Reported below as a diagnostic,
+not as a second attempt at the pre-registered bar -- the pre-registered answer
+stays "uninformative."
+
+### The result
+
+| lookback | raw diff | symmetric diff | verdict |
+|---|---|---|---|
+| 1 year | +0.00 | +0.36 | unreliable, excluded group only 212 trades |
+| **2 years** | **+0.21** | **+0.24** | **the signal** |
+| 3 years | +0.19 | +0.13 | same direction, weaker |
+| 4 years | -0.05 | -0.09 | reverses |
+| 5 years | -0.04 | -0.12 | reverses |
+
+At N=2, M=0.05: 775 trades above the ceiling at 0.634 avgR against 439
+range-bound at 0.420. It wins **8 of 9 years**, losing only 2021 (-0.114) and
+tying 2025 (+0.016) -- both strong-regime years -- and winning by +0.3 to +0.7 in
+2018, 2019, 2020, 2022, 2023, 2024 and 2026.
+
+**Dave's instinct to go longer was wrong.** He expected the effect to strengthen
+past two years (*"I actually think it's even more than one to two years"*). It
+reverses at four and five. Checked that this is not a population artifact: the
+5-year-eligible subsample's baseline avgR is 0.597 against 0.594 for all trades,
+so the older names are not simply worse. At two years the rule asks "has this gone
+somewhere recently"; at five it demands the stock sit at multi-year highs, which
+selects extended names.
+
+### The mechanism: a missing right tail
+
+| | above 2y ceiling | range-bound |
+|---|---|---|
+| win rate | 50.1% | 49.9% |
+| median R | +0.007 | -0.003 |
+| median hold | 6 days | 5 days |
+| losses worse than -0.9R | 35.1% | 33.7% |
+| **trades above +2R** | **12.3%** | **10.0%** |
+
+Identical on every measure but one. **Dave's quick-win hypothesis is disproven** --
+he wondered whether range-bound names scratch a small win off the 50 before
+rolling over, hiding the damage inside the average. They do not: same win rate,
+same median, same hold, same loss profile. They simply produce fewer big winners.
+
+Which is his own original reasoning, confirmed: *"those types of tickers don't
+really have the momentum to carry them the next leg further."* The damage was
+never hidden. It is an absent tail, and the mean is exactly where it shows up.
+
+### Why it is still not a gate
+
+```
+subsample            1,214 trades   totalR 675.9   avgR 0.557
+KEEP  (above)          775 trades   totalR 491.4   avgR 0.634
+CUT   (range-bound)    439 trades   totalR 184.5   avgR 0.420
+```
+
+The cut trades are **profitable**: 49.9% winners, +0.420R average, **184R of
+realized profit over ten years**. The gate raises average R and lowers total R.
+
+A positive-expectancy trade is worth taking unless the slot it occupies would
+otherwise hold something better. So the gate only pays when the book is full. B6
+already measured how often that is: average occupancy 2.70-2.90 of 8 slots, book
+empty roughly a quarter of the time. **The gate would fire almost entirely in the
+free-slot regime, where it subtracts a profitable trade and replaces it with
+nothing.**
+
+Dave's summary, which is the right one: *"you end up cutting off enough winners
+that it actually doesn't make sense. The only way it would really make sense is if
+we had so many trade opportunities that it allowed us to only really get into
+potentially very large winners. Otherwise, we might as well keep the small wins."*
+
+**This is the third time the same structure has appeared** -- B2, B3, and now B1.
+A filter that looks sound in principle removes trades that are profitable in fact,
+and the capital has nowhere better to go. Worth stating as a standing test for any
+future gate proposal: **what do the trades it cuts actually return, and is there
+anything better to do with the slot?**
+
+### [RECOMMENDATION, NOT YET ADOPTED] A tiebreaker, not a filter
+
+When the book is full and two setups compete, prefer the one above its 2-year
+ceiling. Never skip a trade for failing it while a slot is free.
+
+This is a ranking use rather than a gate, and it has one attractive property: it
+sidesteps the unsolved candidate-selection problem (see `order_candidates`) because
+it only has to break ties, not order the whole book.
+
+**It is not adopted and must not be implemented yet.** Ranking is gate logic, and
+the Phase 2 freeze of 2026-09-25 covers it -- the carve-out is bugs, data faults
+and read-only instruments, not selection changes. This is a documented candidate
+for when the freeze lifts, and it needs the same treatment B2 got: a clean
+pre-registration (with bars calibrated against the null this time) and a full
+staged-pipeline run, because adding any selection rule changes downstream capital
+and slot allocation in ways a per-trade comparison cannot see.
+
+### Status and limits
+
+**Hypothesis-grade, not validated.** It emerged from a 25-cell sweep whose
+pre-registration was broken. The margin M matters less than it should -- +0.141 at
+M=0, +0.214 at both 0.05 and 0.10, then collapsing to +0.040 at 0.15 -- and a hump
+in parameter space is what overfitting looks like, though three adjacent cells
+agreeing and a clean reversal at 4-5 years is more structure than noise usually
+produces.
+
+Measured on the 1,404 opened trades, of which 1,214 have two years of prior
+history (86.5%).
+
+Artifacts: `B1_Clearance_PerTrade.csv` (clearance at all five horizons per trade),
+`B1_Clearance_Sweep.csv` (all 25 cells with every bar), `B1_Structure_FirstCut.csv`
+(the five proximity measures that found nothing).
+
+---
+
+## OPEN ITEMS -- revised 2026-10-16
+
+**The research backlog is now empty.** B1 through B6 are all closed: B2 and B3
+rejected on data, B4 dropped by decision, B5 built, B6 measured, B1 closed today.
+No open research question stands between here and simulated trading.
+
+**Two items are real work:**
+
+1. **Second data source.** The top item and the one actually blocking progress.
+   17 of 80 tickers carried a bar at 8:17pm Eastern on 2026-10-14; enough by
+   12:17am. Until that changes, no session can be processed the evening it
+   happens. This is a build.
+2. **Stop criterion for paper/live.** Dave has go-forward conditions
+   (forward-testing now, broker paper next, live at reduced size) and nothing that
+   says when to step BACK. A conversation, not code, and it belongs before paper
+   starts rather than during.
+
+[PLAN, Dave 2026-10-16] Both tomorrow, then the work turns to standing the system
+up in a simulated environment.
+
+**Everything else is bookkeeping:**
+
+3. pandas `FutureWarning` at `orchestrator.py:821` -- latent run-killer on upgrade,
+   ~20 minutes.
+4. No alert for a dead scheduler. The 2026-10-15 overdue alert catches a stuck
+   pipeline, not a scheduler that never fires; GitHub dropped two fires on
+   2026-10-14 alone. Needs something outside Actions.
+5. No `.gitignore`; `pull_report.csv` commit line; catch-up runs email only the
+   last session; the morning cron string duplicated between `on.schedule` and the
+   overdue step's guard.
+6. `state/last_emailed_date.txt` guard dormant in `send_summary_email.py` --
+   documented, harmless, left in place.
+7. Carried: `sim.py` live-vs-Claude comparison; replay equity discrepancy;
+   `SKIP_SCORE_THRESHOLD`, `ADR_CEILING_PCT` and `OVERHEAD_PROXIMITY_R` not
+   re-checked on the corrected 1,404-trade sample; Relative Strength v2 stability;
+   `research/` pushes outstanding.
+
+**Deferred to the end of the Phase 2 freeze:** the B1 2-year clearance tiebreaker
+(above), and any revisit of B4.
