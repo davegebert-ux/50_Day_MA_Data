@@ -6973,3 +6973,290 @@ up in a simulated environment.
 
 **Deferred to the end of the Phase 2 freeze:** the B1 2-year clearance tiebreaker
 (above), and any revisit of B4.
+
+---
+
+## 2026-10-17 -- [DECISION] STEP-BACK CRITERIA FOR PAPER AND LIVE
+
+The open item since 2026-10-13: Dave has go-forward conditions and nothing that
+says when to step BACK. Settled today, and the measurement came first because the
+useful version of this question is empirical.
+
+### What a bad stretch actually looks like
+
+Measured on the 1,404 trades, sequenced by exit date, at 1% risk per trade.
+
+| | |
+|---|---|
+| Worst drawdown in 9 years | **-28.5 R** (~28% of account) -- 241 days, 118 trades, recovered 30 days after the trough |
+| Drawdowns deeper than 5 R | **18** -- about two a year |
+| 90th percentile drawdown | -14.3 R |
+| 95th percentile | -16.9 R |
+| Longest losing streak | **12** straight non-winners; runs of 5+ happened 31 times, 7+ sixteen times |
+| Losing months | **33%** of all months; worst -15.9 R; 5 months worse than -10 R |
+| Worst 20-trade stretch | -18.5 R (best +79.4 R) |
+| Trades gapping through the -1R stop | 3.8%, averaging -1.89 R, worst -6.21 R |
+
+**The governing number: a single trade's standard deviation is 2.96 R against an
+edge of 0.594 R. Noise is five times the signal.**
+
+### The consequence, which is the whole decision
+
+**A P&L-based step-back trigger is close to useless in the short run.** A -14R
+drawdown is a once-a-year event in a strategy that made +833R. Set the trigger
+there and it fires annually on a system that is working.
+
+It takes roughly **67 trades -- about five months at the historical 153/year --
+to be 90% confident the edge is above zero at all**. Treat that as a floor: the
+placeable entry changes the population, and trades cluster rather than arriving
+independently.
+
+So the criteria are built around what IS detectable quickly, which is the machine
+rather than the money.
+
+### [DECISION] Three tiers
+
+**Tier 1 -- PROCESS. Immediate, no judgement, pause before the next trade.**
+Detectable in a single event.
+- A session not processed by 09:00 ET on the next trading day
+- Position state disagreeing with the broker
+- An exit that should have fired and did not
+- Any loss worse than -1R with no gap that explains it
+
+**Tier 2 -- FIDELITY. What paper trading is actually for.** Not profit --
+plumbing. Measurable over 10-20 trades.
+- Fill prices diverging from simulated beyond tolerance
+- Bids filling when the simulator says they should not, or missing when it says
+  they should, beyond the measured baseline
+- Exit timing off by more than one day
+
+**Tier 3 -- ENVELOPE. The only P&L triggers worth having**, because they sit
+outside everything observed in ten years.
+- Drawdown worse than **-28.5 R**
+- Losing streak longer than **12**
+- Rolling 50-trade sum worse than **-26.8 R**
+
+### [DECISION] Two properties of the response
+
+**Step back means HALVE SIZE, not stop.** A binary switch forces a decision the
+data cannot support. A ladder de-risks on ambiguous evidence without abandoning a
+system that may be fine.
+
+**Go-forward is trade-counted, not time-counted.** "A few weeks of seeing it
+execute as expected" is a calendar measure of a sample-size question; in a quiet
+stretch three weeks is four trades. The gate is Tier 2 clean over 20 trades.
+
+---
+
+## 2026-10-17 -- [CORRECTION] The Second Data Source Is Not the Blocker
+
+The 2026-10-15 entry called late data "the only route to processing a session the
+same evening" and the 2026-10-16 open items made it the top item, blocking
+simulated trading. **That was wrong, and the error was not asking why the same
+evening mattered.**
+
+It does not. The signal depends on the close, so no order can be placed the same
+day under any design. Under placeable orders:
+
+- Entry: bid computed from yesterday's values, resting limit for tomorrow
+- Exit: trail break seen on tonight's close, market-on-open order for tomorrow
+
+Both need the session processed **before the next open**, not before midnight.
+Observed processing lands between 00:17 and 08:17 ET. Even the morning safety net
+clears the 09:30 open by 73 minutes.
+
+**The requirement is nine hours looser than stated.** The second data source
+remains worth doing -- it protects the 08:17 case, which is tight, and a dropped
+morning fire would cost a day -- but it is a robustness item, not a gate.
+
+**What actually blocks the sim is that the orders are not placeable.** Addressed
+below.
+
+---
+
+## 2026-10-17 -- [DECISION] EXIT MECHANISM: `next_open` ADOPTED
+
+The 2026-10-13 study recommended it and the recommendation was never acted on.
+Adopted today.
+
+The trail fires on a CLOSE below the trail line and books the fill AT that close,
+which cannot be ordered. `next_open` detects the break on tonight's close and
+exits at tomorrow's open: +0.613 avgR against +0.594 for the unplaceable
+baseline, so it costs nothing and preserves the tail that `resting_stop` clips.
+
+Operationally: the hard stop stays a resting order at the broker; each evening the
+orchestrator names positions that closed below their trail; market-on-open orders
+go in that evening. No intraday attention and no 15:50 deadline.
+
+Not modelled: market-on-open slippage. Small for a universe requiring >1M average
+volume, not zero.
+
+---
+
+## 2026-10-17 -- [CLOSED FINDING] THE WALKING BID: PROJECT THE MA, DO NOT DISCOUNT IT
+
+### The problem
+
+`entry_price = SMA50(today) - 0.10 * ATR14(today)` and today's SMA50 includes
+today's close. Not knowable before the close, therefore not an order. Dave's
+proposal from 2026-10-13 -- project where the average will be and bid there --
+tested today against the alternatives.
+
+### The projection
+
+```
+MA50(i) = MA50(i-1) + (Close(i) - Close(i-50)) / 50
+```
+
+The only unknown is Close(i). **The bar dropping OUT is known exactly**, which is
+what makes this work. Assume Close(i) ~ Close(i-1) and every term is available at
+last night's close.
+
+**It is extremely accurate.** Against the real MA50, in ATR units:
+
+| | median error | mean abs error | 90th pct abs |
+|---|---|---|---|
+| yesterday's MA (the simple fix) | -0.0684 | 0.0712 | 0.1155 |
+| **projected MA** | **-0.0004** | **0.0134** | **0.0266** |
+
+Five times tighter and essentially unbiased. The knowability problem is solved.
+
+### Validation
+
+Re-simulating the 1,404 trades at entry = MA50 exactly reproduced the stored
+results to **max |diff| 0.0000, 100% exact**. Nothing below means anything without
+that anchor.
+
+### The sweep
+
+Fill model: resting limit, fills if Low <= bid, at min(bid, Open) -- so a gap-down
+open fills better than the bid.
+
+| rule | fill% | n | avgR | totalR |
+|---|---|---|---|---|
+| (anchor) entry AT the MA, assumed filled | 100.0% | 1404 | 0.594 | 833.5 |
+| A. backtest bid, UNPLACEABLE | 76.9% | 1080 | 0.899 | 971.0 |
+| B0. yesterday's MA | 81.3% | 1142 | 0.884 | 1009.5 |
+| B. yesterday's MA less 0.10 ATR | 63.4% | 890 | 1.021 | 908.8 |
+| **C. projected MA** | **98.9%** | **1389** | 0.801 | **1112.2** |
+| D. projected MA less 0.10 ATR | 78.1% | 1097 | 0.877 | 962.2 |
+| E. slope projection (secondary check) | 99.2% | 1393 | 0.797 | 1110.6 |
+| F. slope projection less 0.10 ATR | 78.2% | 1098 | 0.888 | 974.8 |
+
+Like-for-like, same fill model:
+
+```
+  C vs B0  (projection vs yesterday's value):   +102.7 R
+  C vs A   (projection vs the unplaceable bid): +141.2 R
+  C vs D   (at the projection vs 0.10 under):   +150.0 R
+```
+
+**[DECISION] Bid AT the projected MA. No discount.** This answers the question
+Dave asked directly: bidding 0.10 ATR under the projection costs 150 R. The
+discount raises avgR (0.877 vs 0.801) and lowers total R, by filling 78% instead
+of 99%. The same structure as B1, B2 and B3 -- a rule that improves the average by
+discarding profitable trades.
+
+The linear-slope projection (E/F) performs identically to the drop-out version.
+The drop-out form is kept because it is better founded, not because it measured
+better.
+
+### [CRITICAL] The 98.9% fill rate is partly circular, and hides a real risk
+
+The population is *touch days*, defined as `Low <= SMA50 <= High`. A bid at
+approximately the MA will therefore almost always fill **on that population**. The
+number is honest about what it says -- the walking bid captures essentially every
+setup the backtest found -- and it says nothing about days that were not touches.
+
+Live, the bid is placed before anyone knows whether the day becomes a touch.
+Scanned across all 1.58M ticker-days for the 722 tickers that produced trades:
+
+```
+  touch days                 200,053   (12.6% of days)
+  EXTRA fills, not touches   636,962   (40.3% of days)
+    entirely below the 50-day MA:  100% of them
+  -> 3.18 extra fills per genuine setup
+```
+
+**A standing bid at the projected MA would fill three times more often on
+knife-catches than on setups** -- days the stock traded wholly below its 50-day
+MA. The backtest never evaluated any of them.
+
+### The gate that fixes it, and what survives
+
+Bid only when **Close(i-1) > MA50(i-1)**. Known before the open, therefore
+placeable, and already the momentum screen's `price_above_50ma` condition.
+
+```
+  eligible touch days                     100,539
+  gap-down fills surviving the screen       7,420
+  -> 0.074 knife-catches per good setup
+  -> the screen removes 97.7% of the exposure
+```
+
+Simulated on a random 400 of those: **avgR -0.397, median -1.000, win 20.6%,
+worst -26.37 R.** Estimated drag if taken unfiltered: about -0.03 R per setup.
+Upper bound -- only the price-above-MA condition is applied here, and the full
+8-criterion screen cuts further.
+
+**The average is not the worry; the tail is.** A -26 R single trade is 26% of the
+account at 1% risk. Buying into an active breakdown has a left tail the normal
+setup population does not have, because the entry is into a stock already failing.
+Any live deployment wants a safeguard against filling far below the projection --
+the simplest being to skip a fill when the open is more than a set distance below
+the projected MA.
+
+### Limits
+
+Gate decisions are held fixed at the backtest's unplaceable touch test. A fully
+placeable system needs a placeable scan too; the 2026-10-13 measurement put that
+at 84.6% of touches surviving. Position sizing is not modelled here, so the R
+gains assume sizing to 1% risk is always possible -- `MAX_POSITION_COST_PCT =
+0.125` would clip some of it.
+
+Artifacts: `Walking_Bid_Comparison.csv` (all seven rules per trade, with fills,
+prices and projection error).
+
+---
+
+## OPEN ITEMS -- revised 2026-10-17
+
+**The path to simulated trading, in order:**
+
+1. **Implement placeable orders.** Both decided today, neither built.
+   - Exit: `next_open` in the orchestrator, market-on-open orders named each
+     evening.
+   - Entry: bid at the projected MA, gated on the prior close being above the 50,
+     with a gap safeguard.
+   This is the only thing standing between here and paper trading.
+2. **Placeable scan rule.** The touch test still uses today's SMA50. 84.6% of
+   touches survive a placeable version; the remaining gap needs closing or
+   accepting explicitly.
+3. **Stand up the paper account** and run Tier 2 fidelity for 20 trades.
+
+**Robustness, not blocking:**
+
+4. **Second data source.** Downgraded from top item (see the correction above).
+   Protects the 08:17 ET morning-net case, which clears the open by 73 minutes.
+5. **No alert for a dead scheduler.** Related: a dropped morning fire is the one
+   path that would miss the open.
+6. pandas `FutureWarning` at `orchestrator.py:821`.
+7. No `.gitignore`; `pull_report.csv` commit; catch-up runs email only the last
+   session; the cron string duplicated between `on.schedule` and the overdue
+   step's guard.
+8. `state/last_emailed_date.txt` guard dormant in `send_summary_email.py`.
+9. Carried: `sim.py` live-vs-Claude comparison; replay equity discrepancy;
+   `SKIP_SCORE_THRESHOLD`, `ADR_CEILING_PCT`, `OVERHEAD_PROXIMITY_R` not
+   re-checked on the corrected sample; Relative Strength v2 stability;
+   `research/` pushes outstanding.
+
+**Deferred to the end of the Phase 2 freeze:** the B1 2-year clearance
+tiebreaker; any revisit of B4.
+
+**Note on the freeze.** Today's two decisions change entry and exit mechanics,
+which the Phase 2 freeze of 2026-09-25 covers. They are carved out on the grounds
+that the freeze protects against tuning, and these are not tuning: the current
+rules describe orders that cannot be placed at all. Converting an unplaceable
+record into a placeable order is making the system real, not optimising it. The
+parameters themselves -- 0.10 ATR, the trail schedule, the thresholds -- are
+untouched, and the no-discount decision REMOVES a parameter rather than tuning it.
