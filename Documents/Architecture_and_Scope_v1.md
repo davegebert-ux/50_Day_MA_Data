@@ -7184,6 +7184,14 @@ MA. The backtest never evaluated any of them.
 
 ### The gate that fixes it, and what survives
 
+> **WRONG -- SUPERSEDED THE SAME EVENING. DO NOT IMPLEMENT THIS GATE.** Dave
+> questioned it immediately on the grounds that it is a one-day version of the
+> B2 filter, which was rejected because reclaims are the BETTER trades. He was
+> right: the gate costs 54% of all profit. The exposure it was meant to prevent
+> was also measured wrong here -- with the real screen applied it is not a cost
+> at all. Both corrected in the section that follows. The numbers below are left
+> standing because the error is instructive.
+
 Bid only when **Close(i-1) > MA50(i-1)**. Known before the open, therefore
 placeable, and already the momentum screen's `price_above_50ma` condition.
 
@@ -7226,8 +7234,10 @@ prices and projection error).
 1. **Implement placeable orders.** Both decided today, neither built.
    - Exit: `next_open` in the orchestrator, market-on-open orders named each
      evening.
-   - Entry: bid at the projected MA, gated on the prior close being above the 50,
-     with a gap safeguard.
+   - Entry: bid at the projected MA, no discount, NO prior-close gate and NO gap
+     safeguard -- both were measured and withdrawn the same evening; the screen
+     runs on yesterday's row with `price_above_50ma` dropped. See the correction
+     section at the end of this document.
    This is the only thing standing between here and paper trading.
 2. **Placeable scan rule.** The touch test still uses today's SMA50. 84.6% of
    touches survive a placeable version; the remaining gap needs closing or
@@ -7260,3 +7270,237 @@ rules describe orders that cannot be placed at all. Converting an unplaceable
 record into a placeable order is making the system real, not optimising it. The
 parameters themselves -- 0.10 ATR, the trail schedule, the thresholds -- are
 untouched, and the no-discount decision REMOVES a parameter rather than tuning it.
+
+---
+
+## 2026-10-17 (same evening) -- [CORRECTION] THE GATE WAS WRONG, AND THE EDGE IS THE FILL PRICE
+
+Written an hour after the section above, which recommended gating the walking bid
+on the prior close being above the 50. **That recommendation was wrong and is
+withdrawn.** Dave caught it within minutes of reading it:
+
+> *"In spirit, we kind of have a check for that anyway... but since we're
+> defining it slightly different, yeah, we probably need a more explicit check.
+> Otherwise, what did I miss?"*
+
+and then, on being asked, the thing neither of us had checked: the gate is a
+one-day version of the B2 filter, which this document rejected on 2026-10-12
+because reclaims are the better trades.
+
+### 1. The gate costs 54% of all profit
+
+Measured on the 1,389 filled trades under the walking bid:
+
+| | n | avgR | totalR | win |
+|---|---|---|---|---|
+| gate PASSES (prior close above the 50) | 947 | +0.538 | +509.4 | 51.8% |
+| gate BLOCKS (prior close below the 50) | **442** | **+1.364** | **+602.8** | **64.5%** |
+
+The gate forfeits **+602.8 R, 54.2% of the total**, to avoid an exposure then
+estimated at about -40 R. Note also that the trades it KEEPS average 0.538 R --
+*below* the 0.594 baseline. **Reclaims are not a tolerable subset of this
+strategy; they are the engine.** B2 said so in October and it did not register
+when the gate was proposed.
+
+This is the fourth appearance of the same pattern (B1, B2, B3, now this): a
+filter that is sound in principle removes the trades that actually pay.
+
+### 2. The gap safeguard inverts too
+
+The section above proposed skipping fills where the open sits far below the
+projection, on the reasoning that it means buying into a breakdown. The opposite
+is true:
+
+| skip if open is below the projection by | setups lost | R lost | avgR of those |
+|---|---|---|---|
+| 0.25 ATR | 236 | +409.2 | **+1.734** |
+| 0.50 ATR | 104 | +243.2 | **+2.339** |
+| 1.00 ATR | 17 | +32.9 | +1.935 |
+
+**Gapping down into the bid produces the best trades in the system.** There is
+nothing to safeguard against on this axis. The safeguard is withdrawn along with
+the gate.
+
+### 3. A market-on-close entry is NEGATIVE, and this is the deepest result
+
+If a resting bid cannot distinguish a reclaim from a knife-catch -- the
+difference is intraday recovery above the MA, unknowable at order time -- the
+obvious alternative is to decide late in the day, when the touch is already
+visible, and enter via a market-on-close order. Perfectly placeable, and it
+preserves setup selection exactly.
+
+| entry rule | fill | avgR | totalR |
+|---|---|---|---|
+| at the MA (anchor, unplaceable) | 100% | +0.594 | +833.5 |
+| **at the CLOSE (MOC, placeable)** | 100% | **-0.138** | **-193.5** |
+| resting bid at projected MA | 98.9% | +0.801 | +1112.2 |
+
+**The strategy is net negative if entered at the close.** A touch day closes a
+median **+0.367 ATR above** the MA, and **0% of touch days close below it** --
+necessarily, since the screen requires Close > SMA50.
+
+> **THE EDGE IS THE FILL PRICE, NOT THE SIGNAL.** It lives entirely in the
+> intraday dip to the 50-day MA. The screen, the score and the trail all operate
+> on a trade whose whole advantage is having bought the dip rather than the
+> close. Any execution mechanism that does not capture the dip does not capture
+> the strategy.
+
+This reframes what paper trading has to prove. Fidelity of FILL PRICE is not one
+check among several -- it is the check. A systematic fill a third of an ATR worse
+than simulated erases the edge entirely.
+
+### 4. The real knife-catch exposure: not a cost
+
+The -0.397 R / 3.18-per-setup figure in the section above was measured with no
+momentum screen beyond the price-above-MA condition -- effectively every day
+every stock sat below its 50. Re-measured through the **real 8-criterion screen**
+(`passes_momentum_screen`), run on yesterday's row, with only `price_above_50ma`
+dropped since keeping it is the rejected gate:
+
+```
+  qualifying setups                8,735
+  knife-catch fills                8,540    -> 0.98 per setup
+  simulated 499:  avgR +0.117   median -1.000   win 33.9%   worst -4.46
+```
+
+**Slightly positive, not negative.** The screen's other seven criteria -- trend
+stack, ADX band, volume, six-month performance -- already exclude the stocks that
+collapse through their 50 and keep going. What remains is roughly one extra fill
+per setup at about breakeven.
+
+**So no gate is required.** Not for safety and not for expectancy.
+
+### [DECISION] The placeable entry, final form
+
+1. Run the momentum screen on **yesterday's** row, dropping `price_above_50ma`.
+2. For each qualifying name, place a resting limit at the **projected MA**:
+   `MA50(i-1) + (Close(i-1) - Close(i-50))/50`. No discount.
+3. No prior-close gate. No gap safeguard. Take the fill.
+
+### What is still open on this
+
+- **Slot pressure. MEASURED, see the final section -- it is real.** Knife-catches
+  roughly DOUBLE the fill count at +0.020 R (full sample; the +0.117 here came
+  from a 499-trade sample and was optimistic) against +0.801 R for real setups.
+  They crowd out real setups at a cost of 9-40% of total R, and the design takes
+  average occupancy from 2.70-2.90 of 8 slots to 5.19. B6 found average occupancy of 2.70-2.90 of 8, so
+  there is room -- but doubling fills is exactly the condition that changes that,
+  and it is the one place the B1 tiebreaker logic would earn its keep.
+- **Pre-gate measurement.** The +0.117 R is measured before overhead resistance,
+  the ADR ceiling and the score threshold. Those gates would reshape the
+  knife-catch population, possibly favourably.
+- Both of these are what a **full staged-pipeline run** answers, and that run is
+  now required before implementation rather than after.
+
+### [PROCESS] Two bad recommendations in one session, caught by the user
+
+The gate and the gap safeguard were both proposed from reasoning about what
+*ought* to be risky -- buying a stock below its 50, buying into a gap -- without
+measuring either. Both were exactly backwards, and the document already contained
+the finding that would have predicted it (B2, nine days earlier).
+
+The 2026-10-15 process entry said a user's repeated observation outranks reasoning
+about code. The generalisation is wider: **in this strategy, intuitions about
+which trades are dangerous have now been wrong four times running, always in the
+same direction.** The uglier-looking setup keeps being the better one. Any future
+proposal to exclude a class of trade should be treated as probably wrong until
+measured, and measured BEFORE it reaches a recommendation rather than after.
+
+Artifacts: `Walking_Bid_Comparison.csv`, `Gate_And_Late_Entry_Test.csv`.
+
+---
+
+## 2026-10-17 (late) -- [FINDING] THE PLACEABLE DESIGN SATURATES THE BOOK, AND A RESTING BID CANNOT RATION SLOTS
+
+The slot-competition check that the previous section listed as "still open". It
+does not change the entry or exit decisions. It changes what has to be built
+alongside them.
+
+### The candidate set
+
+Full placeable design on the 722 trading tickers: screen on yesterday's row minus
+`price_above_50ma`, resting limit at the projected MA, `next_open` exits.
+
+| | n | avgR | totalR | win |
+|---|---|---|---|---|
+| touch setups | 8,728 | +0.322 | +2,809.4 | 41.4% |
+| knife-catches | 8,535 | **+0.020** | +173.3 | 31.0% |
+
+Knife-catches are **zero expectancy at full sample** -- the +0.117 R from the
+499-trade sample was optimistic. Both populations are PRE-GATE (no overhead
+resistance, ADR ceiling or score threshold), which is why touches read +0.322
+rather than the +0.801 measured on the gated 1,404.
+
+### Slot competition, 8 slots, one position per ticker
+
+Ordering when several candidates compete on one day is the variable, because that
+is exactly the `order_candidates` problem this document has carried as unsolved
+since 2026-09-14. Realistic pool = 27% of each population sampled, matching the
+rate at which the gates cut 5,165 touches to 1,404.
+
+| ordering | taken | totalR | touches taken | touch% of available |
+|---|---|---|---|---|
+| TOUCHES ONLY (unreachable ceiling) | 1,148 | **353.4** | 1,148 | 48.4% |
+| touch-first | 1,508 | 322.5 | 953 | 40.2% |
+| random | 1,523 | 286.1 | 769 | 32.4% |
+| knife-first (worst) | 1,567 | **211.8** | 603 | 25.4% |
+
+**Knife-catches crowd out real setups and it costs 9-40% of total R**, despite
+being individually harmless. A zero-expectancy trade that occupies a slot a good
+trade wanted is not free.
+
+### The finding that matters more
+
+```
+  placeable design:  mean occupancy 5.19 of 8   full 36.7% of days   empty 6.1%
+  current system:    mean occupancy 2.70-2.90   (B6, 2026-10-14)     empty ~25%
+```
+
+**The placeable design roughly doubles candidate flow and takes the book from
+comfortably under-used to saturated.** B6 concluded that supply, not capacity,
+was the binding constraint and that over-booking was close to a formality. That
+conclusion was measured on the OLD candidate flow. It does not survive this
+design, and the B6 recommendation of bidding 1.5x free slots needs re-deriving at
+the new flow before it is used.
+
+### And the structural problem: a resting bid cannot be rationed
+
+The current system decides **after the close**, with every candidate visible and
+explicit slot accounting -- `no_slot_available` and `skipped_no_capital` exist
+precisely because that decision is made with full information.
+
+A resting-bid design surrenders that. Bids go in the night before; whatever fills,
+fills. If twelve bids are working and nine fill on the same morning, nine
+positions open. There is no mechanism to decline the tenth in favour of a better
+candidate arriving the same day, because the fill already happened.
+
+**So bid rationing stops being an optimisation and becomes mandatory.** The only
+remaining control is WHICH bids get placed, decided the previous evening on the
+previous evening's information.
+
+That is placeable -- the score is computable on yesterday's data -- and it means
+the ranking problem is now load-bearing. The ordering column above spans 211.8 to
+353.4 R, a 67% range. **Ranking is now worth more than any gate discussed in this
+entire document**, including every one of B1 through B6.
+
+### [OPEN, AND NOW THE TOP ITEM] What has to be built before the sim
+
+1. **Score the full placeable candidate set** (17,263 fills) through
+   `score_total_v2` and the overhead-resistance check, so the gated population is
+   measured rather than approximated at 27%.
+2. **Re-derive the bid-rationing policy** at the new flow -- B6's 1.5x free slots
+   was calibrated on roughly half this candidate volume.
+3. **Solve, or at least improve, candidate ranking.** Previously parked as
+   theoretical. It is now the single highest-value open item in the project.
+
+### Limits of this test
+
+The 27% gate approximation assumes the gates are neutral between touches and
+knife-catches. They probably are not -- the score threshold plausibly cuts more
+knife-catches than touches, which would make the real picture better than shown
+here. That is what item 1 settles. Dollar capital is not modelled; with
+`MAX_POSITION_COST_PCT = 0.125` against 8 slots, slots and capital are roughly
+co-binding by design.
+
+Artifacts: `Placeable_Candidates.csv` (all 17,263 fills with dates, prices and R),
+`Walking_Bid_Comparison.csv`, `Gate_And_Late_Entry_Test.csv`.
