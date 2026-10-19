@@ -412,6 +412,45 @@ def check_open_positions_for_exits(open_df, target_date):
             still_open_rows.append(pos)
             continue
 
+        # ================================================================
+        # NEXT-OPEN TRAIL EXITS (2026-10-19)
+        #
+        # simulate_trail() books a trail exit AT the close of the day that
+        # breaks the line. Nobody can place that order: you cannot know the
+        # close breaks the line until the close has happened. Adopted
+        # 2026-10-13 and implemented here.
+        #
+        # ONLY the trail is translated. The hard stop at entry - 1R is
+        # already a resting order at the broker and fills intraday, so it
+        # needs no change -- translating it would be wrong, not safer.
+        #
+        # If the break lands on target_date itself there is no next bar yet,
+        # so the position stays OPEN and the next run books it. That is
+        # exactly what happens live: the break is seen after the bell, the
+        # market-on-open order goes in that evening, and it fills tomorrow.
+        # Self-correcting, and it needs no new state file.
+        #
+        # Cost: +0.613 avgR against +0.594 for the unplaceable baseline
+        # (2026-10-13, all 1,404 trades). It is free, and it preserves the
+        # right tail that a resting-stop exit clips.
+        # ================================================================
+        if result["exit_reason"].endswith("_trail"):
+            brk = df_upto_target.index[df_upto_target["Date"] ==
+                                       pd.Timestamp(result["exit_date"])]
+            if len(brk) == 0 or int(brk[0]) + 1 >= len(df_upto_target):
+                # No next bar yet -- the sell goes in tonight, fills tomorrow.
+                print(f"  {ticker}: trail broke {pd.Timestamp(result['exit_date']).date()}, "
+                      f"market-on-open sell queued for the next session")
+                still_open_rows.append(pos)
+                continue
+            nxt = df_upto_target.iloc[int(brk[0]) + 1]
+            fill = float(nxt["Open"])
+            result = dict(result)
+            result["exit_date"] = nxt["Date"]
+            result["exit_reason"] = result["exit_reason"] + "_next_open"
+            result["realized_R"] = round(
+                (fill - pos["entry_price"]) / pos["risk_per_share"], 3)
+
         # Trade closed -- append to closed log, do NOT keep in open positions
         exit_price = pos["entry_price"] + result["realized_R"] * pos["risk_per_share"]
         realized_pnl = result["realized_R"] * pos["risk_per_share"] * pos["shares"]
@@ -499,7 +538,40 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
     reimplementing the checks here.
     """
     from touch_scan_and_momentum_screen import (
-        wilder_adx, passes_momentum_screen, touched_50ma)
+        wilder_adx, passes_momentum_screen, touched_50ma,
+        momentum_screen_detail, screen_inputs_ready)
+
+    # ----------------------------------------------------------------
+    # PLACEABLE SCREEN (2026-10-19)
+    #
+    # The screen is now evaluated on the PRIOR bar, because the bid it
+    # authorises is placed that evening. One criterion is dropped:
+    # price_above_50ma (Close > SMA50).
+    #
+    # WHY IT IS DROPPED, and this is not a casual change: applied to the
+    # prior close it blocks every RECLAIM -- a name that sat below the 50
+    # yesterday and touches it today. Measured 2026-10-17 on the 1,389
+    # filled trades, reclaims are 442 trades at +1.364 avgR and 64.5% win,
+    # carrying +602.8 R, which is 54.2% of ALL profit. The trades the
+    # criterion keeps average +0.538 R, BELOW the 0.594 baseline.
+    #
+    # It is the same finding as B2 (2026-10-12), which rejected the
+    # multi-session version of this filter for the same reason. Keeping
+    # the criterion here would have quietly halved the system.
+    #
+    # Cost of dropping it: the watchlist now includes names below their
+    # 50, which produce "knife-catch" fills on days price never recovers
+    # above the MA. Measured through the full screen: 0.98 per setup at
+    # +0.020 avgR -- near-zero expectancy, not harmful per trade, but they
+    # do compete for slots. See the 2026-10-17 sections of
+    # Architecture_and_Scope_v1.md.
+    # ----------------------------------------------------------------
+    def passes_screen_placeable(row):
+        if not screen_inputs_ready(row):
+            return False
+        detail = momentum_screen_detail(row)
+        detail.pop("price_above_50ma", None)
+        return all(detail.values())
 
     target_date = pd.Timestamp(target_date)
     spy_df = sim.load_ticker(SPY_PATH) if os.path.exists(SPY_PATH) else None
@@ -568,20 +640,50 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
         df["Perf6mo"] = (df["Close"] / df["Close"].shift(126) - 1) * 100
         df["SMA50_prior5"] = df["SMA50"].shift(5)
 
-        row = df.iloc[-1]
+        # ================================================================
+        # PLACEABLE ENTRY (2026-10-19) -- read this before changing anything
+        # below it.
+        #
+        # THE RULE: everything that DECIDES the bid comes from the PRIOR
+        # bar, because the order is placed that evening. Only the FILL test
+        # touches today's bar, and only its Low and Open.
+        #
+        # What this replaces: the old code read today's row, tested
+        # Low <= SMA50(today) <= High for a touch, and set the bid from
+        # SMA50(today). Today's SMA50 includes today's close, so that bid
+        # could not be placed by anyone -- it needed the day to be over.
+        # Measured 2026-10-13: ~15% of the trade population does not exist
+        # under a placeable rule and fills drop from 77.1% to 64.7%.
+        #
+        # The touch test is GONE, and nothing replaces it. A resting limit
+        # either fills or it does not; "the range contained the MA" was
+        # only ever a proxy for that. The fill IS the signal.
+        # ================================================================
+        if len(df) < 52:
+            _log(funnel_rows, target_date, ticker, "insufficient_history")
+            continue
 
-        # REFACTORED 2026-09-14: this function used to re-implement the
-        # eight screen criteria inline, which is how the price_above_50ma
-        # fix reached the backtest on 2026-09-11 but not production until
-        # 2026-09-14. The screen now lives in exactly one place.
-        if not passes_momentum_screen(row):
+        prior = df.iloc[-2]      # last bar we had when the order went in
+        today = df.iloc[-1]      # the session being processed
+
+        if not passes_screen_placeable(prior):
             _log(funnel_rows, target_date, ticker, "momentum_screen")
             continue
 
-        touched = touched_50ma(row)
-        if not touched:
-            _log(funnel_rows, target_date, ticker, "no_50ma_touch")
+        # PROJECTED SMA50 for today, from last night's data.
+        #   SMA50(t) = SMA50(t-1) + (Close(t) - Close(t-50)) / 50
+        # The only unknown is Close(t); the bar dropping OUT is known
+        # exactly. Assuming Close(t) ~ Close(t-1) gives a projection whose
+        # median error against the real SMA50 is -0.0004 ATR, with mean
+        # absolute error 0.0134 ATR (2026-10-17, 1,404 trades). Five times
+        # tighter than simply reusing yesterday's SMA50, and unbiased.
+        sma50_prior = prior["SMA50"]
+        close_dropping_out = df["Close"].iloc[-51]
+        if pd.isna(sma50_prior) or pd.isna(close_dropping_out):
+            _log(funnel_rows, target_date, ticker, "insufficient_history")
             continue
+        projected_sma50 = (float(sma50_prior)
+                           + (float(prior["Close"]) - float(close_dropping_out)) / 50.0)
 
         # REORDERED 2026-09-14: entry price, ADR and risk-per-share are now
         # computed BEFORE the overhead-resistance check, because the v3
@@ -621,15 +723,30 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
         # dollars) and is already on df -- the same column the backtest used.
         # Do NOT recompute it here: a second implementation is exactly the
         # drift that put the momentum screen in two files for three days.
-        atr14_at_entry = row["ATR14"]
+        # CHANGED 2026-10-19: ATR and ADR now read the PRIOR bar. Both feed
+        # the order, so both must be knowable when the order is placed.
+        atr14_at_entry = prior["ATR14"]
         if pd.isna(atr14_at_entry) or atr14_at_entry <= 0:
             # No usable ATR means no defensible offset. Fail loudly into the
             # funnel rather than silently falling back to the MA, which would
             # make two different entry rules indistinguishable in the log.
             _log(funnel_rows, target_date, ticker, "no_atr_for_entry_bid")
             continue
-        entry_price = row["SMA50"] - ENTRY_BID_ATR_MULT * float(atr14_at_entry)
-        adr10_pct = ((df["High"] / df["Low"] - 1) * 100).rolling(10).mean().iloc[-1]
+
+        # The bid itself. ENTRY_BID_ATR_MULT is UNCHANGED at 0.10 and is
+        # deliberately still a parameter.
+        #
+        # A 2026-10-17 sweep found bidding AT the projection beats bidding
+        # under it by +150 R on TOTAL R. That is the wrong metric here and
+        # the comment above says why: this offset was adopted in the first
+        # place on the PORTFOLIO result, because at 8 slots total R counts
+        # trades the account could never have funded. The placeable design
+        # binds slots harder, not less -- average occupancy moves from
+        # 2.70-2.90 of 8 to 5.19 (2026-10-17) -- so the portfolio argument
+        # is stronger now than when it was made. Changing the offset wants
+        # its own portfolio test, not a total-R comparison.
+        entry_price = projected_sma50 - ENTRY_BID_ATR_MULT * float(atr14_at_entry)
+        adr10_pct = ((df["High"] / df["Low"] - 1) * 100).rolling(10).mean().iloc[-2]
 
         # ADDED 2026-09-19, with ENTRY_BID_ATR_MULT: a bid BELOW the MA is a
         # limit that may never fill. The setup was valid and we wanted it --
@@ -643,16 +760,32 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
         # from that, the offset is wrong for the current regime -- that is
         # the number this gate exists to expose.
         #
-        # NOTE this is same-day only, matching how the change was tested. A
-        # bid resting across multiple days was explicitly REJECTED as a
-        # measurement: it readmits the repeat-entry duplication Stage 6b
-        # removed. Do not "improve" this into a multi-day resting order
-        # without re-deriving the Stage 6b interaction first.
-        if ENTRY_BID_ATR_MULT > 0 and row["Low"] > entry_price:
+        # NOTE this is still SAME-DAY only: the bid is placed for one
+        # session and cancelled at the close. A bid resting across multiple
+        # days was explicitly REJECTED as a measurement: it readmits the
+        # repeat-entry duplication Stage 6b removed. Do not "improve" this
+        # into a multi-day resting order without re-deriving the Stage 6b
+        # interaction first.
+        #
+        # CHANGED 2026-10-19: the test is now unconditional. Under the old
+        # at-the-MA rule a zero offset meant the bid sat exactly on the MA
+        # and a touch guaranteed a fill, so the check was skipped when
+        # ENTRY_BID_ATR_MULT was 0. There is no touch test any more -- the
+        # bid is a projection and may miss at any offset including zero --
+        # so the fill must always be checked.
+        if float(today["Low"]) > entry_price:
             _log(funnel_rows, target_date, ticker, "bid_not_filled",
                  entry_price=round(float(entry_price), 4),
                  adr10_pct=None if pd.isna(adr10_pct) else round(float(adr10_pct), 4))
             continue
+
+        # FILL PRICE. A limit buy fills at the limit, or better if the stock
+        # opens below it -- a gap down through a resting bid fills at the
+        # open, not at the bid. Measured 2026-10-17: fills below the
+        # projection are the BEST trades in the sample (+2.3 avgR beyond
+        # 0.50 ATR below), which is why no gap safeguard is applied here.
+        # An earlier draft proposed one; it was measured and withdrawn.
+        entry_price = min(float(entry_price), float(today["Open"]))
 
         # ADDED 2026-09-14: volatility ceiling -- see ADR_CEILING_PCT above.
         if pd.isna(adr10_pct) or adr10_pct > ADR_CEILING_PCT:
@@ -671,8 +804,11 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
         # Overhead-resistance pre-watchlist screen (v3, proximity-based:
         # excludes only when an unresolved old high sits within
         # OVERHEAD_PROXIMITY_R above the entry).
+        # CHANGED 2026-10-19: evaluated as of the PRIOR bar. This decides
+        # whether to place the order, so it cannot see the session the
+        # order trades in.
         or_result = overhead_resistance_check(
-            df, target_date,
+            df, prior["Date"],
             entry_price=float(entry_price),
             risk_per_share=float(risk_per_share),
             proximity_R=OVERHEAD_PROXIMITY_R,
@@ -692,7 +828,9 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
                  risk_per_share=round(float(risk_per_share), 4),
                  adr10_pct=round(float(adr10_pct), 4))
             continue
-        score_result = scorecard.score_total_v2(df, target_date, spy_df)
+        # CHANGED 2026-10-19: scored as of the PRIOR bar, for the same
+        # reason as the overhead check -- the score gates the ORDER.
+        score_result = scorecard.score_total_v2(df, prior["Date"], spy_df)
         total_score = score_result.get("total_score_v2")
         if total_score is None or total_score < SKIP_SCORE_THRESHOLD:
             _log(funnel_rows, target_date, ticker, "score_below_threshold",
@@ -824,7 +962,8 @@ def order_candidates(signals, target_date):
 # ============================================================
 # STEP 4: OPEN NEW TRADES (dollar sizing off the STATIC account balance)
 # ============================================================
-def size_and_open_trades(signals, open_df, funnel_rows=None, target_date=None):
+def size_and_open_trades(signals, open_df, funnel_rows=None, target_date=None,
+                         max_new=None):
     """Size each signal under BOTH constraints and open the position.
 
     Two independent limits, added 2026-09-14 (see MAX_POSITION_COST_PCT):
@@ -860,8 +999,17 @@ def size_and_open_trades(signals, open_df, funnel_rows=None, target_date=None):
     # count. State the limit instead of inferring it.
     slots_used = len(open_df) if open_df is not None else 0
 
+    # ADDED 2026-10-19: max_new is how many bids could have been placed
+    # last night, counted before today's exits freed anything. It is the
+    # binding limit; the slot check below stays as a second guard so this
+    # function is still safe if called without it.
     new_rows = []
     for sig in signals:
+        if max_new is not None and len(new_rows) >= max_new:
+            print(f"  SKIPPED {sig['ticker']}: only {max_new} bid(s) could "
+                  f"have been placed last night")
+            _log(funnel_rows, target_date, sig["ticker"], "no_slot_available")
+            continue
         if slots_used + len(new_rows) >= MAX_CONCURRENT_POSITIONS:
             print(f"  SKIPPED {sig['ticker']}: all {MAX_CONCURRENT_POSITIONS} "
                   f"position slots in use")
@@ -1145,6 +1293,29 @@ def process_single_day(target_date):
 
     open_df = load_open_positions()
 
+    # ------------------------------------------------------------------
+    # BID-TIME SLOT COUNT (2026-10-19)
+    #
+    # Counted BEFORE exits are processed, and that ordering is the whole
+    # point. Orders go in the evening before, when the only thing known is
+    # how many slots were occupied at that night's close. A position that
+    # exits during the session frees a slot the bids could not have known
+    # about.
+    #
+    # The old code capped at fill time, after exits, which quietly let the
+    # system place more orders than it had room for and then keep the ones
+    # that happened to be convenient. A real resting bid cannot be taken
+    # back: if twelve are working and nine fill, nine positions open.
+    #
+    # This matters more under the placeable design than it did before --
+    # candidate flow roughly doubles and average occupancy moves from
+    # 2.70-2.90 of 8 to 5.19 (2026-10-17), so the cap now binds often
+    # rather than rarely.
+    # ------------------------------------------------------------------
+    slots_free_at_bid_time = max(0, MAX_CONCURRENT_POSITIONS - len(open_df))
+    print(f"  Slots free when tonight's bids would have gone in: "
+          f"{slots_free_at_bid_time} of {MAX_CONCURRENT_POSITIONS}")
+
     open_df = check_open_positions_for_exits(open_df, target_date)
 
     already_open_tickers = set(open_df["ticker"]) if len(open_df) else set()
@@ -1164,7 +1335,8 @@ def process_single_day(target_date):
 
     open_df = size_and_open_trades(signals, open_df,
                                    funnel_rows=funnel_rows,
-                                   target_date=target_date)
+                                   target_date=target_date,
+                                   max_new=slots_free_at_bid_time)
 
     save_open_positions(open_df)
     check_capital_committed(open_df)
