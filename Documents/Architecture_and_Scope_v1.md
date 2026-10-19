@@ -7152,7 +7152,19 @@ Like-for-like, same fill model:
 ```
 
 **[DECISION] Bid AT the projected MA. No discount.** This answers the question
-Dave asked directly: bidding 0.10 ATR under the projection costs 150 R. The
+Dave asked directly: bidding 0.10 ATR under the projection costs 150 R.
+
+> **REVERSED 2026-10-19. The discount STAYS at 0.10 ATR.** This decision was
+> made on TOTAL R, and the orchestrator's own comment at the
+> `ENTRY_BID_ATR_MULT` definition already explained why total R is the wrong
+> lens for exactly this question: the offset was adopted in the first place
+> *because* total R fell (+833 -> +781) while the PORTFOLIO result improved
+> (23.3% -> 26.9% CAGR), since at 8 slots total R counts trades the account
+> could never have funded. The 2026-10-17 slot work then showed the placeable
+> design binds slots HARDER, not less. So the one argument for dropping the
+> discount was the argument this project had already rejected, on the same
+> parameter, five weeks earlier. Found by reading the code before editing it.
+> See the 2026-10-19 sections. The
 discount raises avgR (0.877 vs 0.801) and lowers total R, by filling 78% instead
 of 99%. The same structure as B1, B2 and B3 -- a rule that improves the average by
 discarding profitable trades.
@@ -7504,3 +7516,285 @@ co-binding by design.
 
 Artifacts: `Placeable_Candidates.csv` (all 17,263 fills with dates, prices and R),
 `Walking_Bid_Comparison.csv`, `Gate_And_Late_Entry_Test.csv`.
+
+---
+
+## 2026-10-19 -- [BUILT] PLACEABLE ORDERS: THE SYSTEM NOW TRADES ORDERS THAT EXIST
+
+Decided 2026-10-17, built today. `orchestrator.py` 67,892 -> 91,707 bytes.
+
+### [DECISION, Dave] The backlog was being used to avoid the milestone
+
+Dave, on the "critical path" list from this morning:
+
+> *"I don't feel like I really understand these items. I want to just push
+> back -- are they really essential? What we're trying to do is move from a
+> development environment to a forward testing environment, and I'd like us
+> just to get there rather than continue to do minor improvements. This isn't
+> real money committed, so the stakes are very low."*
+
+He was right. Scoring the full 17,263-candidate set and re-deriving the bid
+rationing policy were listed as prerequisites. Neither is: both are
+improvements whose cheapest answer is to run the system and look. The only
+genuine blocker was that the orders could not be placed. Backlog reduced to
+that one item, and it was built the same day.
+
+### The four changes
+
+| | change | why |
+|---|---|---|
+| 1 | Screen runs on the PRIOR bar, `price_above_50ma` dropped | The criterion blocks reclaims, which carry 54% of profit (2026-10-17) |
+| 2 | Bid at the projected SMA50, less the unchanged 0.10 ATR | Today's SMA50 includes today's close and cannot be ordered |
+| 3 | Trail exits fill at the next open | `atr_sched_c_trail` books at the close, which nobody can order |
+| 4 | Slots counted BEFORE exits are processed | Orders go in the night before; a slot freed intraday was not knowable |
+
+**The touch test is gone and nothing replaces it.** A resting limit either
+fills or it does not; `Low <= SMA50 <= High` was only ever a proxy for that.
+The fill IS the signal.
+
+**Only the trail exit is translated.** The hard stop at entry - 1R is already
+a resting order that fills intraday. Translating it would be wrong, not safer.
+
+**The governing rule, stated in the code:** everything that DECIDES an order
+comes from the prior bar. Only the fill test touches the current session, and
+only its Low and Open.
+
+### [CORRECTION] The discount stays, and the codebase caught it
+
+Saturday's sweep found bidding at the projection beats bidding 0.10 ATR under
+it by +150 R and recommended dropping the offset. Reading
+`find_new_signals_for_date` before editing it surfaced the comment at the
+`ENTRY_BID_ATR_MULT` definition:
+
+> *"Total R FALLS (+833 -> +781) because the misses outweigh the quality
+> gain, so on total R alone this change would be rejected. It is adopted on
+> the PORTFOLIO result... at 8 slots the baseline already turns away ~300 of
+> 1,374 signals it cannot fund."*
+
+Total R was the exact metric the project had already rejected for this exact
+parameter. And the 2026-10-17 slot work strengthened the portfolio argument
+rather than weakening it: occupancy moves from 2.70-2.90 of 8 to 5.19.
+
+`ENTRY_BID_ATR_MULT` is unchanged at 0.10 and remains a parameter. The
+mechanism became placeable; the tuning value did not move.
+
+**The lesson is narrow and worth keeping:** a sweep run in a fresh session
+does not know which metrics this project has already disqualified. Reading
+the code around the thing being changed is not diligence, it is the only
+place some of those findings live.
+
+### Verification
+
+Four tests, in a sandbox holding a copy of the repo, 141 tickers and the real
+supporting modules.
+
+**No look-ahead -- the test that matters.** Day T's Close was multiplied by
+1.35 and its High by 1.60 on twelve tickers, leaving Low and Open alone since
+the fill test legitimately reads those. Bid, risk-per-share and score were
+identical to four decimals on all twelve. The order depends on nothing from
+the session it trades in.
+
+**Fill price.** `min(bid, Open)` confirmed on five tickers, gap-downs
+included: BCRX bid 10.5947, opened 10.1000, filled 10.1000.
+
+**Trail exit.** ADBE's trail broke 2026-08-10 -> position stayed open with the
+sell queued -> next run closed at the 08-11 open, 145.25, reason
+`atr_sched_c_trail_next_open`.
+
+**Hard stop untouched.** WYNN closed same-day at -1.0R, `initial_stop_entry_day`,
+not translated.
+
+---
+
+## 2026-10-19 -- [BUILT] THE NIGHTLY ORDER LIST
+
+Dave's goal is automated placement through TradersPost. The list is step one
+either way: whether a person or a machine places the orders, both work from
+the same file, so nothing here is thrown away when placement is automated.
+
+### What it produces
+
+`state/pending_orders.csv`, overwritten each run -- a standing instruction,
+not a log. Three order types:
+
+- `SELL_MOO` -- market-on-open, for positions whose trail broke today
+- `BUY_LIMIT` -- the day bids, with limit, shares and the protective stop
+- The stop rides ON the buy row rather than being its own order, because it
+  is only placed if the buy fills
+
+The daily email renders it FIRST, above everything else, because it is the
+only part of the mail that needs doing. Everything below reports what already
+happened.
+
+The email recomputes nothing. `shares_for()` was extracted so the order list
+and the fill evaluation size identically -- the number Dave types into the
+broker is literally the number the system books, from the same file.
+
+### `limit_order_placed`
+
+Dave's request, and a good one:
+
+> *"Can we make sure this goes into the daily funnel... just so I understand
+> it's something we're actively bidding on but haven't been filled yet."*
+
+A disposition, not a gate -- it records an order that WAS placed. It is dated
+**the session the order is FOR**, not the night it was written, so a bid and
+its outcome line up on the same date: one `limit_order_placed` row, then the
+next night either `opened` or `bid_not_filled` for that same ticker and date.
+Verified across a ten-session sandbox run: 14 of 15 bids had their outcome on
+the same date, the fifteenth being the one still pending.
+
+Also new: **`not_ordered`** -- a ticker that cleared every gate and whose bid
+price was reached, but which no order had been placed for, because the slot
+limit the night before meant it was never bid. It is the running cost of the
+8-slot cap, now visible. 23 of them across the test run.
+
+---
+
+## 2026-10-19 -- [TWO BUGS CAUGHT IN TESTING, BOTH WOULD HAVE SHIPPED]
+
+Neither was visible by reading the code. Both came out of running ten
+consecutive sessions and looking at what happened.
+
+### 1. The fill pass ignored the order list
+
+The first build wrote an order list each night and then, next session,
+rescanned the entire universe, reshuffled, and booked whichever candidates
+filled. On 2026-03-16 the sandbox told Dave to bid **ALB, FTI, PR** and then
+opened **PL, DD, MRK** -- three tickers it had never bid on.
+
+Entered by hand at a broker those two sets diverge on day one, and the whole
+point of the paper phase -- do my fills match the system's -- would have been
+meaningless from the first session.
+
+**Fix:** `load_pending_bids()`. If a bid list exists for the session, that list
+IS the set of things that can fill. A candidate the system never bid on cannot
+open, however good it looks in hindsight. Falls back to the full scan when no
+list applies -- the first run after this change, or a replay of a session
+whose orders were never written -- and SAYS SO in the log, because a silent
+fallback here would look exactly like working correctly.
+
+### 2. Bids were being spent on orders that could not fill
+
+With the fix in, the sandbox filled **2 of 16 bids**. The backtest expects
+65-77%.
+
+The cause is structural and was invisible until the system ran forward. The
+old flow applied the touch test BEFORE the slot cap, so the candidates
+competing for slots were already names sitting at their 50-day MA. There is no
+touch test any more -- it cannot be placeable -- so the screen alone passes
+names trading several ATRs above their MA, whose bid could not possibly be hit
+tomorrow. The date-seeded shuffle was spending the night's handful of orders
+on those, while the actual setups went unbid.
+
+**Fix:** order the nightly list by how far the bid sits below the last close,
+in ATRs. Closest first. Nothing is excluded, only ordered, so no candidate is
+unreachable on a day with slots to spare.
+
+**Fill rate went from 2 of 16 to 7 of 9**, inside the backtest's band.
+
+**This is NOT the ranking `order_candidates()` forbids**, and the distinction
+matters. That prohibition is about predicting which candidate will PERFORM
+better, and it stands untouched -- nothing here claims a nearer name is a
+better trade. This orders by whether an order can FILL AT ALL. A bid five ATRs
+below the market is not an order, it is a placeholder.
+
+### [PROCESS] Both bugs were behavioural, not logical
+
+The code compiled, the unit-level checks passed, and the no-look-ahead proof
+held. Both faults only appeared when ten sessions ran in sequence and the
+output was read as a trader would read it: *it told me to buy these three and
+bought those three instead*, and *why is almost nothing filling?*
+
+Adding to the standing lesson from 2026-10-11: checking the artefact rather
+than the account of it now extends to **running the thing forward and reading
+the result**, not only verifying that each part does what it says.
+
+---
+
+## 2026-10-19 -- [KNOWN GAP] GATES ARE RE-EVALUATED ON THE FILL DAY
+
+A bid can be placed one night and rejected the next morning by a gate that now
+reads differently. GTX did this twice in the sandbox: bid, then
+`overhead_resistance` the following session.
+
+Arguably wrong. Once an order is placed the gates have already been applied;
+re-applying them is a second veto the broker does not offer. If it fills, you
+own it.
+
+Roughly 13% of bids in a small sample. **Not fixed today** -- the fix is to
+skip the gates entirely for tickers on the order list and evaluate only the
+fill, which is a further restructuring of `find_new_signals_for_date`. Worth
+watching during the first paper week; if Dave's fills and the system's diverge,
+this is the first place to look.
+
+---
+
+## 2026-10-19 -- [PLAN] THE PAPER PHASE
+
+Agreed across the day's calls.
+
+1. **TradeStation simulated account, funded at $25,000** to match
+   `ACCOUNT_STARTING_BALANCE`.
+2. **Enter the orders by hand for about a week**, from the email, as day
+   orders. Short on purpose -- long enough to see the orders look right
+   before anything places them automatically.
+3. **Then TradersPost**, reading `state/pending_orders.csv`. Starting fresh;
+   not yet set up.
+4. **After 20 trades, run the Tier 2 fidelity check** from the 2026-10-17
+   step-back criteria: do the fills match what the system booked?
+
+**[DECISION] One strategy per paper account, and the 50-day system goes
+first.** Dave raised the risk of turning this and the Donchian strategy on
+together: *"That just sounds messy."* Agreed, and there is a concrete reason
+beyond tidiness -- the first fidelity check is whether the system's positions
+match the broker's, and that only works if the account holds nothing but the
+one strategy. The 50-day system goes first because it is running, tested and
+now produces an order list.
+
+---
+
+## OPEN ITEMS -- revised 2026-10-19
+
+**Paper phase, in order:**
+
+1. Open the TradeStation sim account at $25,000.
+2. Enter orders by hand for a week; watch the first email's order list closely.
+3. Tier 2 fidelity at 20 trades.
+4. TradersPost wiring.
+
+**Worth doing during the paper week:**
+
+5. **Gates re-evaluated on the fill day** (above). First suspect if fills
+   diverge.
+6. **Dead-scheduler alert.** Still the one failure mode that reaches Dave as
+   silence.
+7. **Disposition sheet is stale.** `no_50ma_touch` no longer fires;
+   `limit_order_placed` and `not_ordered` are new; `bid_not_filled` becomes
+   the main gate after `momentum_screen`. The sheet is a living artifact at
+   claude.ai/code/artifact/ac5ca4d0-9fc9-4369-8f14-73aeea41eae9 and is now
+   wrong in three places.
+
+**Improvements, explicitly NOT blocking (2026-10-19 decision):**
+
+8. Score the full 17,263 placeable candidates; re-derive bid rationing at the
+   new flow; candidate ranking. All three are now answerable by watching the
+   system run, which is cheaper than modelling them.
+9. pandas `FutureWarning` at `orchestrator.py:821`.
+10. Second data source.
+11. `.gitignore`; `pull_report.csv` commit; catch-up runs email only the last
+    session; the cron string duplicated between `on.schedule` and the overdue
+    step's guard.
+12. Carried: `sim.py` live-vs-Claude comparison; replay equity discrepancy;
+    thresholds not re-checked on the corrected sample; Relative Strength v2
+    stability; `research/` pushes.
+
+**Deferred to the end of the Phase 2 freeze:** the B1 2-year clearance
+tiebreaker; any revisit of B4.
+
+**Note on the freeze.** Today's build changes entry and exit mechanics, carved
+out on the same grounds as the 2026-10-17 decisions: the freeze guards against
+tuning, and converting an unplaceable record into a placeable order is making
+the system real rather than optimising it. No strategy parameter moved today --
+`ENTRY_BID_ATR_MULT` was explicitly left alone, against a sweep that argued for
+changing it.
