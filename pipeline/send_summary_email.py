@@ -38,6 +38,7 @@ STATE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 OPEN_POSITIONS_PATH = os.path.join(STATE_DIR, "open_positions.csv")
 CLOSED_TRADES_PATH = os.path.join(STATE_DIR, "closed_trades.csv")
 LAST_RUN_PATH = os.path.join(STATE_DIR, "last_run_date.txt")
+PENDING_ORDERS_PATH = os.path.join(STATE_DIR, "pending_orders.csv")
 
 # ----------------------------------------------------------------------
 # ONE EMAIL PER SESSION (added 2026-10-14)
@@ -119,6 +120,54 @@ def safe_read_csv(path):
     return df
 
 
+def build_orders_section():
+    """The actionable block: what to enter at the broker tonight."""
+    L = []
+    orders = safe_read_csv(PENDING_ORDERS_PATH)
+    if not len(orders):
+        L.append("ORDERS TO PLACE TONIGHT: none")
+        L.append("")
+        return L
+
+    for_session = str(orders["for_session"].iloc[0])
+    sells = orders[orders["order_type"] == "SELL_MOO"]
+    buys = orders[orders["order_type"] == "BUY_LIMIT"]
+
+    L.append("=" * 72)
+    L.append(f"ORDERS TO PLACE TONIGHT  --  for the {for_session} session")
+    L.append("=" * 72)
+    L.append("")
+
+    L.append(f"SELL, market-on-open ({len(sells)}):")
+    if len(sells):
+        for _, r in sells.iterrows():
+            L.append(f"    {str(r['ticker']):<7}{int(r['shares']):>7} shares"
+                     f"     ({r['note']})")
+    else:
+        L.append("    (none)")
+    L.append("")
+
+    L.append(f"BUY, limit -- DAY ORDERS, good for {for_session} only ({len(buys)}):")
+    if len(buys):
+        L.append(f"    {'ticker':<8}{'limit':>9}{'shares':>8}{'stop':>9}"
+                 f"{'cost':>11}{'score':>7}")
+        total = 0.0
+        for _, r in buys.iterrows():
+            total += float(r["position_cost"])
+            L.append(f"    {str(r['ticker']):<8}{float(r['limit_price']):>9.2f}"
+                     f"{int(r['shares']):>8}{float(r['stop_price']):>9.2f}"
+                     f"{float(r['position_cost']):>11,.2f}{float(r['score']):>7.1f}")
+        L.append("")
+        L.append(f"    Capital committed if every bid fills: {total:,.2f}")
+        L.append("    The stop is NOT placed now -- enter it only if the buy fills.")
+    else:
+        L.append("    (none)")
+    L.append("")
+    L.append("=" * 72)
+    L.append("")
+    return L
+
+
 def build_summary_body(target_date):
     open_df = safe_read_csv(OPEN_POSITIONS_PATH)
     closed_df = safe_read_csv(CLOSED_TRADES_PATH)
@@ -130,6 +179,28 @@ def build_summary_body(target_date):
     lines.append(f"Scorecard Daily Summary -- {target_date}")
     lines.append("=" * 50)
     lines.append("")
+
+    # ------------------------------------------------------------------
+    # ORDERS TO PLACE TONIGHT (added 2026-10-19)
+    #
+    # FIRST in the mail, because it is the only part that needs doing.
+    # Everything below it is a report on what already happened.
+    #
+    # Read straight from state/pending_orders.csv, which orchestrator.py
+    # writes at the end of each run. This script does not recompute
+    # anything: the share count Dave types into the broker is the one the
+    # system booked, because it is literally the same number from the same
+    # file. When placement is automated, the automation reads that file
+    # too, so this section and the robot never disagree.
+    #
+    # Wrapped, like the P&L block: a missing or malformed order file costs
+    # a section of the mail, never the mail.
+    # ------------------------------------------------------------------
+    try:
+        lines.extend(build_orders_section())
+    except Exception as e:
+        lines.append(f"ORDERS: could not be read ({type(e).__name__}: {e})")
+        lines.append("")
 
     lines.append(f"NEW TRADES OPENED TODAY ({len(new_trades)}):")
     if len(new_trades):

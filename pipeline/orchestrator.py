@@ -74,6 +74,15 @@ os.makedirs(_STATE_DIR, exist_ok=True)
 OPEN_POSITIONS_PATH = os.path.join(_STATE_DIR, "open_positions.csv")
 CLOSED_TRADES_PATH = os.path.join(_STATE_DIR, "closed_trades.csv")
 LAST_RUN_PATH = os.path.join(_STATE_DIR, "last_run_date.txt")
+# ADDED 2026-10-19: the orders to place TONIGHT for the next session.
+# Overwritten each run -- it is a standing instruction, not a log. The
+# daily email renders it, and when order placement is automated the same
+# file is what gets submitted, so nothing here is throwaway.
+PENDING_ORDERS_PATH = os.path.join(_STATE_DIR, "pending_orders.csv")
+PENDING_ORDERS_COLUMNS = [
+    "for_session", "order_type", "ticker", "limit_price", "shares",
+    "stop_price", "risk_per_share", "position_cost", "score", "note",
+]
 
 SKIP_SCORE_THRESHOLD = 2.5  # MVP decision -- see Conviction_Sizing_Model_v3.md
 
@@ -205,6 +214,21 @@ FUNNEL_GATES = [
     "score_below_threshold",
     "no_slot_available",    # fired in size_and_open_trades(), not the scan
 ]
+# DISPOSITIONS (the other column) -- what happened to a ticker that was NOT
+# dropped: "opened", "skipped_zero_shares", "skipped_no_capital", and from
+# 2026-10-19 "limit_order_placed".
+#
+# "not_ordered" (2026-10-19) marks a ticker that cleared every gate and
+# whose bid price was reached, but which no order had been placed for --
+# the slot limit the night before meant it was never bid on. It is the
+# honest record of what the slot cap costs, and it is NOT a rejection by
+# the strategy.
+#
+# limit_order_placed is not a rejection. It records a bid that WAS placed
+# and is waiting on the next session. It is dated the session the order is
+# FOR, not the night it was written, so a bid and its outcome line up on
+# the same date: one "limit_order_placed" row, then the next night either
+# "opened" or "bid_not_filled" for that same ticker and date.
 
 OPEN_POSITIONS_COLUMNS = [
     "ticker", "entry_date", "entry_price", "risk_per_share",
@@ -367,7 +391,7 @@ def set_last_run_date(date):
 # ============================================================
 # STEP 1: CHECK OPEN POSITIONS FOR EXITS (as of target_date)
 # ============================================================
-def check_open_positions_for_exits(open_df, target_date):
+def check_open_positions_for_exits(open_df, target_date, queued_exits=None):
     """
     For every currently-open position, re-run sim.simulate_trail() from
     the original entry point against updated price data, and see whether
@@ -441,6 +465,13 @@ def check_open_positions_for_exits(open_df, target_date):
                 # No next bar yet -- the sell goes in tonight, fills tomorrow.
                 print(f"  {ticker}: trail broke {pd.Timestamp(result['exit_date']).date()}, "
                       f"market-on-open sell queued for the next session")
+                if queued_exits is not None:
+                    queued_exits.append({
+                        "ticker": ticker,
+                        "shares": pos["shares"],
+                        "reason": result["exit_reason"],
+                        "broke_on": pd.Timestamp(result["exit_date"]).date(),
+                    })
                 still_open_rows.append(pos)
                 continue
             nxt = df_upto_target.iloc[int(brk[0]) + 1]
@@ -521,7 +552,8 @@ def setup_has_reset(df, exit_date, target_date):
     return False
 
 
-def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=None):
+def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=None,
+                              mode="fill"):
     """
     Evaluates ONLY target_date as a possible touch event per ticker (still
     loading whatever trailing history is needed to compute the moving
@@ -663,8 +695,18 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
             _log(funnel_rows, target_date, ticker, "insufficient_history")
             continue
 
-        prior = df.iloc[-2]      # last bar we had when the order went in
-        today = df.iloc[-1]      # the session being processed
+        # mode="fill"  -- evaluate the orders placed LAST night against the
+        #                 session being processed. prior = T-1, today = T.
+        # mode="order" -- generate the orders to place TONIGHT, for the next
+        #                 session. prior = T, and there is no "today" yet,
+        #                 so no fill test. Same code path deliberately: the
+        #                 bid you are told to place and the bid that is
+        #                 later scored against must be the same arithmetic,
+        #                 and the momentum-screen incident above is what a
+        #                 second implementation costs.
+        k = 1 if mode == "fill" else 0
+        prior = df.iloc[-(1 + k)]
+        today = df.iloc[-1] if mode == "fill" else None
 
         if not passes_screen_placeable(prior):
             _log(funnel_rows, target_date, ticker, "momentum_screen")
@@ -678,7 +720,7 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
         # absolute error 0.0134 ATR (2026-10-17, 1,404 trades). Five times
         # tighter than simply reusing yesterday's SMA50, and unbiased.
         sma50_prior = prior["SMA50"]
-        close_dropping_out = df["Close"].iloc[-51]
+        close_dropping_out = df["Close"].iloc[-(50 + k)]
         if pd.isna(sma50_prior) or pd.isna(close_dropping_out):
             _log(funnel_rows, target_date, ticker, "insufficient_history")
             continue
@@ -746,7 +788,7 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
         # is stronger now than when it was made. Changing the offset wants
         # its own portfolio test, not a total-R comparison.
         entry_price = projected_sma50 - ENTRY_BID_ATR_MULT * float(atr14_at_entry)
-        adr10_pct = ((df["High"] / df["Low"] - 1) * 100).rolling(10).mean().iloc[-2]
+        adr10_pct = ((df["High"] / df["Low"] - 1) * 100).rolling(10).mean().iloc[-(1 + k)]
 
         # ADDED 2026-09-19, with ENTRY_BID_ATR_MULT: a bid BELOW the MA is a
         # limit that may never fill. The setup was valid and we wanted it --
@@ -773,7 +815,7 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
         # ENTRY_BID_ATR_MULT was 0. There is no touch test any more -- the
         # bid is a projection and may miss at any offset including zero --
         # so the fill must always be checked.
-        if float(today["Low"]) > entry_price:
+        if mode == "fill" and float(today["Low"]) > entry_price:
             _log(funnel_rows, target_date, ticker, "bid_not_filled",
                  entry_price=round(float(entry_price), 4),
                  adr10_pct=None if pd.isna(adr10_pct) else round(float(adr10_pct), 4))
@@ -785,7 +827,8 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
         # projection are the BEST trades in the sample (+2.3 avgR beyond
         # 0.50 ATR below), which is why no gap safeguard is applied here.
         # An earlier draft proposed one; it was measured and withdrawn.
-        entry_price = min(float(entry_price), float(today["Open"]))
+        if mode == "fill":
+            entry_price = min(float(entry_price), float(today["Open"]))
 
         # ADDED 2026-09-14: volatility ceiling -- see ADR_CEILING_PCT above.
         if pd.isna(adr10_pct) or adr10_pct > ADR_CEILING_PCT:
@@ -841,9 +884,15 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
                  score=total_score)
             continue
 
+        # ADDED 2026-10-19: how far the last close sits above the bid, in
+        # ATRs. Used to order the nightly bid list -- see write_pending_orders.
+        _dist = ((float(prior["Close"]) - float(entry_price)) / float(atr14_at_entry)
+                 if atr14_at_entry else float("inf"))
+
         signals.append({
             "ticker": ticker,
             "entry_date": target_date,
+            "distance_to_bid_atr": round(_dist, 3),
             "entry_price": round(float(entry_price), 4),
             "risk_per_share": round(float(risk_per_share), 4),
             "score_at_entry": total_score,
@@ -962,6 +1011,28 @@ def order_candidates(signals, target_date):
 # ============================================================
 # STEP 4: OPEN NEW TRADES (dollar sizing off the STATIC account balance)
 # ============================================================
+def shares_for(entry_price, risk_per_share):
+    """Share count under BOTH caps, and which one bound.
+
+    Extracted 2026-10-19 so the nightly order list and the fill evaluation
+    size identically. They must: the share count printed in tonight's email
+    is the one Dave types into the broker, and the one the system books
+    tomorrow. Two implementations would drift, which is precisely what the
+    momentum screen did for three days in September.
+    """
+    dollar_risk = parameters.ACCOUNT_STARTING_BALANCE * parameters.RISK_PERCENT_PER_TRADE
+    max_cost = parameters.ACCOUNT_STARTING_BALANCE * MAX_POSITION_COST_PCT
+    by_risk = int(dollar_risk / risk_per_share) if risk_per_share > 0 else 0
+    by_cost = int(max_cost / entry_price) if entry_price > 0 else 0
+    if by_cost < by_risk:
+        constraint = "cost"
+    elif by_risk < by_cost:
+        constraint = "risk"
+    else:
+        constraint = "both"
+    return min(by_risk, by_cost), constraint
+
+
 def size_and_open_trades(signals, open_df, funnel_rows=None, target_date=None,
                          max_new=None):
     """Size each signal under BOTH constraints and open the position.
@@ -1015,16 +1086,7 @@ def size_and_open_trades(signals, open_df, funnel_rows=None, target_date=None,
                   f"position slots in use")
             _log(funnel_rows, target_date, sig["ticker"], "no_slot_available")
             continue
-        shares_by_risk = int(dollar_risk_per_trade / sig["risk_per_share"]) if sig["risk_per_share"] > 0 else 0
-        shares_by_cost = int(max_position_cost / sig["entry_price"]) if sig["entry_price"] > 0 else 0
-        shares = min(shares_by_risk, shares_by_cost)
-
-        if shares_by_cost < shares_by_risk:
-            constraint = "cost"
-        elif shares_by_risk < shares_by_cost:
-            constraint = "risk"
-        else:
-            constraint = "both"
+        shares, constraint = shares_for(sig["entry_price"], sig["risk_per_share"])
 
         # A signal can size to zero shares if one share alone would exceed
         # the cost cap (a very high-priced stock). Skip rather than open a
@@ -1316,7 +1378,11 @@ def process_single_day(target_date):
     print(f"  Slots free when tonight's bids would have gone in: "
           f"{slots_free_at_bid_time} of {MAX_CONCURRENT_POSITIONS}")
 
-    open_df = check_open_positions_for_exits(open_df, target_date)
+    # Collected so tonight's order list can carry the market-on-open sells
+    # alongside the bids -- one file, one place to look.
+    queued_exits = []
+    open_df = check_open_positions_for_exits(open_df, target_date,
+                                             queued_exits=queued_exits)
 
     already_open_tickers = set(open_df["ticker"]) if len(open_df) else set()
 
@@ -1327,11 +1393,41 @@ def process_single_day(target_date):
     signals = find_new_signals_for_date(target_date, already_open_tickers,
                                         funnel_rows=funnel_rows)
 
-    # ADDED 2026-09-15: order candidates before sizing. Nothing tested
-    # predicts which candidate to prefer, so this is a date-seeded
-    # shuffle -- arbitrary, but without alphabetical's standing bias
-    # toward early-alphabet tickers. See order_candidates().
-    signals = order_candidates(signals, target_date)
+    # ------------------------------------------------------------------
+    # ONLY ORDERS THAT WERE ACTUALLY PLACED CAN FILL (2026-10-19)
+    #
+    # If last night wrote a bid list for this session, that list IS the
+    # set of things that could have filled. A candidate the system never
+    # bid on cannot open, however good it looks in hindsight.
+    #
+    # Falls back to the full scan when no list applies -- the first run
+    # after this change, or a replay of a session whose orders were never
+    # written -- and says so, because a silent fallback here would look
+    # exactly like working correctly.
+    # ------------------------------------------------------------------
+    pending = load_pending_bids(target_date)
+    if pending is None:
+        print("  No bid list for this session (first run under the new rules, "
+              "or a replay) -- evaluating the full candidate scan instead.")
+        # ADDED 2026-09-15: order candidates before sizing. Nothing tested
+        # predicts which candidate to prefer, so this is a date-seeded
+        # shuffle -- arbitrary, but without alphabetical's standing bias
+        # toward early-alphabet tickers. See order_candidates().
+        signals = order_candidates(signals, target_date)
+    else:
+        bid_on = [s for s in signals if s["ticker"] in pending]
+        for s_ in signals:
+            if s_["ticker"] not in pending:
+                _log(funnel_rows, target_date, s_["ticker"], None, "not_ordered",
+                     entry_price=s_["entry_price"],
+                     risk_per_share=s_["risk_per_share"],
+                     adr10_pct=s_.get("adr10_pct"),
+                     overhead_R=s_.get("overhead_R"),
+                     score=s_["score_at_entry"])
+        # Keep last night's ordering; it is the order the bids went in.
+        signals = sorted(bid_on, key=lambda x: pending[x["ticker"]])
+        print(f"  Bid list for {pd.Timestamp(target_date).date()}: "
+              f"{len(pending)} order(s) placed, {len(signals)} filled")
 
     open_df = size_and_open_trades(signals, open_df,
                                    funnel_rows=funnel_rows,
@@ -1340,6 +1436,24 @@ def process_single_day(target_date):
 
     save_open_positions(open_df)
     check_capital_committed(open_df)
+
+    # ------------------------------------------------------------------
+    # TONIGHT'S ORDERS (2026-10-19)
+    #
+    # Runs AFTER the book is settled, so free slots and available capital
+    # are the real end-of-session numbers.
+    #
+    # Wrapped for the same reason the equity curve is: this is a reporting
+    # and instruction artefact, and a failure to produce it must never
+    # take down a session that otherwise completed. If it fails, the
+    # session is still correct and the email simply has no order list.
+    # ------------------------------------------------------------------
+    try:
+        write_pending_orders(target_date, open_df, queued_exits, funnel_rows)
+    except Exception as e:
+        print(f"  Order list failed ({type(e).__name__}: {e}) -- continuing; "
+              f"the session itself is complete.")
+
     append_funnel_rows(funnel_rows)
 
     # ------------------------------------------------------------------
@@ -1428,6 +1542,168 @@ def load_market_open_dates():
     cal = pd.read_csv(MARKET_CALENDAR_PATH, parse_dates=["date"])
     open_days = cal[cal["market_open"] == True]["date"]
     return set(open_days)
+
+
+def load_pending_bids(target_date):
+    """The BUY_LIMIT orders written last night FOR target_date, in the order
+    they were listed, or None if there is no list for this session.
+
+    WHY THIS EXISTS (2026-10-19). Without it the system tells Dave to place
+    three specific bids and then, next session, rescans the whole universe,
+    reshuffles, and books whichever three happened to fill. Caught in the
+    sandbox on 2026-03-16: the order list said ALB, FTI, PR and the run
+    opened PL, DD, MRK. Entered by hand at a broker those two sets diverge
+    on day one, and the fidelity check -- do my fills match the system's --
+    becomes meaningless.
+
+    A real resting order can only fill if it was placed. This enforces that.
+
+    Returns None (not an empty dict) when no list applies, which is the
+    signal to fall back to the full scan. That happens in exactly two
+    legitimate cases: the first run after this change, and a catch-up
+    replay of a session whose orders were never written. Both are logged.
+    """
+    if not os.path.exists(PENDING_ORDERS_PATH):
+        return None
+    try:
+        po = pd.read_csv(PENDING_ORDERS_PATH)
+    except Exception as e:
+        print(f"  Could not read pending orders ({e}) -- falling back to the "
+              f"full scan for this session.")
+        return None
+    if not len(po) or "for_session" not in po.columns:
+        return None
+    tgt = pd.Timestamp(target_date).date().isoformat()
+    mine = po[(po["for_session"].astype(str) == tgt) &
+              (po["order_type"] == "BUY_LIMIT")]
+    if not len(mine):
+        # A list exists but is for another session -- it says nothing about
+        # this one, so it must not be treated as "no bids were placed".
+        if str(po["for_session"].iloc[0]) != tgt:
+            return None
+        return {}          # list IS for today and genuinely held no bids
+    return {str(r["ticker"]): i for i, (_, r) in enumerate(mine.iterrows())}
+
+
+def write_pending_orders(target_date, open_df, queued_exits, funnel_rows=None):
+    """Write the orders to place TONIGHT, for the next session.
+
+    This is the piece that turns the system from a record of what would
+    have happened into something that can actually be traded. Everything
+    here is decided on data through target_date's close, because that is
+    all that exists when the orders go in.
+
+    Three kinds of order:
+      SELL_MOO   -- market-on-open, for positions whose trail broke today
+      BUY_LIMIT  -- the day bids, at the projected 50-day MA less the offset
+      (the protective stop is carried ON the BUY_LIMIT row rather than
+       being its own order, because it is only placed if the buy fills)
+
+    Capital is reserved bid by bid as the list is built. Queued SELL_MOOs
+    will free capital tomorrow, but deliberately are NOT counted: that
+    money is not available until the sell actually fills, and sizing
+    against it would be sizing against a forecast.
+    """
+    for_session = next_trading_day(target_date)
+    if for_session is None:
+        print("  No next trading day in the calendar -- no orders written.")
+        return
+
+    rows = []
+    for q in (queued_exits or []):
+        rows.append({
+            "for_session": for_session.date().isoformat(),
+            "order_type": "SELL_MOO", "ticker": q["ticker"],
+            "limit_price": "", "shares": q["shares"], "stop_price": "",
+            "risk_per_share": "", "position_cost": "", "score": "",
+            "note": f"trail broke {q['broke_on']}",
+        })
+
+    free = max(0, MAX_CONCURRENT_POSITIONS - len(open_df))
+    already = set(open_df["ticker"]) if len(open_df) else set()
+    committed = open_df["position_cost"].sum() if len(open_df) else 0.0
+    capital = parameters.ACCOUNT_STARTING_BALANCE - committed
+
+    placed = 0
+    if free > 0:
+        sigs = find_new_signals_for_date(target_date, already,
+                                         funnel_rows=None, mode="order")
+
+        # ------------------------------------------------------------------
+        # ORDER THE LIST BY REACHABILITY, NOT BY SHUFFLE (2026-10-19)
+        #
+        # The old flow tested for a touch BEFORE the slot cap, so the
+        # candidates competing for slots were already names sitting at their
+        # 50-day MA. There is no touch test any more -- it cannot be
+        # placeable -- so the screen alone passes names trading far above
+        # their MA, whose bid could not possibly be hit tomorrow.
+        #
+        # Measured in the sandbox before this change: 2 fills from 16 bids.
+        # The shuffle was spending the night's handful of orders on names
+        # several ATRs away from the bid while the actual setups went unbid.
+        #
+        # THIS IS NOT A RANKING IN THE SENSE order_candidates() FORBIDS.
+        # That prohibition is about predicting which candidate will PERFORM
+        # better, and it still stands -- nothing here claims a close name is
+        # a better trade. This orders by whether the order can FILL AT ALL. A
+        # bid five ATRs below the market is not an order, it is a placeholder.
+        #
+        # Nothing is excluded, only ordered, so no candidate is unreachable
+        # on a day with slots to spare.
+        # ------------------------------------------------------------------
+        sigs = sorted(sigs, key=lambda x: (x.get("distance_to_bid_atr", float("inf")),
+                                           x["ticker"]))
+        for sig in sigs:
+            if placed >= free:
+                break
+            shares, constraint = shares_for(sig["entry_price"], sig["risk_per_share"])
+            if shares <= 0:
+                continue
+            cost = round(shares * sig["entry_price"], 2)
+            if cost > capital:
+                continue
+            capital -= cost
+            stop = round(sig["entry_price"] - sig["risk_per_share"], 4)
+            rows.append({
+                "for_session": for_session.date().isoformat(),
+                "order_type": "BUY_LIMIT", "ticker": sig["ticker"],
+                "limit_price": round(sig["entry_price"], 2),
+                "shares": shares, "stop_price": round(stop, 2),
+                "risk_per_share": sig["risk_per_share"],
+                "position_cost": cost, "score": sig["score_at_entry"],
+                "note": f"day order; {sig.get('distance_to_bid_atr', '?')} ATR "
+                        f"below last close; sized by {constraint}",
+            })
+            _log(funnel_rows, for_session, sig["ticker"], None,
+                 "limit_order_placed",
+                 entry_price=round(sig["entry_price"], 4),
+                 risk_per_share=sig["risk_per_share"],
+                 adr10_pct=sig.get("adr10_pct"),
+                 overhead_R=sig.get("overhead_R"),
+                 score=sig["score_at_entry"], shares=shares,
+                 position_cost=cost, sizing_constraint=constraint)
+            placed += 1
+
+    pd.DataFrame(rows, columns=PENDING_ORDERS_COLUMNS).to_csv(
+        PENDING_ORDERS_PATH, index=False)
+    n_sell = sum(1 for r in rows if r["order_type"] == "SELL_MOO")
+    print(f"  Orders for {for_session.date()}: {placed} limit bid(s) "
+          f"({free} slot(s) free), {n_sell} market-on-open sell(s) "
+          f"-> state/pending_orders.csv")
+
+
+def next_trading_day(after):
+    """The next session the market is open after `after`, or None if the
+    static calendar has run out (it covers 2026-2029 -- see
+    load_market_open_dates)."""
+    try:
+        opens = sorted(d for d in load_market_open_dates()
+                       if pd.Timestamp(d) > pd.Timestamp(after))
+    except Exception as e:
+        print(f"  Could not read the market calendar ({e}) -- cannot date "
+              f"tonight's orders.")
+        return None
+    return pd.Timestamp(opens[0]) if opens else None
 
 
 def get_trading_days_to_process(through=None):
