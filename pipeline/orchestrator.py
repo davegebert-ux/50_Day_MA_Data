@@ -179,7 +179,24 @@ MAX_CONCURRENT_POSITIONS = 8
 FUNNEL_LOG_PATH = os.path.join(_STATE_DIR, "daily_funnel.csv")
 
 FUNNEL_COLUMNS = [
-    "run_date", "ticker", "dropped_at", "disposition",
+    # run_date   -- the session the ORCHESTRATOR PROCESSED. When the system
+    #               ran, in trading-session terms.
+    # for_session -- the session the ROW IS ABOUT.
+    #
+    # They are the same on every row except one: "limit_order_placed",
+    # written during session T for an order that trades in session T+1.
+    #
+    # SPLIT 2026-10-20, the morning after the order list went live. Dave:
+    # "we now have the run_date column meaning two things... I think this
+    # needs to be two columns so the tracking is clear." He was right, and
+    # it was a one-day-old mistake: the bid row was being stamped with the
+    # FUTURE session so that a bid and its outcome would line up, which
+    # quietly redefined run_date for that one disposition. Naming the two
+    # ideas separately keeps the alignment AND keeps run_date honest.
+    #
+    # Named to match the "for_session" column in state/pending_orders.csv:
+    # same concept, same word, two files.
+    "run_date", "for_session", "ticker", "dropped_at", "disposition",
     "entry_price", "risk_per_share", "adr10_pct", "overhead_R",
     "score", "shares", "position_cost", "sizing_constraint",
 ]
@@ -250,6 +267,81 @@ CLOSED_TRADES_COLUMNS = OPEN_POSITIONS_COLUMNS + [
 # ============================================================
 # DAILY FUNNEL LOG (append-only, one row per ticker per day)
 # ============================================================
+def _migrate_funnel_for_session():
+    """One-time: add the for_session column to a funnel written before
+    2026-10-20. Returns True if the file is ready to append to.
+
+    WHY A MIGRATION AND NOT JUST A NEW COLUMN. append_funnel_rows() writes
+    the header only when the file does not exist. Add a column and every
+    row appended afterwards carries one more field than the header
+    declares, so the whole file stops parsing. The column cannot be added
+    without rewriting what is already there.
+
+    WHAT IT DOES TO THE ROWS ALREADY IN THE FILE:
+      - ordinary rows: for_session = run_date. They always meant the same
+        session, so nothing changes in substance.
+      - "limit_order_placed" rows: these were stamped with the session the
+        order was FOR. That value moves to for_session, and run_date is set
+        back to the previous trading day -- the night the order was
+        actually written. Only one session's worth of these exists (the
+        2026-10-19 run, the first under the order list).
+
+    SAFETY. The original is copied to state/daily_funnel.pre_for_session.csv
+    first, the rewrite goes to a temp file and is swapped in atomically, and
+    the whole thing is skipped if the column is already there. If anything
+    fails, this returns False and the caller skips the append rather than
+    writing rows that would corrupt the file -- a one-day gap in a
+    diagnostic log is recoverable, a ragged CSV is not.
+    """
+    if not os.path.exists(FUNNEL_LOG_PATH):
+        return True
+    try:
+        with open(FUNNEL_LOG_PATH) as f:
+            header = f.readline().strip()
+        if "for_session" in header.split(","):
+            return True
+
+        print(f"  Funnel: adding the for_session column (one-time rewrite)")
+        df = pd.read_csv(FUNNEL_LOG_PATH, dtype=str).fillna("")
+        if "run_date" not in df.columns:
+            print(f"  Funnel migration SKIPPED: no run_date column found. "
+                  f"Not touching the file.")
+            return False
+
+        backup = os.path.join(_STATE_DIR, "daily_funnel.pre_for_session.csv")
+        if not os.path.exists(backup):
+            df.to_csv(backup, index=False)
+            print(f"  Funnel: original copied to {os.path.basename(backup)} "
+                  f"-- safe to delete once the new file looks right")
+
+        df["for_session"] = df["run_date"]
+        if "disposition" in df.columns:
+            bids = df["disposition"] == "limit_order_placed"
+            n_bids = int(bids.sum())
+            if n_bids:
+                moved = 0
+                for i in df.index[bids]:
+                    prev = previous_trading_day(df.at[i, "run_date"])
+                    if prev is not None:
+                        df.at[i, "run_date"] = prev.date().isoformat()
+                        moved += 1
+                print(f"  Funnel: {moved} of {n_bids} limit_order_placed "
+                      f"row(s) re-dated to the night they were written")
+
+        cols = [c for c in FUNNEL_COLUMNS if c in df.columns]
+        cols += [c for c in df.columns if c not in cols]
+        tmp = FUNNEL_LOG_PATH + ".tmp"
+        df[cols].to_csv(tmp, index=False)
+        os.replace(tmp, FUNNEL_LOG_PATH)
+        print(f"  Funnel: rewrote {len(df)} row(s) with the new column")
+        return True
+    except Exception as e:
+        print(f"  Funnel migration FAILED ({type(e).__name__}: {e}). Skipping "
+              f"the funnel append for this session rather than writing rows "
+              f"the header cannot describe. The session itself is unaffected.")
+        return False
+
+
 def append_funnel_rows(rows):
     """Append funnel rows for one processed day.
 
@@ -263,6 +355,8 @@ def append_funnel_rows(rows):
     reprocessing, drop its rows first.
     """
     if not rows:
+        return
+    if not _migrate_funnel_for_session():
         return
     df = pd.DataFrame(rows, columns=FUNNEL_COLUMNS)
     header = not os.path.exists(FUNNEL_LOG_PATH)
@@ -279,6 +373,10 @@ def funnel_row(run_date, ticker, dropped_at=None, disposition="", **fields):
     """
     row = {c: "" for c in FUNNEL_COLUMNS}
     row["run_date"] = pd.Timestamp(run_date).date().isoformat()
+    # Defaults to run_date, so every existing call site stays correct and
+    # only the bid row has to say otherwise. The **fields loop below
+    # overrides it when a caller passes for_session explicitly.
+    row["for_session"] = row["run_date"]
     row["ticker"] = ticker
     row["dropped_at"] = dropped_at if dropped_at else ""
     row["disposition"] = disposition
@@ -1674,8 +1772,9 @@ def write_pending_orders(target_date, open_df, queued_exits, funnel_rows=None):
                 "note": f"day order; {sig.get('distance_to_bid_atr', '?')} ATR "
                         f"below last close; sized by {constraint}",
             })
-            _log(funnel_rows, for_session, sig["ticker"], None,
+            _log(funnel_rows, target_date, sig["ticker"], None,
                  "limit_order_placed",
+                 for_session=for_session.date().isoformat(),
                  entry_price=round(sig["entry_price"], 4),
                  risk_per_share=sig["risk_per_share"],
                  adr10_pct=sig.get("adr10_pct"),
@@ -1690,6 +1789,16 @@ def write_pending_orders(target_date, open_df, queued_exits, funnel_rows=None):
     print(f"  Orders for {for_session.date()}: {placed} limit bid(s) "
           f"({free} slot(s) free), {n_sell} market-on-open sell(s) "
           f"-> state/pending_orders.csv")
+
+
+def previous_trading_day(before):
+    """The last session the market was open before `before`, or None."""
+    try:
+        opens = sorted(d for d in load_market_open_dates()
+                       if pd.Timestamp(d) < pd.Timestamp(before))
+    except Exception:
+        return None
+    return pd.Timestamp(opens[-1]) if opens else None
 
 
 def next_trading_day(after):
