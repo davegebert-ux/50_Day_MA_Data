@@ -1,6 +1,5 @@
 for_session,order_type,ticker,limit_price,shares,stop_price,risk_per_share,position_cost,score,note
-2026-10-20,SELL_MOO,PBF,,45,,,,,trail broke 2026-10-19
-2026-10-20,BUY_LIMIT,STLN,6.39,489,5.98,0.4045,3124.07,2.5,day order; 0.187 ATR below last close; sized by cost
-2026-10-20,BUY_LIMIT,FTNT,169.11,18,163.32,5.7931,3044.07,2.5,day order; 0.36 ATR below last close; sized by cost
-2026-10-20,BUY_LIMIT,NTAP,201.67,15,194.51,7.1611,3025.01,2.5,day order; 0.628 ATR below last close; sized by cost
-2026-10-20,BUY_LIMIT,OABI,4.42,706,4.11,0.3097,3123.06,3.0,day order; 0.863 ATR below last close; sized by cost
+2026-10-21,BUY_LIMIT,STLN,6.4,488,5.98,0.4236,3123.25,2.5,day order; 0.591 ATR below last close; sized by cost
+2026-10-21,BUY_LIMIT,NTAP,201.96,15,194.57,7.3862,3029.35,2.5,day order; 0.889 ATR below last close; sized by cost
+2026-10-21,BUY_LIMIT,CLMT,53.42,58,51.47,1.9463,3098.19,4.5,day order; 1.158 ATR below last close; sized by cost
+2026-10-21,BUY_LIMIT,OKTA,181.38,17,171.11,10.2676,3083.44,2.5,day order; 1.159 ATR below last close; sized by cost
