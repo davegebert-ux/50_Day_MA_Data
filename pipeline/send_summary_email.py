@@ -39,6 +39,7 @@ OPEN_POSITIONS_PATH = os.path.join(STATE_DIR, "open_positions.csv")
 CLOSED_TRADES_PATH = os.path.join(STATE_DIR, "closed_trades.csv")
 LAST_RUN_PATH = os.path.join(STATE_DIR, "last_run_date.txt")
 PENDING_ORDERS_PATH = os.path.join(STATE_DIR, "pending_orders.csv")
+ORDERS_SENT_PATH = os.path.join(STATE_DIR, "orders_sent.csv")
 
 # ----------------------------------------------------------------------
 # ONE EMAIL PER SESSION (added 2026-10-14)
@@ -162,10 +163,50 @@ def build_orders_section():
         L.append("    The stop is NOT placed now -- enter it only if the buy fills.")
     else:
         L.append("    (none)")
+    # ------------------------------------------------------------------
+    # DISPATCH STATUS (added 2026-10-22)
+    #
+    # One line saying whether these orders actually went to TradersPost or
+    # were only prepared. Without it the list above is ambiguous: in dry
+    # run it looks identical to a live night, and "did the robot send
+    # these, or am I still entering them by hand?" is exactly the question
+    # that must never be guessed at while both are possible.
+    # ------------------------------------------------------------------
+    try:
+        L.extend(_dispatch_line(for_session))
+    except Exception as e:
+        L.append(f"    Dispatch status unavailable ({type(e).__name__}: {e})")
+
     L.append("")
     L.append("=" * 72)
     L.append("")
     return L
+
+
+def _dispatch_line(for_session):
+    sent = safe_read_csv(ORDERS_SENT_PATH)
+    if not len(sent) or "for_session" not in sent.columns:
+        return ["", "    TradersPost: no dispatch record -- orders NOT sent."]
+    mine = sent[sent["for_session"].astype(str) == str(for_session)]
+    if not len(mine):
+        return ["", f"    TradersPost: nothing dispatched for {for_session} "
+                    f"-- these orders were NOT sent."]
+    modes = set(mine["mode"].astype(str))
+    n_sent = int((mine["status"] == "sent").sum())
+    n_fail = int(mine["status"].isin(["failed", "build_error"]).sum())
+    n_dry = int((mine["status"] == "dry_run").sum())
+    out = [""]
+    if modes == {"dry_run"}:
+        out.append(f"    TradersPost: DRY RUN -- {n_dry} order(s) prepared, "
+                   f"NOTHING SENT. Enter these by hand.")
+    else:
+        out.append(f"    TradersPost: {n_sent} sent, {n_fail} failed.")
+        if n_fail:
+            out.append("    FAILED ORDERS DID NOT REACH THE BROKER and are "
+                       "never retried -- place them by hand or skip them.")
+            for _, r in mine[mine["status"] != "sent"].iterrows():
+                out.append(f"      {r['ticker']}: {str(r['detail'])[:90]}")
+    return out
 
 
 def build_summary_body(target_date):
