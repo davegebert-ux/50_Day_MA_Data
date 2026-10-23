@@ -1,5 +1,5 @@
 for_session,order_type,ticker,limit_price,shares,stop_price,risk_per_share,position_cost,score,note
-2026-10-22,BUY_LIMIT,NAT,7.53,415,7.18,0.3477,3124.58,3.5,day order; 0.141 ATR below last close; sized by cost
-2026-10-22,BUY_LIMIT,CRWD,232.97,13,221.52,11.4557,3028.65,2.5,day order; 0.522 ATR below last close; sized by cost
-2026-10-22,BUY_LIMIT,STLN,6.41,487,6.0,0.4148,3123.96,2.5,day order; 1.08 ATR below last close; sized by cost
-2026-10-22,BUY_LIMIT,CBZ,54.68,57,54.58,0.1049,3116.83,3.5,day order; 1.135 ATR below last close; sized by cost
+2026-10-23,BUY_LIMIT,CRWD,233.2,13,221.59,11.6067,3031.61,2.5,day order; 0.391 ATR below last close; sized by cost
+2026-10-23,BUY_LIMIT,AMC,2.74,1140,2.57,0.167,3122.57,3.0,day order; 1.023 ATR below last close; sized by cost
+2026-10-23,BUY_LIMIT,NTAP,202.45,15,194.6,7.8431,3036.7,2.5,day order; 1.099 ATR below last close; sized by cost
+2026-10-23,BUY_LIMIT,PRCH,17.0,183,16.23,0.7637,3110.71,3.5,day order; 1.156 ATR below last close; sized by cost
