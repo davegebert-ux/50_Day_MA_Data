@@ -35,6 +35,32 @@ Until one real order has gone into the SIM account and been seen the
 next morning, treat overnight delivery as unverified.
 
 -----------------------------------------------------------------------
+HTTP 200 DOES NOT MEAN THE ORDER WAS ACCEPTED (learned 2026-10-24)
+-----------------------------------------------------------------------
+The first live send returned HTTP 200 with {"success":true,"id":...} for
+all four orders. TradersPost then REJECTED all four -- the strategy's
+"Allowed IP addresses" was still set to TradingView -- and said so in a
+separate email, minutes later.
+
+So the 2xx acknowledges the WEBHOOK. Validation happens afterwards and is
+reported out of band. This file recorded "sent" and the daily email
+reported "4 sent, 0 failed" for four orders that never reached the broker.
+
+That is the same mistake this project has already written down twice: the
+green workflow that did no work, and the success counter that measured
+HTTP status. It got rebuilt here anyway.
+
+The status is therefore "delivered", never "sent", and every message says
+acceptance is unconfirmed. TradersPost publishes no API for querying a
+signal's outcome, so there is nothing better to key on from here.
+
+THE DURABLE FIX IS RECONCILIATION, NOT A BETTER STATUS CODE: compare the
+system's open positions against the broker's. That catches a rejected
+order, a partial fill, a wrong quantity and a manual intervention, all of
+which a delivery receipt is blind to. It is the Tier 2 fidelity check
+already planned for the paper phase (2026-10-17).
+
+-----------------------------------------------------------------------
 TWO SUBSCRIPTION SETTINGS THIS DEPENDS ON
 -----------------------------------------------------------------------
 Both live in TradersPost, not here, and both silently change what gets
@@ -262,7 +288,10 @@ def main():
 
         if live:
             ok, detail = post(url, payload)
-            status = "sent" if ok else "failed"
+            # "delivered", NOT "sent". See the HTTP 200 note at the top of
+            # this file: a 2xx means TradersPost took the webhook, not that
+            # it accepted the trade.
+            status = "delivered" if ok else "failed"
             n_ok += int(ok)
             n_fail += int(not ok)
         else:
@@ -299,7 +328,15 @@ def main():
               f"{os.path.basename(LAST_SENT_PATH)} ({e}). A re-run of this "
               f"step could dispatch the same session again.", file=sys.stderr)
 
-    print(f"  Done: {n_ok} ok, {n_fail} failed, mode {mode}")
+    if live:
+        print(f"  Done: {n_ok} delivered (ACCEPTANCE NOT CONFIRMED), "
+              f"{n_fail} failed to deliver, mode {mode}")
+        if n_ok:
+            print("  A delivered order can still be REJECTED by TradersPost "
+                  "after the fact. Check for rejection emails from them, or "
+                  "the TradersPost dashboard, before assuming these worked.")
+    else:
+        print(f"  Done: {n_ok} prepared, {n_fail} failed, mode {mode}")
     if n_fail and live:
         print("  NOTE: TradersPost never retries a failed order. Anything "
               "marked failed above did NOT reach the broker.", file=sys.stderr)

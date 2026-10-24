@@ -192,20 +192,34 @@ def _dispatch_line(for_session):
         return ["", f"    TradersPost: nothing dispatched for {for_session} "
                     f"-- these orders were NOT sent."]
     modes = set(mine["mode"].astype(str))
-    n_sent = int((mine["status"] == "sent").sum())
+    # "sent" is the pre-2026-10-24 label for the same thing; both mean the
+    # webhook was accepted, NOT that the order was.
+    delivered = mine["status"].isin(["delivered", "sent"])
+    n_del = int(delivered.sum())
     n_fail = int(mine["status"].isin(["failed", "build_error"]).sum())
     n_dry = int((mine["status"] == "dry_run").sum())
     out = [""]
     if modes == {"dry_run"}:
         out.append(f"    TradersPost: DRY RUN -- {n_dry} order(s) prepared, "
                    f"NOTHING SENT. Enter these by hand.")
-    else:
-        out.append(f"    TradersPost: {n_sent} sent, {n_fail} failed.")
-        if n_fail:
-            out.append("    FAILED ORDERS DID NOT REACH THE BROKER and are "
-                       "never retried -- place them by hand or skip them.")
-            for _, r in mine[mine["status"] != "sent"].iterrows():
-                out.append(f"      {r['ticker']}: {str(r['detail'])[:90]}")
+        return out
+
+    # WORDING MATTERS HERE (2026-10-24). This line previously read
+    # "N sent, 0 failed" and said exactly that on a night when all four
+    # orders were rejected by TradersPost after it had already returned
+    # HTTP 200. The daily mail is the only thing Dave reads every morning,
+    # so it must not claim an outcome the system cannot observe.
+    out.append(f"    TradersPost: {n_del} delivered, {n_fail} failed to deliver.")
+    if n_del:
+        out.append("    DELIVERED IS NOT ACCEPTED. TradersPost returns success")
+        out.append("    on receipt and validates afterwards; a rejection comes")
+        out.append("    as a separate email from them. Check for one before")
+        out.append("    assuming these orders are working.")
+    if n_fail:
+        out.append("    FAILED ORDERS NEVER REACHED TRADERSPOST and are never")
+        out.append("    retried -- place them by hand or skip them.")
+        for _, r in mine[~delivered].iterrows():
+            out.append(f"      {r['ticker']}: {str(r['detail'])[:90]}")
     return out
 
 
