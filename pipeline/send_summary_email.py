@@ -184,13 +184,19 @@ def build_orders_section():
 
 
 def _dispatch_line(for_session):
+    # CHANGED 2026-10-24: "not dispatched" is the NORMAL state of this
+    # email now, not an alarm. Dispatch moved out of the nightly run to a
+    # morning job (send_orders_morning.yml) because TradeStation rejects
+    # day orders placed while the market is shut. So when this mail is
+    # written, tonight's orders have correctly not been sent yet.
+    QUEUED = ("    TradersPost: not sent yet -- the morning job dispatches "
+              "these after the 09:30 ET open.")
     sent = safe_read_csv(ORDERS_SENT_PATH)
     if not len(sent) or "for_session" not in sent.columns:
-        return ["", "    TradersPost: no dispatch record -- orders NOT sent."]
+        return ["", QUEUED]
     mine = sent[sent["for_session"].astype(str) == str(for_session)]
     if not len(mine):
-        return ["", f"    TradersPost: nothing dispatched for {for_session} "
-                    f"-- these orders were NOT sent."]
+        return ["", QUEUED]
     modes = set(mine["mode"].astype(str))
     # "sent" is the pre-2026-10-24 label for the same thing; both mean the
     # webhook was accepted, NOT that the order was.

@@ -98,7 +98,8 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -112,6 +113,42 @@ LAST_RUN_PATH = os.path.join(_STATE_DIR, "last_run_date.txt")
 MAX_ORDERS_PER_RUN = 12          # 8 slots plus exits; anything more is a fault
 HTTP_TIMEOUT_SECONDS = 20
 
+# ----------------------------------------------------------------------
+# WHY THERE IS A MARKET-HOURS GUARD (learned 2026-10-24)
+#
+# TradeStation REJECTS a day order submitted while the market is closed.
+# The first order to make it all the way down the chain -- GitHub sent it,
+# TradersPost auto-submitted it, TradeStation received it as a limit buy
+# for 1,137 AMC at 2.75 -- came back rejected for exactly that reason.
+# Every nightly send would have been rejected the same way, because the
+# orchestrator always runs overnight.
+#
+# Three fixes were considered:
+#   - good-till-cancelled: REJECTED. The bid would rest past the session,
+#     which is the multi-day resting order ruled out on 2026-09-19 for
+#     readmitting the Stage 6b duplication. It changes which trades exist.
+#   - good-till-date expiring tonight: Dave's idea, and the best of the
+#     three if it worked. It does not: TradersPost's `expiresAt` governs
+#     how long TRADERSPOST holds the signal, not the order's expiry at the
+#     broker, and there is no field for the latter. Sending "gtd" with no
+#     date leaves the order's lifetime at TradeStation undefined.
+#   - SEND AFTER THE OPEN: adopted. The nightly run still builds the list;
+#     a separate morning job sends it. It also fails safe -- a late job
+#     sends late, and a job that never runs leaves nothing resting at the
+#     broker.
+#
+# So a LIVE send refuses unless the market is open. A dry run does not
+# check, because nothing leaves the runner.
+# ----------------------------------------------------------------------
+MARKET_TZ = ZoneInfo("America/New_York")
+SEND_NOT_BEFORE = dtime(9, 35)   # a few minutes after the 09:30 open
+SEND_NOT_AFTER = dtime(15, 45)   # too near the close for a day bid to mean much
+SEND_LATE_WARN = dtime(10, 30)   # still sent, but the fill picture has drifted
+MARKET_CALENDAR_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "nyse_market_calendar_2026_2029.csv",
+)
+
 # The exit is the least certain part of this file. We send a plain market
 # order and rely on TradersPost queueing it to the next open, rather than
 # tagging it "opg" (at-the-open) as well -- one mechanism instead of two.
@@ -123,6 +160,32 @@ ORDERS_SENT_COLUMNS = [
     "sent_utc", "mode", "for_session", "order_type", "ticker",
     "expected_shares", "limit_price", "stop_price", "status", "detail",
 ]
+
+
+def market_is_open_now():
+    """(ok, now_et, reason). Fails CLOSED: anything unreadable means no send.
+
+    A missing or unreadable calendar stops live trading, which is the right
+    way round -- the alternative is firing orders into a day we cannot
+    confirm is a trading day.
+    """
+    now = datetime.now(MARKET_TZ)
+    try:
+        cal = pd.read_csv(MARKET_CALENDAR_PATH, parse_dates=["date"])
+        opens = set(cal[cal["market_open"] == True]["date"].dt.date)
+    except Exception as e:
+        return False, now, (f"could not read the market calendar ({e}); "
+                            f"refusing to send rather than guess")
+    if now.date() not in opens:
+        return False, now, f"{now.date()} is not a trading day"
+    if now.time() < SEND_NOT_BEFORE:
+        return False, now, (f"{now:%H:%M} ET is before {SEND_NOT_BEFORE:%H:%M} "
+                            f"-- TradeStation rejects day orders placed "
+                            f"before the open")
+    if now.time() > SEND_NOT_AFTER:
+        return False, now, (f"{now:%H:%M} ET is past {SEND_NOT_AFTER:%H:%M} "
+                            f"-- too late in the session for a day bid")
+    return True, now, f"{now:%H:%M} ET, market open"
 
 
 def resend_selection():
@@ -286,6 +349,33 @@ def main():
               f"processed session is {last_run}. A fresh list should be for "
               f"a LATER session, so this file is stale. Nothing sent.")
         return
+
+    # MARKET-HOURS GUARD, and the stronger session check that comes with
+    # it. Both apply only to a LIVE send -- a dry run leaves nothing.
+    #
+    # for_session must be TODAY. The nightly run writes a list for the next
+    # trading day and the morning job sends it that morning, so any other
+    # value means the list did not get rebuilt: last night's run failed, or
+    # this is a stray execution. Sending a day bid computed from a close
+    # two sessions ago is worse than sending nothing.
+    if live:
+        ok_now, now_et, why = market_is_open_now()
+        if not ok_now:
+            print(f"  NOT SENDING: {why}.")
+            print(f"  The order list is kept; the next morning run sends it.")
+            return
+        today_et = now_et.date().isoformat()
+        if for_session != today_et:
+            print(f"  REFUSING: the order list is for {for_session} but today "
+                  f"is {today_et}. These bids were computed from a different "
+                  f"session's close. Nothing sent.")
+            return
+        if now_et.time() > SEND_LATE_WARN:
+            print(f"  LATE: sending at {now_et:%H:%M} ET. The bids are still "
+                  f"valid for today, but any dip to them earlier in the "
+                  f"session was missed -- expect fewer fills than the "
+                  f"backtest implies.")
+        print(f"  Market check: {why}")
 
     # ONE DISPATCH PER SESSION -- deliberately bypassed on a resend, which
     # exists precisely because the first dispatch did not take. The stamp
