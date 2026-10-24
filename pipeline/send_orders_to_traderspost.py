@@ -125,6 +125,40 @@ ORDERS_SENT_COLUMNS = [
 ]
 
 
+def resend_selection():
+    """What this run is resending, or None for a normal nightly dispatch.
+
+    TRADERSPOST_RESEND holds a comma-separated ticker list ("CAKE, AMC") or
+    the word "all". Set only by the manual Resend workflow.
+
+    WHY A MANUAL LIST AND NOT AN AUTOMATIC RETRY. TradersPost returns
+    HTTP 200 and then rejects out of band (see the note above), so nothing
+    here can tell which orders actually failed -- the only place that
+    knowledge exists is the rejection email in Dave's inbox. An automatic
+    retry would therefore have to guess, and guessing wrong means
+    duplicate positions. Naming the tickers puts the decision where the
+    information is.
+    """
+    raw = os.environ.get("TRADERSPOST_RESEND", "").strip()
+    if not raw:
+        return None
+    if raw.lower() == "all":
+        return "ALL"
+    picked = {t.strip().upper() for t in raw.replace(";", ",").split(",") if t.strip()}
+    return picked or None
+
+
+def prior_status(for_session, ticker):
+    """What orders_sent.csv last recorded for this ticker and session."""
+    try:
+        sent = pd.read_csv(ORDERS_SENT_PATH)
+        mine = sent[(sent["for_session"].astype(str) == str(for_session)) &
+                    (sent["ticker"].astype(str).str.upper() == ticker.upper())]
+        return str(mine["status"].iloc[-1]) if len(mine) else None
+    except Exception:
+        return None
+
+
 def is_live():
     return os.environ.get("TRADERSPOST_MODE", "").strip() == "live"
 
@@ -218,8 +252,12 @@ def record(rows):
 
 def main():
     live = is_live()
-    mode = "live" if live else "dry_run"
+    resend = resend_selection()
+    mode = ("live" if live else "dry_run") + ("_resend" if resend else "")
     print(f"TradersPost dispatch -- MODE: {mode.upper()}")
+    if resend:
+        print(f"  RESEND requested: "
+              f"{'every order in the current list' if resend == 'ALL' else ', '.join(sorted(resend))}")
     if not live:
         print("  (dry run: payloads are built and recorded, nothing is sent. "
               "Set TRADERSPOST_MODE to exactly 'live' to send.)")
@@ -249,9 +287,12 @@ def main():
               f"a LATER session, so this file is stale. Nothing sent.")
         return
 
-    # ONE DISPATCH PER SESSION.
+    # ONE DISPATCH PER SESSION -- deliberately bypassed on a resend, which
+    # exists precisely because the first dispatch did not take. The stamp
+    # is also left UNCHANGED by a resend: it records that the nightly step
+    # ran for this session, which stays true either way.
     already = _read_text(LAST_SENT_PATH)
-    if already == for_session:
+    if already == for_session and not resend:
         print(f"  Orders for {for_session} were already dispatched "
               f"(state/last_orders_sent.txt) -- skipping.")
         return
@@ -267,6 +308,30 @@ def main():
         print("  REFUSING: TRADERSPOST_MODE is live but "
               "TRADERSPOST_WEBHOOK_URL is not set. Nothing sent.")
         return
+
+    if resend and resend != "ALL":
+        have = {str(t).strip().upper() for t in orders["ticker"]}
+        missing = sorted(resend - have)
+        if missing:
+            print(f"  NOT IN THE CURRENT ORDER LIST, skipped: {', '.join(missing)}")
+            print(f"  (the list is for {for_session}; a ticker from an older "
+                  f"session cannot be resent from here -- enter it by hand)")
+        orders = orders[orders["ticker"].astype(str).str.strip().str.upper().isin(resend)]
+        if not len(orders):
+            print("  Nothing left to resend. Nothing sent.")
+            return
+
+    # A resend of something already DELIVERED is usually right -- delivered
+    # does not mean accepted -- but it is the one way to end up with two
+    # positions in the same ticker, so it is called out per order.
+    if resend and live:
+        for t in orders["ticker"].astype(str):
+            ps = prior_status(for_session, t)
+            if ps in ("delivered", "sent"):
+                print(f"  WARNING {t}: a previous attempt was DELIVERED. If "
+                      f"TradersPost actually accepted it, resending will open "
+                      f"a SECOND position. Resend only what you have "
+                      f"confirmed was rejected.")
 
     print(f"  {len(orders)} order(s) for session {for_session}")
     rows, n_ok, n_fail = [], 0, 0
@@ -320,6 +385,12 @@ def main():
     # The stamp is written in BOTH modes. A dry run that ran is a dispatch
     # decision already taken for that session: re-running the step must not
     # suddenly send live orders for a session Dave already placed by hand.
+    # A RESEND does not touch it -- see the note where it is read.
+    if resend:
+        print(f"  (resend: state/{os.path.basename(LAST_SENT_PATH)} left "
+              f"unchanged)")
+        print(f"  Done: {n_ok} delivered, {n_fail} failed, mode {mode}")
+        return
     try:
         with open(LAST_SENT_PATH, "w") as f:
             f.write(for_session)
