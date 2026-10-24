@@ -1,0 +1,99 @@
+name: Resend Orders to TradersPost
+
+# ============================================================
+# MANUAL RECOVERY. Run by hand from the Actions tab when orders from the
+# nightly run did not make it to the broker.
+#
+# WHY THIS EXISTS (2026-10-24). On the first live night TradersPost
+# returned HTTP 200 with {"success":true} for all four orders and then
+# rejected every one of them -- the strategy's Allowed IP addresses was
+# still set to TradingView. The 200 acknowledges the webhook; validation
+# happens afterwards and is reported only by email. TradersPost offers no
+# resubmit of its own, and nothing in this repo could resend, so the only
+# recovery was re-typing the orders at the broker.
+#
+# WHY IT IS A SEPARATE WORKFLOW rather than an input on the nightly one:
+# every step there is gated on should_run, and a resend must skip the
+# whole pipeline -- no data pull, no orchestrator, no session advance. A
+# file of its own also cannot be fired by a schedule, only by a person.
+#
+# WHY YOU TYPE THE TICKERS. Nothing in the code can tell which orders were
+# rejected: the HTTP response said they all succeeded. That knowledge
+# exists only in the rejection emails. So the list comes from you, and
+# resending something that WAS accepted would open a second position --
+# the run warns per ticker when a previous attempt was delivered.
+#
+# It sends from the CURRENT state/pending_orders.csv. Orders from an older
+# session are gone and must be entered by hand.
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Tickers to resend, comma-separated (CAKE, AMC) -- or: all'
+        required: true
+        type: string
+      confirm:
+        description: 'Type RESEND to confirm you have checked these were rejected'
+        required: true
+        type: string
+
+# Shares the nightly workflow's group so a resend can never read
+# pending_orders.csv while the orchestrator is rewriting it.
+concurrency:
+  group: daily-scorecard
+  cancel-in-progress: false
+
+jobs:
+  resend:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check the confirmation word
+        if: inputs.confirm != 'RESEND'
+        run: |
+          echo "Confirmation was '${{ inputs.confirm }}', not 'RESEND'. Nothing sent."
+          exit 1
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas
+
+      # Honours TRADERSPOST_MODE exactly as the nightly step does: if the
+      # repository variable is not 'live' this is a dry run and prints what
+      # it would have sent. That is on purpose -- a resend must not be a
+      # back door that sends while the system is meant to be dark.
+      - name: Resend
+        run: python3 pipeline/send_orders_to_traderspost.py
+        env:
+          TRADERSPOST_MODE: ${{ vars.TRADERSPOST_MODE || 'dry_run' }}
+          TRADERSPOST_WEBHOOK_URL: ${{ secrets.TRADERSPOST_WEBHOOK_URL }}
+          TRADERSPOST_RESEND: ${{ inputs.tickers }}
+
+      # The resend appends to state/orders_sent.csv with mode
+      # "live_resend"/"dry_run_resend", so the record shows a resend as a
+      # distinct event rather than overwriting the original attempt.
+      # state/last_orders_sent.txt is deliberately NOT touched.
+      - name: Commit the dispatch record
+        if: always()
+        run: |
+          git config user.name "scorecard-automation-bot"
+          git config user.email "actions@github.com"
+          git add state/orders_sent.csv || true
+          if git diff --cached --quiet; then
+            echo "No dispatch record to commit."
+          else
+            git commit -m "Order resend: ${{ inputs.tickers }} ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+            git pull --rebase --autostash origin "$BRANCH"
+            git push
+          fi
