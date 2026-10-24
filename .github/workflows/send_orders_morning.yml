@@ -1,0 +1,90 @@
+name: Send Orders After the Open
+
+# ============================================================
+# Sends the orders the nightly run already built, shortly after the
+# market opens. The nightly pipeline no longer dispatches.
+#
+# WHY (2026-10-24). TradeStation rejects a day order submitted while the
+# market is closed, and the orchestrator always runs overnight (observed
+# between 00:17 and 08:17 Eastern). The full chain was proven working --
+# GitHub -> TradersPost -> TradeStation, which received a limit buy for
+# 1,137 AMC at 2.75 -- and TradeStation rejected it for exactly that
+# reason. Every nightly send would have gone the same way.
+#
+# The two alternatives were rejected on their merits, not their effort:
+#   - good-till-cancelled leaves the bid resting past the session, which
+#     is the multi-day resting order ruled out on 2026-09-19 because it
+#     readmits the Stage 6b duplication. It changes which trades exist.
+#   - good-till-date expiring tonight would have been ideal and does not
+#     work: TradersPost's `expiresAt` controls how long TRADERSPOST holds
+#     the signal, not the order's lifetime at the broker, and there is no
+#     field for the latter.
+#
+# This also fails safe. A late run sends late; a run that never happens
+# leaves nothing resting at the broker overnight. The opposite design --
+# send at night, cancel in the morning -- leaves an order working for a
+# second day the first time a run is missed.
+#
+# SCHEDULE. GitHub cron is UTC and ignores daylight saving, and GitHub
+# drops fires under load. So this fires four times and the first one that
+# can send does; the rest find state/last_orders_sent.txt already stamped
+# and exit in seconds.
+#   EDT: 09:35, 10:35, 11:35, 12:35 Eastern
+#   EST: 08:35 (refused, before the open), 09:35, 10:35, 11:35
+#
+# The dispatcher itself enforces the window -- market open per the NYSE
+# calendar, at or after 09:35, and the order list dated TODAY. It refuses
+# rather than guesses, so a dropped nightly run means no orders rather
+# than yesterday's.
+# ============================================================
+
+on:
+  schedule:
+    - cron: '35 13,14,15,16 * * 1-5'
+  workflow_dispatch:          # manual send, same guards apply
+
+concurrency:
+  group: daily-scorecard      # never overlap the nightly pipeline's push
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas
+
+      - name: Send today's orders
+        run: python3 pipeline/send_orders_to_traderspost.py
+        env:
+          TRADERSPOST_MODE: ${{ vars.TRADERSPOST_MODE || 'dry_run' }}
+          TRADERSPOST_WEBHOOK_URL: ${{ secrets.TRADERSPOST_WEBHOOK_URL }}
+
+      # Commits state/last_orders_sent.txt and state/orders_sent.csv. The
+      # stamp is what stops the later fires re-sending, and it is worthless
+      # unless it is committed -- the same trap send_summary_email.py's
+      # dormant guard fell into.
+      - name: Commit the dispatch record
+        if: always()
+        run: |
+          git config user.name "scorecard-automation-bot"
+          git config user.email "actions@github.com"
+          git add state/ || true
+          if git diff --cached --quiet; then
+            echo "Nothing dispatched -- no record to commit."
+          else
+            git commit -m "Order dispatch: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+            git pull --rebase --autostash origin "$BRANCH"
+            git push
+          fi

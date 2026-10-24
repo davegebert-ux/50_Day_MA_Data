@@ -198,41 +198,25 @@ jobs:
             echo "Suppressing the summary email so the previous session is not re-sent."
           fi
 
-      # ORDER DISPATCH TO TRADERSPOST (ADDED 2026-10-22)
-      # -----------------------------------------------
-      # Sends the orders the orchestrator just wrote to TradersPost, which
-      # forwards them to the TradeStation account its subscription points
-      # at. This is the only step in this workflow that can move money.
+      # ORDER DISPATCH LIVED HERE BRIEFLY, AND MOVED OUT (2026-10-24)
+      # --------------------------------------------------------------
+      # A send step was added here on 2026-10-22, right before the commit
+      # so its stamp would be committed. It was removed two days later:
+      # TradeStation REJECTS a day order submitted while the market is
+      # closed, and this pipeline always runs overnight (observed between
+      # 00:17 and 08:17 Eastern).
       #
-      # DEFAULTS TO DRY RUN. TRADERSPOST_MODE must be exactly "live" for
-      # anything to leave the runner. It is read from a repository
-      # VARIABLE, not from this file, so flipping it is a setting change in
-      # GitHub rather than a commit -- and an unset variable means dry run.
-      #   Settings > Secrets and variables > Actions > Variables
+      # That was not theory. The full chain worked -- GitHub sent it,
+      # TradersPost auto-submitted it, TradeStation received a limit buy
+      # for 1,137 AMC at 2.75 -- and TradeStation rejected it on timing
+      # alone. Every nightly send would have gone the same way.
       #
-      # WHY IT SITS HERE, BEFORE THE COMMIT, AND NOT AFTER THE EMAIL:
-      # the script writes state/last_orders_sent.txt to stop a retry
-      # dispatching the same session twice, and that stamp is worthless
-      # unless it is committed. send_summary_email.py's last-emailed guard
-      # is dormant for exactly this reason -- it stamps AFTER the commit
-      # step, so the stamp never survives the next checkout (see the
-      # header). Putting this step before the commit means "git add state/"
-      # picks the stamp up. Do not move it below the commit.
+      # Sending now lives in .github/workflows/send_orders_morning.yml,
+      # which fires after the open. This workflow still BUILDS the order
+      # list (orchestrator.py writes state/pending_orders.csv); it just
+      # does not dispatch it.
       #
-      # Gated on steps.advanced so a deferred run cannot re-dispatch the
-      # previous session's orders -- the same gap that caused a month of
-      # duplicate emails.
-      #
-      # continue-on-error: the session is already correct and about to be
-      # committed. An undispatched order is a missed trade; a failed
-      # workflow step is a missed session, which is worse.
-      - name: Send orders to TradersPost (dry run unless TRADERSPOST_MODE is 'live')
-        if: steps.check_time.outputs.should_run == 'true' && steps.advanced.outputs.advanced == 'true' && success()
-        continue-on-error: true
-        run: python3 pipeline/send_orders_to_traderspost.py
-        env:
-          TRADERSPOST_MODE: ${{ vars.TRADERSPOST_MODE || 'dry_run' }}
-          TRADERSPOST_WEBHOOK_URL: ${{ secrets.TRADERSPOST_WEBHOOK_URL }}
+      # DO NOT RE-ADD A SEND HERE. Two senders means two sets of orders.
 
       - name: Commit updated data and state files back to the repo
         if: steps.check_time.outputs.should_run == 'true' && success()
