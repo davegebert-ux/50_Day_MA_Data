@@ -7798,3 +7798,313 @@ tuning, and converting an unplaceable record into a placeable order is making
 the system real rather than optimising it. No strategy parameter moved today --
 `ENTRY_BID_ATR_MULT` was explicitly left alone, against a sweep that argued for
 changing it.
+
+---
+
+## 2026-10-20 -- [FIX] `run_date` MEANT TWO THINGS; THE FUNNEL NOW HAS TWO COLUMNS
+
+Caught by Dave the morning after the order list went live, reading his own
+funnel:
+
+> *"We now have the run_date column not meaning two things... I think this
+> needs to be two columns so the tracking is clear."*
+
+He was right, and it was a one-day-old mistake of mine. The
+`limit_order_placed` row was stamped with the session the order was FOR, so
+that a bid and its outcome would line up on the same date. That alignment is
+correct and worth keeping -- but it silently redefined `run_date` for that one
+disposition.
+
+| column | meaning |
+|---|---|
+| `run_date` | the session the orchestrator PROCESSED |
+| `for_session` | the session the row IS ABOUT |
+
+Identical on every row except `limit_order_placed`. Named `for_session` to
+match the column `state/pending_orders.csv` already used: same concept, same
+word, two files.
+
+### The part that needed care: it could not be done by adding a column
+
+`append_funnel_rows()` writes a header only when the file does not exist. Add
+a column and every row appended afterwards carries one more field than the
+header declares -- the whole file stops parsing. So the column could not be
+added without rewriting what was already there.
+
+`_migrate_funnel_for_session()` runs once, automatically:
+- ordinary rows: `for_session` = `run_date`, no change in substance
+- `limit_order_placed` rows: that date moves to `for_session`, and `run_date`
+  is set back to the previous trading day -- the night the order was written
+
+It copies the original to `state/daily_funnel.pre_for_session.csv`, writes to
+a temp file and swaps atomically, and skips itself once the column exists. On
+any failure it **skips the funnel append** rather than writing rows the header
+cannot describe: a one-day gap in a diagnostic beats a corrupt file.
+
+Tested on a funnel shaped like production -- six old-format rows including two
+bid rows stamped with the future session -- then six live sessions on top. 861
+rows, 13 columns, no ragged parsing. `pull_data.py`'s truncation and
+`equity_curve.py` were both checked and need no change.
+
+`orchestrator.py` 91,707 -> 96,985 bytes.
+
+---
+
+## 2026-10-22 -- [BUILT] ORDER DISPATCH TO TRADERSPOST
+
+Dave had already set up TradersPost, connected the TradeStation **simulator**
+account, created a strategy and subscription, and saved the webhook as the
+GitHub secret `TRADERSPOST_WEBHOOK_URL`.
+
+`pipeline/send_orders_to_traderspost.py` reads `state/pending_orders.csv` and
+POSTs each order. It is the only file in the project that can cause money to
+move, and it is built accordingly.
+
+### It defaults to dry run and stays there
+
+`TRADERSPOST_MODE` must equal the exact string `live`. Unset, empty, `true`,
+`1`, `LIVE ` with a space -- all dry run. The asymmetry is deliberate: a
+mistake must fail toward sending nothing. The value is a repository VARIABLE,
+not a file, so flipping it is a settings change rather than a commit, and
+deleting it reverts to dry run.
+
+The switch existed because Dave was hand-entering the same orders during the
+first paper week. Both at once would double every order.
+
+### Two settings in TradersPost that silently change what gets traded
+
+Found in their webhook docs, not obvious from the UI:
+
+1. **"Allow signal override" must be enabled** or `limitPrice` is ignored and
+   the order becomes a market buy. The edge of this strategy IS the fill price
+   -- entering at the close instead of the dip was measured at -193 R against
+   +833 R on 2026-10-17 -- so a silently-marketed entry does not degrade the
+   system, it inverts it.
+2. **Quantity must come from the signal.** An absent quantity "is calculated
+   dynamically or defaults to 1".
+
+### Safety rails
+
+One dispatch per session (`state/last_orders_sent.txt`); refuses an order list
+dated at or before the session just processed; refuses above
+`MAX_ORDERS_PER_RUN = 12`; never prints the webhook URL; appends every attempt
+to `state/orders_sent.csv` whether sent or not. A failure exits 0 and reports
+-- an undispatched order is a missed trade, a crashed step is a missed session.
+
+Thirteen tests including a live send against a local mock server.
+
+### Placement
+
+The step sits BEFORE the commit, not after the email. Its stamp is worthless
+unless committed, and `send_summary_email.py`'s last-emailed guard is dormant
+for exactly that reason -- it stamps after the commit step, so the stamp never
+survives the next checkout.
+
+---
+
+## 2026-10-23 -- Dry run verified
+
+Email and `state/orders_sent.csv` agreed exactly on all four orders, with
+correctly shaped payloads. Nothing sent. Dave hand-entered them.
+
+---
+
+## 2026-10-24 -- FOUR FAILURES IN ONE MORNING, AND WHAT EACH ONE TAUGHT
+
+The first live night. Everything that could reveal itself did, which is what a
+simulated account is for.
+
+### 1. The orders were rejected, and not for the reason the email said
+
+TradersPost's subject line said "invalid or malformed JSON payload". The
+status line said something else: *"The trade signal did not come from
+TradingView. You have your strategy configured to only accept trade signals
+from TradingView."* The payload it echoed back was correct.
+
+The setting is the strategy's **Allowed IP addresses**, which had been left on
+"TradingView". Changing it to "Any IP addresses" is right for a webhook from a
+GitHub Actions runner, whose IP changes every run.
+
+**[CORRECTION]** Claude searched the TradersPost docs and sent Dave looking for
+a separate "Limit to TradingView" toggle. Dave found the actual field himself
+by asking their help bot. The search result was real but was not the setting in
+front of him.
+
+### 2. [PROCESS, AND A REPEAT] HTTP 200 does not mean the order was accepted
+
+All four orders returned **HTTP 200 with `{"success":true,"id":...}`** and were
+recorded as `sent`. The daily email reported **"4 sent, 0 failed"**. All four
+had been rejected.
+
+```
+orders_sent.csv  2026-10-24T04:37:58Z  live  AMC  1137  2.75  2.58  sent
+                 HTTP 200: {"success":true,"id":"28745e3f-..."}
+TradersPost      Oct 23 10:37 PM MT (= 04:37 UTC)  AMC 2.75 x1137  REJECTED
+```
+
+The 2xx acknowledges the WEBHOOK. TradersPost validates afterwards and reports
+out of band, by email. There is no API for querying a signal's outcome, so
+nothing in the code can key on acceptance.
+
+**This document already names this failure in five places** -- the green
+workflow that did no work, the success counter that measured HTTP status, the
+guard that tested existence instead of sufficiency, the stale `last_run_date`
+check, and a PROCESS FINDING of 2026-10-11 whose own conclusion reads: *"a
+report that something was done is not evidence it was done. Check the
+artefact, not the account of it."*
+
+Claude rebuilt it thirteen days after writing that sentence, and the exact
+phrase "the success counter that measured HTTP status" sits three times in the
+pages above the code that repeated it. Writing a lesson down -- repeatedly, in
+the document you are actively editing -- is not the same as applying it. What
+caught it was Dave reading the TradersPost rejection emails against our own
+"4 sent, 0 failed": the artefact, not the account.
+
+The status is now `delivered`, never `sent`, and every message says acceptance
+is unconfirmed.
+
+**The durable fix is reconciliation, not a better status code:** compare the
+system's open positions against the broker's. That catches a rejected order, a
+partial fill, a wrong quantity and a manual intervention, all of which a
+delivery receipt is blind to. It is the Tier 2 fidelity check already planned
+(2026-10-17), now promoted from hygiene to the thing that closes the loop.
+Deferred by Dave until the system is in steady state.
+
+### 3. The subscription had silently reverted
+
+After the first successful delivery, the TradersPost subscription was found
+**disabled** and set to **Manual Submit** -- both had been configured correctly
+earlier. Cause unknown. Re-enabled and set to Auto Submit.
+
+**Worth watching.** If it reverts again, orders will leave GitHub, be accepted
+by TradersPost, and stop there, with nothing in our own logs to show it.
+
+### 4. [THE REAL ONE] TradeStation rejects day orders placed while the market is shut
+
+With everything else fixed, the chain ran end to end -- GitHub sent it,
+TradersPost auto-submitted it, TradeStation received a limit buy for **1,137
+AMC at 2.75** -- and TradeStation rejected it because a `day` order cannot be
+placed outside market hours.
+
+The orchestrator always runs overnight (observed 00:17 to 08:17 Eastern), so
+**every nightly send would have failed this way.**
+
+Three options:
+
+| | verdict |
+|---|---|
+| good-till-cancelled | **Rejected.** The bid would rest past the session. A static bid left working for days is the scar recorded under the Walking Bid proposal (2026-10-13): it readmits the Stage 6b duplicate entries that the one-position-per-ticker rule exists to prevent (open item raised 2026-09-18; see the `bid_not_filled` comment). It changes which trades exist. |
+| good-till-date, expiring tonight | **Dave's idea, and the best of the three if it worked.** It does not: TradersPost's `expiresAt` governs how long TRADERSPOST holds the signal, not the order's lifetime at the broker, and there is no field for the latter. "gtd" with no date leaves the order's lifetime undefined. |
+| **send after the open** | **Adopted.** |
+
+### [DECISION] The morning send
+
+`.github/workflows/send_orders_morning.yml` fires at 13:35/14:35/15:35/16:35
+UTC Mon-Fri -- four shots because GitHub cron ignores daylight saving and drops
+fires. The first that can send does; the rest find the stamp and exit.
+
+The nightly workflow no longer dispatches. It still BUILDS the list. A comment
+sits where the step was, ending "DO NOT RE-ADD A SEND HERE. Two senders means
+two sets of orders."
+
+A live send now requires all three of: market open per the NYSE calendar, at or
+after 09:35 ET, and the order list dated TODAY. It fails closed -- an
+unreadable calendar refuses rather than guesses. Dry runs skip the check.
+
+**It also fails safe, which decided it over the alternative.** A late job sends
+late; a job that never runs leaves nothing resting at the broker. Send-at-night
+plus cancel-in-the-morning would leave an order working a second day the first
+time a run is missed.
+
+### [BUILT] The resend workflow
+
+TradersPost offers no resubmit, and nothing here could resend, so a failed
+dispatch meant re-typing orders at the broker.
+
+`.github/workflows/resend_orders.yml` -- manual, type the tickers or `all`,
+plus `RESEND` in a confirmation box. Separate file rather than an input on the
+nightly workflow: every step there is gated on `should_run`, and a resend must
+skip the whole pipeline.
+
+**You type the tickers, and that is not laziness.** Nothing in the code can
+tell which orders were rejected -- the HTTP response said they all succeeded.
+That knowledge exists only in the rejection emails. An automatic retry would
+have to guess, and guessing wrong opens duplicate positions. It warns per
+ticker when a previous attempt was `delivered`.
+
+Twelve tests, including confirmation that the ordinary nightly path is still
+blocked by its stamp.
+
+---
+
+## 2026-10-26 -- FORWARD TESTING IS LIVE
+
+Monday's four orders were submitted through the resend workflow after the open
+and accepted. The full chain is working: orchestrator builds the list
+overnight, the morning job sends it after 09:35 ET, TradersPost auto-submits,
+TradeStation accepts.
+
+[DECISION, Dave] Let it run several days before any new work.
+
+**What to watch in the first week:**
+
+1. **Fill prices against the limits in the email.** This is the Tier 2 fidelity
+   check and it matters more than anything else -- the edge is the fill price.
+2. **The subscription staying enabled and on Auto Submit.** It reverted once,
+   unexplained.
+3. **The morning job running unattended**, first time Tuesday.
+4. **The first exit.** The market-on-open path has never been exercised.
+
+---
+
+## OPEN ITEMS -- revised 2026-10-26
+
+**During the paper week:**
+
+1. **Position reconciliation against the broker.** Promoted from the Tier 2
+   plan: it is the only thing that can detect a rejected order, a partial fill
+   or a wrong quantity, because TradersPost publishes no API for a signal's
+   outcome and HTTP 200 proves nothing. Needs position data from TradersPost or
+   TradeStation -- a real build.
+2. **Watch the subscription settings.** A silent revert stops orders with no
+   signal in our logs.
+3. **Whether the attached stop survives past day one**, and **whether the exit
+   lands at the open** (`EXIT_TIME_IN_FORCE` is the one line to change; `opg` is
+   the fallback). Both answer themselves in the first week.
+4. **Gates are re-evaluated on the fill day** (2026-10-19). A bid can be placed
+   one night and rejected the next morning. First suspect if fills diverge.
+5. **Disposition sheet is stale in five places**: `no_50ma_touch` no longer
+   fires; `limit_order_placed`, `not_ordered` are new; the `run_date` /
+   `for_session` split; `bid_not_filled` is now the main gate after
+   `momentum_screen`.
+
+**Not blocking:**
+
+6. **Dead-scheduler alert.** Now covers two workflows rather than one.
+7. pandas `FutureWarning` at `orchestrator.py:821`.
+8. Second data source.
+9. `.gitignore`; `pull_report.csv` commit; catch-up runs email only the last
+   session; the cron string duplicated between `on.schedule` and the overdue
+   step's guard.
+10. Score the full 17,263 placeable candidates; re-derive bid rationing;
+    candidate ranking. All three are now answerable by watching the system run.
+11. Carried: `sim.py` live-vs-Claude comparison; replay equity discrepancy;
+    thresholds not re-checked on the corrected sample; Relative Strength v2
+    stability; `research/` pushes.
+
+**Deferred to the end of the Phase 2 freeze:** the B1 2-year clearance
+tiebreaker; any revisit of B4.
+
+### [PROCESS] What this week actually demonstrated
+
+Five separate things were wrong between "the code is correct" and "an order
+reaches the broker": a source restriction, a status code that lied, a silently
+reverted subscription, an order type the broker will not accept at that hour,
+and no way to resend. Every one was invisible to unit testing and to reading
+the code. Each surfaced only by running the thing for real, one step further
+each time, in an account where being wrong cost nothing.
+
+That is the argument for the simulated account, and it is worth remembering the
+next time the backlog looks like it should be cleared before going live. Dave
+pushed for exactly that on 2026-10-19, against a plan that had three research
+items ahead of it.
