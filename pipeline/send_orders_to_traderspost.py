@@ -26,13 +26,8 @@ WHAT A DRY RUN CANNOT TELL YOU
 -----------------------------------------------------------------------
 It verifies OUR payloads. It verifies nothing about TradersPost.
 
-The open question is timing. This runs when the orchestrator does, which
-has been between 00:17 and 08:17 Eastern -- the market is shut. The
-TradersPost docs say orders are queued when the market is closed and
-released at the next open, but do not confirm a signal at that hour
-qualifies; it depends on whether the broker would reject it outright.
-Until one real order has gone into the SIM account and been seen the
-next morning, treat overnight delivery as unverified.
+It verifies nothing about what TradeStation will accept, or when. That
+question is now being tested deliberately -- see THE PRE-OPEN TEST below.
 
 -----------------------------------------------------------------------
 HTTP 200 DOES NOT MEAN THE ORDER WAS ACCEPTED (learned 2026-10-24)
@@ -114,34 +109,72 @@ MAX_ORDERS_PER_RUN = 12          # 8 slots plus exits; anything more is a fault
 HTTP_TIMEOUT_SECONDS = 20
 
 # ----------------------------------------------------------------------
-# WHY THERE IS A MARKET-HOURS GUARD (learned 2026-10-24)
+# WHY THERE IS A SEND WINDOW AT ALL (learned 2026-10-24)
 #
 # TradeStation REJECTS a day order submitted while the market is closed.
 # The first order to make it all the way down the chain -- GitHub sent it,
 # TradersPost auto-submitted it, TradeStation received it as a limit buy
 # for 1,137 AMC at 2.75 -- came back rejected for exactly that reason.
 # Every nightly send would have been rejected the same way, because the
-# orchestrator always runs overnight.
+# orchestrator always runs overnight (00:17 to 08:17 Eastern observed).
 #
 # Three fixes were considered:
-#   - good-till-cancelled: REJECTED. The bid would rest past the session,
-#     which is the multi-day resting order ruled out on 2026-09-19 for
-#     readmitting the Stage 6b duplication. It changes which trades exist.
+#   - good-till-cancelled: REJECTED. The bid would rest past the session.
+#     A static bid left working for days readmits the Stage 6b duplicate
+#     entries that the one-position-per-ticker rule exists to prevent
+#     (open item raised 2026-09-18; see the `bid_not_filled` comment in
+#     orchestrator.py). It changes which trades exist.
 #   - good-till-date expiring tonight: Dave's idea, and the best of the
 #     three if it worked. It does not: TradersPost's `expiresAt` governs
 #     how long TRADERSPOST holds the signal, not the order's expiry at the
 #     broker, and there is no field for the latter. Sending "gtd" with no
 #     date leaves the order's lifetime at TradeStation undefined.
-#   - SEND AFTER THE OPEN: adopted. The nightly run still builds the list;
-#     a separate morning job sends it. It also fails safe -- a late job
+#   - SEND LATER, not at night: adopted. The nightly run still builds the
+#     list; a separate morning job sends it. It fails safe -- a late job
 #     sends late, and a job that never runs leaves nothing resting at the
-#     broker.
+#     broker overnight.
 #
-# So a LIVE send refuses unless the market is open. A dry run does not
-# check, because nothing leaves the runner.
+# ----------------------------------------------------------------------
+# THE PRE-OPEN TEST (2026-10-27, Dave's call) -- WHY THE FLOOR IS 07:00
+# ----------------------------------------------------------------------
+# The floor was 09:35 ET, a few minutes after the open. That worked, but
+# it depends on GitHub's scheduler being punctual, and it is not: the
+# 09:35 fire had still not appeared by 09:51 on 2026-10-27, and the send
+# only happened because Dave pressed the button. Every minute late is a dip
+# that can be missed, because the bid is not resting yet.
+#
+# Dave's fix is to move the first attempt to 07:00 ET, which buys two and
+# a half hours of slack for GitHub to be late in. The post-open fires stay
+# as the safety net.
+#
+# It also runs an experiment we could not otherwise run cheaply. The
+# TradersPost help bot states (2026-10-27) that a signal arriving while
+# the market is closed is QUEUED and submitted at the next open, with
+# limit price, quantity and stop preserved, and that no setting enables
+# this. Our own 2026-10-24 evidence contradicts that: the Friday 00:37 ET
+# send was passed straight through to TradeStation and rejected, and
+# nothing arrived at Monday's open. A 07:00 send distinguishes the cases:
+#
+#   queued and filled at the open  -> the bot is right, timing is solved
+#   accepted outright              -> pre-market accepts a day order
+#   rejected                       -> the bot is wrong; resend after open
+#
+# NOTE WHAT THIS DOES NOT CHANGE. Even if queueing proves real, the plan
+# is still to send from here on a schedule we can see, because a queue is
+# invisible to us: our log would say "delivered", the broker would say
+# "rejected", and an unobservable recovery would sit in between. That is
+# the exact blindness that cost 2026-10-24. The bot also says a second
+# signal for the same ticker SILENTLY REPLACES the first one queued --
+# which our catch-up runs and the resend workflow can both produce.
+#
+# IF THE 07:00 SEND IS REJECTED, NOTHING RETRIES BY ITSELF. The stamp is
+# written, so the post-open fires will skip. That is deliberate: the
+# alternative re-sends orders that may have been queued and opens two
+# positions. Recovery is the Resend workflow, by hand, after the open.
 # ----------------------------------------------------------------------
 MARKET_TZ = ZoneInfo("America/New_York")
-SEND_NOT_BEFORE = dtime(9, 35)   # a few minutes after the 09:30 open
+MARKET_OPEN = dtime(9, 30)       # the regular session; informational only
+SEND_NOT_BEFORE = dtime(7, 0)    # pre-open by design -- see THE PRE-OPEN TEST
 SEND_NOT_AFTER = dtime(15, 45)   # too near the close for a day bid to mean much
 SEND_LATE_WARN = dtime(10, 30)   # still sent, but the fill picture has drifted
 MARKET_CALENDAR_PATH = os.path.join(
@@ -162,8 +195,12 @@ ORDERS_SENT_COLUMNS = [
 ]
 
 
-def market_is_open_now():
+def in_send_window():
     """(ok, now_et, reason). Fails CLOSED: anything unreadable means no send.
+
+    NOT the same as "the market is open" -- the window deliberately starts
+    before the open (see THE PRE-OPEN TEST above). It answers one question:
+    may this run dispatch right now?
 
     A missing or unreadable calendar stops live trading, which is the right
     way round -- the alternative is firing orders into a day we cannot
@@ -180,11 +217,13 @@ def market_is_open_now():
         return False, now, f"{now.date()} is not a trading day"
     if now.time() < SEND_NOT_BEFORE:
         return False, now, (f"{now:%H:%M} ET is before {SEND_NOT_BEFORE:%H:%M} "
-                            f"-- TradeStation rejects day orders placed "
-                            f"before the open")
+                            f"-- too early even for the pre-open attempt")
     if now.time() > SEND_NOT_AFTER:
         return False, now, (f"{now:%H:%M} ET is past {SEND_NOT_AFTER:%H:%M} "
                             f"-- too late in the session for a day bid")
+    if now.time() < MARKET_OPEN:
+        return True, now, (f"{now:%H:%M} ET, PRE-OPEN (market opens "
+                           f"{MARKET_OPEN:%H:%M}) -- see THE PRE-OPEN TEST")
     return True, now, f"{now:%H:%M} ET, market open"
 
 
@@ -358,12 +397,14 @@ def main():
     # value means the list did not get rebuilt: last night's run failed, or
     # this is a stray execution. Sending a day bid computed from a close
     # two sessions ago is worse than sending nothing.
+    pre_open = False
     if live:
-        ok_now, now_et, why = market_is_open_now()
+        ok_now, now_et, why = in_send_window()
         if not ok_now:
             print(f"  NOT SENDING: {why}.")
             print(f"  The order list is kept; the next morning run sends it.")
             return
+        pre_open = now_et.time() < MARKET_OPEN
         today_et = now_et.date().isoformat()
         if for_session != today_et:
             print(f"  REFUSING: the order list is for {for_session} but today "
@@ -375,7 +416,7 @@ def main():
                   f"valid for today, but any dip to them earlier in the "
                   f"session was missed -- expect fewer fills than the "
                   f"backtest implies.")
-        print(f"  Market check: {why}")
+        print(f"  Window check: {why}")
 
     # ONE DISPATCH PER SESSION -- deliberately bypassed on a resend, which
     # exists precisely because the first dispatch did not take. The stamp
@@ -422,6 +463,16 @@ def main():
                       f"TradersPost actually accepted it, resending will open "
                       f"a SECOND position. Resend only what you have "
                       f"confirmed was rejected.")
+
+    # Announced here, not at the window check, so it appears only when an
+    # order is actually about to go out -- not on a run that then skips.
+    if pre_open:
+        print(f"  PRE-OPEN SEND. TradeStation may reject a day order this "
+              f"early. If it does, NOTHING HERE RETRIES -- the stamp is "
+              f"written and the post-open fires will skip, deliberately, "
+              f"because re-sending could duplicate an order TradersPost "
+              f"queued. Watch for a TradersPost rejection email and use the "
+              f"Resend workflow after 09:30 ET.")
 
     print(f"  {len(orders)} order(s) for session {for_session}")
     rows, n_ok, n_fail = [], 0, 0
@@ -496,6 +547,12 @@ def main():
             print("  A delivered order can still be REJECTED by TradersPost "
                   "after the fact. Check for rejection emails from them, or "
                   "the TradersPost dashboard, before assuming these worked.")
+        if n_ok and pre_open:
+            print("  THIS WAS A PRE-OPEN SEND. The three outcomes to look "
+                  "for: the order is queued and appears at 09:30; it is "
+                  "accepted outright in the pre-market; or it is rejected "
+                  "for market hours. Record which one happened -- it settles "
+                  "whether TradersPost really queues closed-market signals.")
     else:
         print(f"  Done: {n_ok} prepared, {n_fail} failed, mode {mode}")
     if n_fail and live:
