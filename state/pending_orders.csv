@@ -1,5 +1,4 @@
 for_session,order_type,ticker,limit_price,shares,stop_price,risk_per_share,position_cost,score,note
-2026-10-26,BUY_LIMIT,CAKE,107.37,29,103.71,3.6596,3113.84,3.0,day order; 0.269 ATR below last close; sized by cost
-2026-10-26,BUY_LIMIT,OABI,4.54,688,4.26,0.2736,3121.04,3.0,day order; 0.391 ATR below last close; sized by cost
-2026-10-26,BUY_LIMIT,STLN,6.43,485,6.06,0.3722,3119.47,2.5,day order; 0.75 ATR below last close; sized by cost
-2026-10-26,BUY_LIMIT,AMC,2.75,1137,2.58,0.1665,3123.23,3.0,day order; 0.836 ATR below last close; sized by cost
+2026-10-27,BUY_LIMIT,ASST,25.99,120,24.17,1.8194,3119.0,2.5,day order; 0.151 ATR below last close; sized by cost
+2026-10-27,BUY_LIMIT,PRCH,17.01,183,16.19,0.8144,3112.52,3.0,day order; 0.456 ATR below last close; sized by cost
+2026-10-27,BUY_LIMIT,AMC,2.76,1133,2.59,0.1635,3122.77,3.0,day order; 0.752 ATR below last close; sized by cost
