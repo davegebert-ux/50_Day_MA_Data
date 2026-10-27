@@ -1,8 +1,12 @@
-name: Send Orders After the Open
+name: Send Orders
 
 # ============================================================
-# Sends the orders the nightly run already built, shortly after the
-# market opens. The nightly pipeline no longer dispatches.
+# Sends the orders the nightly run already built. First attempt is at
+# 07:00 ET, before the open; the post-open fires are the safety net.
+# The nightly pipeline no longer dispatches.
+#
+# RENAMED 2026-10-27 (was "Send Orders After the Open"). The first send
+# is now BEFORE the open, so the old name was actively misleading.
 #
 # WHY (2026-10-24). TradeStation rejects a day order submitted while the
 # market is closed, and the orchestrator always runs overnight (observed
@@ -12,9 +16,10 @@ name: Send Orders After the Open
 # reason. Every nightly send would have gone the same way.
 #
 # The two alternatives were rejected on their merits, not their effort:
-#   - good-till-cancelled leaves the bid resting past the session, which
-#     is the multi-day resting order ruled out on 2026-09-19 because it
-#     readmits the Stage 6b duplication. It changes which trades exist.
+#   - good-till-cancelled leaves the bid resting past the session. A
+#     static bid left working for days readmits the Stage 6b duplicate
+#     entries that the one-position-per-ticker rule exists to prevent
+#     (open item raised 2026-09-18). It changes which trades exist.
 #   - good-till-date expiring tonight would have been ideal and does not
 #     work: TradersPost's `expiresAt` controls how long TRADERSPOST holds
 #     the signal, not the order's lifetime at the broker, and there is no
@@ -25,22 +30,48 @@ name: Send Orders After the Open
 # send at night, cancel in the morning -- leaves an order working for a
 # second day the first time a run is missed.
 #
+# ------------------------------------------------------------
+# WHY THE FIRST ATTEMPT MOVED TO 07:00 ET (2026-10-27, Dave's call)
+#
+# GitHub's scheduler is best-effort and routinely late. On 2026-10-27 the
+# 09:35 fire had still not appeared by 09:51 and the orders only went out
+# because Dave pressed the button. With the bid not resting, every late
+# minute is a dip that can be missed.
+#
+# Firing at 07:00 ET gives GitHub two and a half hours of slack before
+# the open. Lateness is absorbed rather than paid for.
+#
+# It also settles an open question. TradersPost's help bot says signals
+# arriving while the market is closed are queued and released at the
+# open; our 2026-10-24 evidence says the order went straight through and
+# was rejected. A 07:00 send tells us which: queued, accepted outright in
+# the pre-market, or rejected. Rejected means a manual Resend after 09:30
+# -- nothing retries automatically, on purpose, because a retry could
+# duplicate an order that was in fact queued.
+# ------------------------------------------------------------
+#
 # SCHEDULE. GitHub cron is UTC and ignores daylight saving, and GitHub
-# drops fires under load. So this fires four times and the first one that
+# drops fires under load. So this fires six times and the first one that
 # can send does; the rest find state/last_orders_sent.txt already stamped
 # and exit in seconds.
-#   EDT: 09:35, 10:35, 11:35, 12:35 Eastern
-#   EST: 08:35 (refused, before the open), 09:35, 10:35, 11:35
+#   EDT: 07:00, 08:00, then 09:35, 10:35, 11:35, 12:35 Eastern
+#   EST: 06:00 (refused, before the 07:00 floor), 07:00,
+#        then 08:35, 09:35, 10:35, 11:35
 #
-# The dispatcher itself enforces the window -- market open per the NYSE
-# calendar, at or after 09:35, and the order list dated TODAY. It refuses
-# rather than guesses, so a dropped nightly run means no orders rather
-# than yesterday's.
+# The 08:00 EDT fire matters more than it looks: the nightly run has
+# finished as late as 08:17 ET, and on such a morning the 07:00 fire
+# finds no list for today and correctly refuses.
+#
+# The dispatcher itself enforces the window -- a trading day per the NYSE
+# calendar, at or after 07:00 ET, and the order list dated TODAY. It
+# refuses rather than guesses, so a dropped nightly run means no orders
+# rather than yesterday's.
 # ============================================================
 
 on:
   schedule:
-    - cron: '35 13,14,15,16 * * 1-5'
+    - cron: '0 11,12 * * 1-5'       # pre-open: 07:00/08:00 EDT, 06:00/07:00 EST
+    - cron: '35 13,14,15,16 * * 1-5' # post-open safety net
   workflow_dispatch:          # manual send, same guards apply
 
 concurrency:
