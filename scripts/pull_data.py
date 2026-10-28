@@ -4,9 +4,17 @@ Historical Data Pull for 50-Day MA Bounce Scorecard - Larger Sample Build
 
 Pulls daily OHLCV history from the Yahoo Finance chart API (direct HTTPS
 requests, no yfinance dependency) for the live TradingView momentum-screen
-universe (see get_tradingview_screen_tickers()) UNIONED with any currently
-open positions (see get_open_position_tickers()), and writes one CSV per
-ticker in the format:
+universe (see get_tradingview_screen_tickers()) UNIONED with:
+
+  - any currently open position     (get_open_position_tickers)
+  - any ticker with an order out    (get_pending_order_tickers)
+  - the SPY benchmark
+
+The rule behind those three: any ticker the system has business with gets
+pulled, whatever the screen says today. Each was added after a bug caused
+by its absence; the comments on each function carry the evidence.
+
+Writes one CSV per ticker in the format:
 
     Date, Open, High, Low, Close, Volume
 
@@ -40,6 +48,10 @@ DATA_DIR.mkdir(exist_ok=True)
 # file lives regardless of working directory.
 STATE_DIR = REPO_ROOT / "state"
 OPEN_POSITIONS_PATH = STATE_DIR / "open_positions.csv"
+
+# FIX (2026-10-28): a ticker with a BID OUT needs its bar for exactly the
+# same reason an open position does -- see get_pending_order_tickers().
+PENDING_ORDERS_PATH = STATE_DIR / "pending_orders.csv"
 
 HEADERS = {
     "User-Agent": (
@@ -182,6 +194,59 @@ def get_open_position_tickers():
     if "ticker" not in df.columns or df.empty:
         return set()
     return set(df["ticker"].dropna().astype(str).str.strip())
+
+
+def get_pending_order_tickers():
+    """
+    Read state/pending_orders.csv and return every ticker with an order
+    out -- bids waiting to fill and market-on-open exits alike.
+
+    FIX (2026-10-28). THE BUG THIS CLOSES, with the evidence:
+
+    STLN was bid on the 2026-10-23 run for the 2026-10-26 session, and the
+    broker FILLED it at 6.43 on the 26th. But STLN dropped off the
+    TradingView momentum screen that same day, so this pull never fetched
+    its 10-26 bar, so orchestrator.py had no bar to test the bid against,
+    so the fill was never booked. The system did not know it held STLN.
+
+    It then compounded: two days later the system bid STLN AGAIN, because
+    a ticker it does not know it holds is a ticker it will happily buy.
+    Only TradersPost's refusal to add to an open position stopped a second
+    position opening. Nothing in our own code would have.
+
+    WHY THIS WILL KEEP HAPPENING WITHOUT THE FIX. The screen requires
+    SMA50 < price and 6-month performance above 30%. A stock pulling back
+    INTO its 50-day average is pressed against the first of those by
+    definition -- the setup we trade is the condition most likely to drop
+    a ticker off the screen on the very day we need its bar. This is not a
+    rare coincidence; it is the normal case for a bid that gets hit hard.
+
+    WHY NOT FILTER BY SESSION. The file is rewritten each run, so at pull
+    time it holds the orders that were working for the session about to be
+    processed -- exactly the ones whose fills need checking. Reading it
+    whole is also the safe direction: an extra ticker costs one HTTP
+    request, a missing one costs an untracked position.
+
+    Dave's rule, stated 2026-10-28: "If there is any kind of open activity
+    on a ticker -- a bid out, a current position, an order to close -- it
+    needs to remain in the data pull." Open positions were already covered
+    (see get_open_position_tickers); exits are always for open positions
+    and so were covered too. Pending bids were the gap.
+    """
+    if not PENDING_ORDERS_PATH.exists():
+        return set()
+    try:
+        df = pd.read_csv(PENDING_ORDERS_PATH)
+    except Exception as e:
+        # Deliberately loud. A silent empty set here reopens the exact bug
+        # this function exists to close, and the pull would still report
+        # success.
+        print(f"WARNING: could not read {PENDING_ORDERS_PATH.name} ({e}); "
+              f"tickers with a bid out may be MISSING from this pull.")
+        return set()
+    if "ticker" not in df.columns or df.empty:
+        return set()
+    return set(df["ticker"].dropna().astype(str).str.strip().str.upper())
 
 
 # ----------------------------------------------------------------------
@@ -956,14 +1021,40 @@ def main():
     # Unioned in unconditionally, the same way open positions are, because
     # like them it is a correctness requirement independent of whatever
     # the screen returns on any given day.
+    # FIX (2026-10-28): tickers with an order working must be pulled for the
+    # same reason open positions must -- a bid cannot be checked for a fill
+    # without that day's bar. STLN was filled at the broker on 2026-10-26
+    # and never booked here because it left the screen that day. See
+    # get_pending_order_tickers() for the full evidence.
+    pending_order_tickers = get_pending_order_tickers()
+
     BENCHMARK_TICKERS = {"SPY"}
-    added_tickers = (open_position_tickers | BENCHMARK_TICKERS) - set(universe.keys())
+    required = open_position_tickers | pending_order_tickers | BENCHMARK_TICKERS
+    added_tickers = required - set(universe.keys())
     if added_tickers:
-        print(f"Adding {len(added_tickers)} required ticker(s) (benchmark / open position) not in "
-              f"today's screen results: {sorted(added_tickers)}")
-        for sym in added_tickers:
-            universe[sym] = ("Benchmark" if sym in BENCHMARK_TICKERS
-                             else "Open Position (outside screen)", "", sym)
+        def _why(sym):
+            if sym in BENCHMARK_TICKERS:
+                return "Benchmark"
+            if sym in open_position_tickers:
+                return "Open Position (outside screen)"
+            return "Pending Order (outside screen)"
+
+        print(f"Adding {len(added_tickers)} required ticker(s) (benchmark / "
+              f"open position / pending order) not in today's screen "
+              f"results:")
+        for sym in sorted(added_tickers):
+            reason = _why(sym)
+            print(f"  {sym:<8} {reason}")
+            universe[sym] = (reason, "", sym)
+
+    # Said plainly, because this is the line that would have caught the
+    # STLN bug on the day it happened rather than two days later.
+    off_screen_bids = sorted(pending_order_tickers & added_tickers)
+    if off_screen_bids:
+        print(f"Tickers with an order out that TODAY'S SCREEN DID NOT "
+              f"RETURN ({len(off_screen_bids)}): {', '.join(off_screen_bids)}")
+        print(f"  These are pulled anyway. Without that, a bid that filled "
+              f"would never be booked.")
 
     symbols = sorted(universe.keys())
 
