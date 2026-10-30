@@ -8273,13 +8273,80 @@ Monitor through the coming week, then build position reconciliation.
 
 ---
 
+## 2026-10-30 -- [MANUAL CANCEL] UTZ: A PENDING BUYOUT PASSED EVERY GATE
+
+This morning's send included a buy limit on **UTZ** (Utz Brands). Dave
+cancelled it at the broker. It is the first manual override of a system order.
+
+**Why the chart looks like that.** Utz agreed in July 2026 to be taken private
+by Intersnack Group for **$14.25 a share in cash**, expected to close in Q4
+2026 (company press release). The stock gapped to the offer and has been
+pinned to it since. Dave's chart on 2026-10-30: price 14.31, ADR% 0.23,
+ATR 0.03, SMA50 about 14.23. A pinned merger-arbitrage stock is not a pullback
+setup: the upside is capped near the deal price and the downside is the deal
+breaking.
+
+**Why it passed.** Every gate reads price history, and nothing in the
+pipeline knows a deal exists. The 6-month performance includes the takeover
+gap, price sits just above a rising 50-day, and a flat line hugging its
+averages is the pattern MA Respect rewards. [INFERENCE: its actual score was
+not checked.]
+
+**What a fill would have cost.** Risk per share is entry x min(7%, ADR10),
+so about 0.23%, roughly 3 cents. The 12.5% cost cap binds: about $3,100 of
+capital and one of the 8 slots, risking about $7. The bigger problem is the
+R arithmetic. When 1R is 3 cents, one cent of slippage is a third of an R and
+a 9-cent drift is +3R. One such trade inside a 20-trade Tier 2 sample would
+distort both the fill-fidelity read and avgR.
+
+**Not the rejected stop floor.** The 2026-09-14 sizing entry rejected a
+minimum stop DISTANCE, which widens tight stops and spends the edge. This is
+different: excluding a name whose range is too small to trade at all. It is
+the mirror of the 10% ADR ceiling (adopted 2026-09-14), which removes names
+too wild to size.
+
+### [CHECK TONIGHT -- Tier 1] The books may not match the broker
+
+The order was cancelled at the broker, but the nightly run does not know
+that. If today's low reached the bid, tonight's run books UTZ as opened. The
+broker does not hold it, and the broker wins: if UTZ appears in
+`state/open_positions.csv`, Dave sends the current file and it is removed.
+
+### It will come back
+
+Nothing stops UTZ being bid again each night it still passes the screen,
+possibly through to the deal's close. Until something changes, every time:
+cancel at the broker, then check the books that night.
+
+### Two fixes, different timing
+
+1. **Manual exclusion list -- now, Dave's call. [OPEN]** A small file Dave
+   edits in GitHub's web editor (`state/excluded_tickers.csv`: ticker, date,
+   reason) that the orchestrator skips before writing orders. Arguably within
+   the freeze: it changes no rule, it records a veto Dave is already making at
+   the broker, and it keeps the books equal to the broker. Needs the current
+   `pipeline/orchestrator.py`; adds one disposition to the sheet.
+2. **ADR% floor, automatic -- after the freeze.** Measure first: how many of
+   the 1,404 baseline trades had ADR10 under about 1%, and what they returned.
+   The 2026-09-14 band table only goes down to "under 3%" (357 trades, +0.55R
+   with outliers trimmed), so where a floor belongs is unknown. Do not pick
+   the number by intuition. A floor would also catch slow low-volatility names
+   that are not buyouts; the measurement says whether that costs anything.
+
+---
+
 ## OPEN ITEMS -- revised 2026-10-30
+
+**Tonight:**
+
+1. **UTZ book check (Tier 1).** If UTZ appears in `state/open_positions.csv`,
+   remove it (Dave sends the current file). See the UTZ entry above.
 
 **Before Monday 2026-11-02 (cron-job.org settings, no code):**
 
-1. **cron-job.org timezone.** Clocks fall back 2026-11-01. Confirm the job is
+2. **cron-job.org timezone.** Clocks fall back 2026-11-01. Confirm the job is
    set to a named zone so it stays at 07:05 ET.
-2. **A second morning trigger.** cron-job.org fires once. If the nightly run
+3. **A second morning trigger.** cron-job.org fires once. If the nightly run
    finishes after 07:05 ET (it has been seen as late as 08:17 ET, 2026-10-24),
    the 07:05 send finds no list for today and refuses, and that morning rests
    on GitHub's backup crons, which have proven unreliable. A second
@@ -8289,12 +8356,18 @@ Monitor through the coming week, then build position reconciliation.
    The one-dispatch stamp makes a second fire safe. Does not change which
    trades are taken.
 
+**Decision pending:**
+
+4. **Manual exclusion list** (UTZ entry, fix 1). Recommended now: otherwise
+   UTZ is re-bid and cancelled by hand every session until the deal closes,
+   with a book check each night.
+
 **This week (watch, no build):**
 
-3. **Fill fidelity (Tier 2).** Broker fill against the booked entry, per
+5. **Fill fidelity (Tier 2).** Broker fill against the booked entry, per
    trade. NEO is the first. Also confirm every fill is booked in
    `state/open_positions.csv` (the STLN check). Judge at 10-20 trades.
-4. **The first exit of a system-opened position.** Two questions:
+6. **The first exit of a system-opened position.** Two questions:
    - **Does the exit go through while the attached stop is working?**
      FTNT's rejection ("long 18 shares with 18 remaining on sell orders")
      suggests TradeStation refuses a sell that would over-commit a position.
@@ -8304,35 +8377,36 @@ Monitor through the coming week, then build position reconciliation.
      [INFERENCE, not observed.] Either way the rejection email is the alert.
    - **Does it land at the open?** (`EXIT_TIME_IN_FORCE`; `opg` is the
      fallback.)
-5. **Subscription settings** (carried). Enabled + Auto Submit; IP allowlist
+7. **Subscription settings** (carried). Enabled + Auto Submit; IP allowlist
    "Any IP addresses"; "Allow signal override" on. A silent revert stops
    orders with nothing in our logs.
-6. **Day-order backstop.** Any bid still showing after a close.
-7. **Gates are re-evaluated on the fill day** (2026-10-19, carried). First
+8. **Day-order backstop.** Any bid still showing after a close.
+9. **Gates are re-evaluated on the fill day** (2026-10-19, carried). First
    suspect if fills diverge.
 
 **After the week:**
 
-8. **Position reconciliation against the broker.** The next build. STLN proved
-   it: the books missed a real position and nothing internal could see it.
-   Needs position data from TradersPost or TradeStation. Also settles item 11.
+10. **Position reconciliation against the broker.** The next build. STLN and
+    UTZ both show why: the books and the broker can disagree, and nothing
+    internal can see it. Needs position data from TradersPost or TradeStation.
+    Also settles item 13.
 
 **Small, safe under the freeze:**
 
-9. **Reword the summary email's "Orders to place tonight" header.** Wrong since
-   dispatch moved to the morning.
-10. **Disposition definition sheet is stale**
+11. **Reword the summary email's "Orders to place tonight" header.** Wrong
+    since dispatch moved to the morning.
+12. **Disposition definition sheet is stale**
     (https://claude.ai/code/artifact/ac5ca4d0-9fc9-4369-8f14-73aeea41eae9):
     `no_50ma_touch` retired; `limit_order_placed` and `not_ordered` added;
     `bid_not_filled` now the main gate after `momentum_screen`; the
-    `run_date` / `for_session` split.
-11. **Legacy positions.** DK (2026-09-30, pre-sim, not held at the broker)
+    `run_date` / `for_session` split. Plus one more if item 4 is built.
+13. **Legacy positions.** DK (2026-09-30, pre-sim, not held at the broker)
     rejects on every exit. FTNT (2026-10-20, hand-entered with its own
     bracket) rejects while that bracket stands. IQV (2026-10-07) also
     predates TradersPost; whether the broker holds it is not recorded here.
     When the books and the broker disagree, the broker wins. [DECISION, Dave]
     Not chasing; reconcile or let them age out.
-12. **PAT expiry.** About one year from setup. Renew before it lapses; the
+14. **PAT expiry.** About one year from setup. Renew before it lapses; the
     morning send stops silently when it does. Dave: expiry date in the
     calendar.
 
@@ -8345,7 +8419,8 @@ comparison, replay equity discrepancy, thresholds on the corrected sample,
 Relative Strength v2 stability, `research/` pushes.
 
 **Deferred to the end of the freeze:** the B1 2-year clearance tiebreaker; any
-revisit of B4; the catastrophe stop (2026-10-29).
+revisit of B4; the catastrophe stop (2026-10-29); the ADR% floor, measured
+first (2026-10-30).
 
 **Closed this round:** morning send (cron-job.org); Gmail filter for rejection
 emails (not needed); Monday 2026-10-26 doubled-position check (moot).
