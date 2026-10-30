@@ -8108,3 +8108,244 @@ That is the argument for the simulated account, and it is worth remembering the
 next time the backlog looks like it should be cleared before going live. Dave
 pushed for exactly that on 2026-10-19, against a plan that had three research
 items ahead of it.
+
+---
+
+## 2026-10-27 to 2026-10-29 -- [CHANGE] THE MORNING SEND: 07:00 ET, TRIGGERED FROM CRON-JOB.ORG
+
+GitHub's scheduler proved unreliable for the morning send, the same way it
+already drops fires elsewhere in this document. It is no longer relied on.
+
+**What sends now:**
+
+- **cron-job.org**, job "50MA morning order send", Mon-Fri at **07:05 ET**
+  (set by Dave as 05:05 Mountain). It POSTs to the GitHub API to dispatch
+  `.github/workflows/send_orders_morning.yml` (workflow name "Send Orders") on
+  ref `Main` -- capital M, case-sensitive, as recorded earlier.
+- Auth is a **fine-grained PAT**: this repo only, Actions read/write, about a
+  one-year expiry. **When it expires the morning send stops silently.**
+  Nothing in the repo can see the PAT or its expiry date.
+- **GitHub's own crons stay as a backup net**: 11:00 and 12:00 UTC pre-open,
+  13:35 to 16:35 UTC post-open. The first fire that can send does; the rest
+  find the one-dispatch-per-session stamp and exit, as before.
+- **Send window 07:00 to 15:45 ET**, replacing "at or after 09:35 ET"
+  (2026-10-24). Still one dispatch per session, still logged to
+  `state/orders_sent.csv` as `delivered`, still no automatic retry.
+
+`pipeline/send_orders_to_traderspost.py` 26,675 bytes.
+`.github/workflows/send_orders_morning.yml` 5,414 bytes.
+
+### [CORRECTION] To 2026-10-24, item 4
+
+That entry concluded TradeStation rejects day orders "placed while the market
+is shut". Too broad. The rejected AMC order went at 04:37 UTC, which is
+**00:37 ET, overnight**. On 2026-10-29, orders sent at **07:05 ET were
+accepted pre-market** and rested at the broker as working day orders.
+
+Recorded as observed, not measured: how early TradeStation starts accepting
+was never tested. 07:05 ET is the time known to work; the 07:00 floor is not a
+tested boundary.
+
+The fail-safe argument that chose the morning send on 2026-10-24 still holds:
+a late job sends late, and a job that never runs leaves nothing resting.
+
+**[CLOSED, Dave, 2026-10-30]** Working unattended since 2026-10-29.
+
+### [CHECK BEFORE 2026-11-02] Clocks fall back Sunday 2026-11-01
+
+GitHub crons are UTC, so in Eastern terms they move an hour earlier: 11:00 UTC
+becomes 06:00 ET, before the send floor, and 12:00 UTC becomes 07:00 ET. The
+cron-job.org job follows its own timezone setting. If that is a named zone
+(Mountain or Eastern), it stays at 07:05 ET. If it is a fixed UTC time, it
+fires at 06:05 ET, is refused by the floor, and the morning falls to GitHub's
+backups.
+
+---
+
+## 2026-10-27 to 2026-10-29 -- [BUG, FIXED] STLN: A FILLED BID THAT WAS NEVER BOOKED
+
+STLN's bid filled at the broker, but STLN dropped off the momentum screen the
+same day. `scripts/pull_data.py` fetched the day's screen plus open positions
+(the 2026-09-10 fix); a ticker with only a pending bid was in neither. No bar
+was pulled, so the fill pass never saw the fill and no position was booked.
+
+Booked by hand in `state/open_positions.csv`: entry 2026-10-26, 485 sh @ 6.43,
+risk 0.37, stop 6.06.
+
+**Fix.** Any ticker in `state/pending_orders.csv` or `state/open_positions.csv`
+stays in the pull, whatever the screen says. `scripts/pull_data.py` 50,575
+bytes.
+
+**Rule: any open activity on a ticker keeps it in the pull.** The screen that
+selects a setup can hide its fill.
+
+It was also a Tier 1 event -- position state disagreeing with the broker --
+that nothing inside the system could see. Only the broker could. That is the
+case for reconciliation in one example.
+
+---
+
+## 2026-10-29 -- FIRST UNATTENDED MORNING: ORDERS ACCEPTED PRE-MARKET
+
+- The 07:05 ET send ran with no manual step.
+- TradeStation **accepted the orders pre-market** and they rested as working
+  orders at the broker (visible in TradingView), not held inside TradersPost.
+  Example: HPQ buy limit 98 @ 31.61, stop 30.35. The stop shows Inactive until
+  the buy fills -- correct.
+- **They are day orders.** No unfilled bid from 2026-10-28 was still working
+  on 2026-10-29. TradingView's edit window does not show time in force, so
+  this rests on absence. Backstop: any bid still showing after a session's
+  close means they are not day orders.
+- The Monday 2026-10-26 doubled-position check is moot: orders are clearly
+  reaching the broker directly.
+
+### FTNT: the first exit, and it was rejected
+
+The SELL_MOO for FTNT was rejected: *"You are long 18 shares with 18 remaining
+on sell orders."* FTNT was entered by Dave by hand on 2026-10-20 with a
+TradingView bracket (stop + take profit). Those orders cover all 18 shares,
+and TradersPost could not cancel orders it did not create.
+
+**[DECISION, Dave]** A legacy transition issue; not chased. DK (2026-09-30,
+pre-sim) also rejects on exit, because the broker does not hold it. Dave
+confirmed on 2026-10-30 that exits on positions from before TradersPost failed
+as expected.
+
+**No system-opened position has exited yet** (STLN, OABI, ASST, and later
+fills). Expected to exit cleanly; unconfirmed until one does.
+
+---
+
+## 2026-10-29 -- [LOGGED FOR AFTER THE FREEZE] CATASTROPHE STOP
+
+**The broker stop never moves up.** It sits at the initial stop until the
+trail fires on a close, then a market-on-open sell goes out the next morning.
+A news-driven intraday crash in between can fall all the way to the initial
+stop and give back the open profit.
+
+A stop that rides up with the trail was already tested: `resting_stop`
+(2026-10-13), avgR +0.516 against +0.594 for the close baseline. Intraday
+noise shakes out trades that would have recovered, and those trades are the
+right tail.
+
+The middle ground to evaluate later: a **catastrophe stop**, moved up
+periodically but kept well below the trail line, so it rarely fires but caps
+a disaster.
+
+**Frozen**: it changes exits. It also needs new code to modify a stop through
+TradersPost. Revisit after about 20 paper trades.
+
+---
+
+## 2026-10-30 -- PAPER WEEK CHECK-IN
+
+### Fills
+
+Two orders from 2026-10-29. **NEO filled slightly better than its limit**,
+because of where the market opened. The other could not yet be read.
+
+Better than the limit on a gap open is what the books should also show:
+production fills at `min(bid, Open)` (confirmed 2026-10-19, BCRX). So the
+Tier 2 check is **broker fill against the BOOKED entry price**, not against
+the limit in the email.
+
+**[DECISION, Dave]** Basically working, but it depends on where the market
+opens. Watch for a week; Tier 2 judges it at 10-20 trades.
+
+### Closed today
+
+- **Morning send** (cron-job.org) -- working unattended.
+- **Gmail filter for TradersPost rejection emails -- not needed.** [DECISION,
+  Dave] They land in his inbox and he reads them; the inbox is kept tidy. They
+  remain the only automatic warning of a rejected order.
+- **Branch name** reconfirmed: `Main`, capital M.
+
+### [DECISION, Dave] Plan
+
+Monitor through the coming week, then build position reconciliation.
+
+### [PROCESS] Two lessons carried from the 2026-10-29 handoff
+
+- A vendor support bot's description is an account, not evidence. Observe
+  instead.
+- Measure before recommending. Intuitions about dangerous setups have been
+  wrong repeatedly, always in the same direction.
+
+---
+
+## OPEN ITEMS -- revised 2026-10-30
+
+**Before Monday 2026-11-02 (cron-job.org settings, no code):**
+
+1. **cron-job.org timezone.** Clocks fall back 2026-11-01. Confirm the job is
+   set to a named zone so it stays at 07:05 ET.
+2. **A second morning trigger.** cron-job.org fires once. If the nightly run
+   finishes after 07:05 ET (it has been seen as late as 08:17 ET, 2026-10-24),
+   the 07:05 send finds no list for today and refuses, and that morning rests
+   on GitHub's backup crons, which have proven unreliable. A second
+   cron-job.org job at about **09:15 ET** covers it. Keep it before 09:30: a
+   bid resting at the open gets the open price on a gap down, which is what
+   the books record (`min(bid, Open)`); a bid sent after the open does not.
+   The one-dispatch stamp makes a second fire safe. Does not change which
+   trades are taken.
+
+**This week (watch, no build):**
+
+3. **Fill fidelity (Tier 2).** Broker fill against the booked entry, per
+   trade. NEO is the first. Also confirm every fill is booked in
+   `state/open_positions.csv` (the STLN check). Judge at 10-20 trades.
+4. **The first exit of a system-opened position.** Two questions:
+   - **Does the exit go through while the attached stop is working?**
+     FTNT's rejection ("long 18 shares with 18 remaining on sell orders")
+     suggests TradeStation refuses a sell that would over-commit a position.
+     If so, the likelier failure is not an orphaned stop opening a SHORT but a
+     **rejected exit**: the FTNT message again, on a system position, with the
+     books showing it closed at the open and the broker still long.
+     [INFERENCE, not observed.] Either way the rejection email is the alert.
+   - **Does it land at the open?** (`EXIT_TIME_IN_FORCE`; `opg` is the
+     fallback.)
+5. **Subscription settings** (carried). Enabled + Auto Submit; IP allowlist
+   "Any IP addresses"; "Allow signal override" on. A silent revert stops
+   orders with nothing in our logs.
+6. **Day-order backstop.** Any bid still showing after a close.
+7. **Gates are re-evaluated on the fill day** (2026-10-19, carried). First
+   suspect if fills diverge.
+
+**After the week:**
+
+8. **Position reconciliation against the broker.** The next build. STLN proved
+   it: the books missed a real position and nothing internal could see it.
+   Needs position data from TradersPost or TradeStation. Also settles item 11.
+
+**Small, safe under the freeze:**
+
+9. **Reword the summary email's "Orders to place tonight" header.** Wrong since
+   dispatch moved to the morning.
+10. **Disposition definition sheet is stale**
+    (https://claude.ai/code/artifact/ac5ca4d0-9fc9-4369-8f14-73aeea41eae9):
+    `no_50ma_touch` retired; `limit_order_placed` and `not_ordered` added;
+    `bid_not_filled` now the main gate after `momentum_screen`; the
+    `run_date` / `for_session` split.
+11. **Legacy positions.** DK (2026-09-30, pre-sim, not held at the broker)
+    rejects on every exit. FTNT (2026-10-20, hand-entered with its own
+    bracket) rejects while that bracket stands. IQV (2026-10-07) also
+    predates TradersPost; whether the broker holds it is not recorded here.
+    When the books and the broker disagree, the broker wins. [DECISION, Dave]
+    Not chasing; reconcile or let them age out.
+12. **PAT expiry.** About one year from setup. Renew before it lapses; the
+    morning send stops silently when it does. Dave: expiry date in the
+    calendar.
+
+**Not blocking (carried from 2026-10-26):** dead-scheduler alert (now two
+workflows); pandas `FutureWarning` at `orchestrator.py:821`; second data
+source; `.gitignore`, `pull_report.csv` commit, catch-up runs emailing only the
+last session, the duplicated cron string; scoring the 17,263 placeable
+candidates, bid rationing, candidate ranking; `sim.py` live-vs-Claude
+comparison, replay equity discrepancy, thresholds on the corrected sample,
+Relative Strength v2 stability, `research/` pushes.
+
+**Deferred to the end of the freeze:** the B1 2-year clearance tiebreaker; any
+revisit of B4; the catastrophe stop (2026-10-29).
+
+**Closed this round:** morning send (cron-job.org); Gmail filter for rejection
+emails (not needed); Monday 2026-10-26 doubled-position check (moot).
