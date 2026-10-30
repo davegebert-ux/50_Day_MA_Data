@@ -1,4 +1,4 @@
 for_session,order_type,ticker,limit_price,shares,stop_price,risk_per_share,position_cost,score,note
-2026-10-29,SELL_MOO,FTNT,,18,,,,,trail broke 2026-10-28
-2026-10-29,BUY_LIMIT,NEO,17.58,177,16.78,0.7995,3112.28,3.0,day order; 0.484 ATR below last close; sized by cost
-2026-10-29,BUY_LIMIT,HPQ,31.61,98,30.35,1.2574,3097.95,3.0,day order; 0.648 ATR below last close; sized by cost
+2026-10-30,SELL_MOO,ASST,,120,,,,,trail broke 2026-10-29
+2026-10-30,BUY_LIMIT,NTNX,69.36,45,67.12,2.2467,3121.37,3.5,day order; 0.611 ATR below last close; sized by cost
+2026-10-30,BUY_LIMIT,UTZ,14.25,219,14.21,0.0359,3120.75,3.0,day order; 0.795 ATR below last close; sized by cost
