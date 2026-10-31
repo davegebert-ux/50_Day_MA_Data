@@ -8424,3 +8424,187 @@ first (2026-10-30).
 
 **Closed this round:** morning send (cron-job.org); Gmail filter for rejection
 emails (not needed); Monday 2026-10-26 doubled-position check (moot).
+
+---
+
+## 2026-10-31 -- [BUILT] MANUAL EXCLUSION LIST
+
+**[CORRECTION] To 2026-10-30:** the file is `state/excluded_tickers.txt`, not
+`state/excluded_tickers.csv`. One ticker per line, `#` for notes -- the same
+shape as `state/skip_sessions.txt`, the other hand-edited file in `state/`.
+Plain text is simpler to edit in GitHub's web editor than CSV columns, and
+only the ticker is read.
+
+### What it does
+
+A listed ticker cannot become a signal. The check is a new final scan gate,
+`manually_excluded`, at the end of `find_new_signals_for_date()`. That
+function serves both passes, so one check has two effects:
+
+- **Order pass:** no bid is written for it, from the next nightly run on.
+- **Fill pass:** a bid for it that already went out is treated as CANCELLED
+  and is never booked. This is what keeps the books equal to the broker when
+  Dave cancels there -- the UTZ case below.
+
+It is the LAST gate on purpose. A funnel row with `dropped_at =
+manually_excluded` means exactly one thing: the strategy wanted the trade and
+Dave did not. A listed name that fails an earlier gate is logged at that gate,
+which is how the funnel shows it no longer matters and can come off the list.
+
+**The rule that goes with it: add it here, and if an order for it is already
+at the broker, cancel it there.** The fill pass assumes the cancel happened.
+A listed ticker whose order was left working and filled would be held at the
+broker and missing from the books -- the STLN direction of error.
+
+**What it does not do.** Open positions are untouched: `already_open` runs
+first, and exits never pass through the scan. A listed ticker that is open
+keeps its trail and its market-on-open sell.
+
+**Missing file:** nothing is excluded, output byte-identical to before.
+**Unreadable file:** warns, excludes nothing. Chosen direction: the opposite
+-- refusing to evaluate fills -- would stop real broker fills being booked,
+which is the worse divergence.
+
+Forgiving on purpose, since it is hand-edited: blank lines, notes, lower case,
+quotes, tabs, Windows line endings and a leading BOM are all fine; only the
+first word on a line is read; `BRK.B`, `brk/b` and `BRK-B` match the same file.
+
+**Freeze.** Changes no rule. Records a veto Dave was already making at the
+broker. The automatic version, an ADR% floor, stays deferred and must be
+measured first (2026-10-30).
+
+### Verification
+
+Mock repo: the real `orchestrator.py` against stub modules (screen, score and
+overhead checks set to pass) and synthetic price data -- NOT production data.
+Compared against the previous `orchestrator.py` run on the same inputs:
+
+| case | result |
+|---|---|
+| no list file | state files identical to the old version |
+| list of comments only | identical |
+| UTZ listed, bid sent last night, price reached it | not booked; funnel `manually_excluded`; no bid written for the next session; every other ticker identical |
+| UTZ listed, not bid last night | old version bid it; new does not; everything else identical |
+| an OPEN position listed, trail broken | identical to the old version: still open, market-on-open sell still written |
+| messy hand edits (BOM, CRLF, case, quotes, tabs, `brk.b`) | all read correctly |
+| list unreadable (a folder in its place) | warning; identical to the old version; exit 0 |
+
+Not tested: `pipeline/send_summary_email.py`. The only new thing it can see
+is the funnel label `manually_excluded`.
+
+`pipeline/orchestrator.py` 96,985 -> 102,794 bytes. Additions only: 117 lines
+added, none removed or changed. `state/excluded_tickers.txt` 549 bytes, with
+UTZ.
+
+---
+
+## 2026-10-31 -- [TIER 1, CONFIRMED] UTZ WAS BOOKED; REMOVED BY HAND
+
+The 2026-10-30 run booked UTZ: entry 14.25, risk per share 0.0359, 219 shares,
+cost 3,120.75. The broker does not hold it -- Dave cancelled the bid that
+morning. The books held a position that did not exist.
+
+**Second books-versus-broker disagreement in a week, and in the opposite
+direction to STLN:**
+
+| | the broker | the books |
+|---|---|---|
+| STLN (2026-10-26) | held it | missed it |
+| UTZ (2026-10-30) | did not hold it | booked it |
+
+Neither was visible from inside the system. Both were found by Dave comparing
+against the broker. Reconciliation (open item) is the only thing that closes
+this.
+
+The risk per share confirms the 2026-10-30 arithmetic: 0.0359 is 0.25% of
+entry, so 1R is under 4 cents.
+
+**Fix.** UTZ's row removed from `state/open_positions.csv` (449 -> 400
+bytes). It was never in `state/closed_trades.csv`, so it leaves no trade and no
+setup-reset record -- correct, since no trade happened. The append-only logs
+keep their record: the funnel's `opened` row for UTZ on 2026-10-30, and that
+session's equity-curve row, still include it. Left as written; they record
+what the system did.
+
+**No Monday cancel needed.** Because UTZ was booked as open, the Friday night
+run's `already_open` gate kept it off the order list for 2026-11-02. With UTZ
+now out of the book and on the exclusion list, it is not bid again.
+
+### The book as of 2026-10-31
+
+`state/open_positions.csv` after the fix: IQV (10-07), OABI (10-26), STLN
+(10-26), DINO (10-28), NEO (10-29), NTNX (10-30). Six positions, 18,645.86
+committed.
+
+Against the 2026-10-29 handoff list (DK, IQV, FTNT, OABI, STLN, ASST): **DK,
+FTNT and ASST are no longer in the book.** DK and FTNT are legacy positions
+whose broker exits reject (2026-10-29). **ASST was opened by the system
+(2026-10-27), so its exit is the first system-opened exit** -- the open item
+on whether the attached stop blocks the sell. Whether the broker agrees has
+not been checked. [OPEN]
+
+---
+
+## OPEN ITEMS -- revised 2026-10-31
+
+**Now:**
+
+1. **ASST at the broker.** The books closed it. Is it flat at the broker?
+   Any TradersPost rejection email? If the exit was a market-on-open sell and
+   it went through, the attached-stop question (item 5) is answered.
+
+**Before Monday 2026-11-02 (cron-job.org settings, no code):**
+
+2. **cron-job.org timezone.** Clocks fall back 2026-11-01. Confirm the job is
+   set to a named zone so it stays at 07:05 ET.
+3. **A second morning trigger** at about 09:15 ET, before the open. Covers a
+   nightly run that finishes after 07:05 ET. Detail in the 2026-10-30 list.
+
+**This week (watch, no build):**
+
+4. **Fill fidelity (Tier 2).** Broker fill against the booked entry, per
+   trade. NEO is booked at 17.25; Dave saw a fill slightly better than the
+   limit. Confirm every fill is booked (the STLN check) and nothing is booked
+   that was not filled (the UTZ check). Judge at 10-20 trades.
+5. **The first exit of a system-opened position** -- ASST, item 1. Does the
+   sell go through while the attached stop is working (FTNT suggests a
+   rejection is the likelier failure, not a short)? Does it land at the open?
+6. **Subscription settings** (carried). Enabled + Auto Submit; IP allowlist
+   "Any IP addresses"; "Allow signal override" on.
+7. **Day-order backstop.** Any bid still showing after a close.
+8. **Gates are re-evaluated on the fill day** (2026-10-19, carried).
+
+**After the week:**
+
+9. **Position reconciliation against the broker.** The next build. STLN and
+   UTZ are its two failure directions, one each.
+
+**Small, safe under the freeze:**
+
+10. **Reword the summary email's "Orders to place tonight" header.**
+11. **Disposition definition sheet is stale**
+    (https://claude.ai/code/artifact/ac5ca4d0-9fc9-4369-8f14-73aeea41eae9):
+    `no_50ma_touch` retired; `limit_order_placed`, `not_ordered` and now
+    `manually_excluded` added; `bid_not_filled` now the main gate after
+    `momentum_screen`; the `run_date` / `for_session` split.
+12. **Legacy positions.** DK and FTNT are out of the book; FTNT may still be
+    held at the broker under its own bracket. IQV (2026-10-07) predates
+    TradersPost; whether the broker holds it is not recorded. The broker wins.
+    [DECISION, Dave] Not chasing; reconciliation settles it.
+13. **PAT expiry.** About one year from setup; the morning send stops silently
+    when it lapses. Dave: expiry date in the calendar.
+
+**Not blocking (carried):** dead-scheduler alert; pandas `FutureWarning` at
+`orchestrator.py:821` (now line 919 after today's additions); second data
+source; `.gitignore`, `pull_report.csv` commit, catch-up runs emailing only
+the last session, the duplicated cron string; scoring the 17,263 placeable
+candidates, bid rationing, candidate ranking; `sim.py` live-vs-Claude
+comparison, replay equity discrepancy, thresholds on the corrected sample,
+Relative Strength v2 stability, `research/` pushes.
+
+**Deferred to the end of the freeze:** the B1 2-year clearance tiebreaker; any
+revisit of B4; the catastrophe stop (2026-10-29); the ADR% floor, measured
+first (2026-10-30).
+
+**Closed this round:** manual exclusion list (built); UTZ book check (booked,
+removed); Monday UTZ cancel (not needed).
