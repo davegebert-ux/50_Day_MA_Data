@@ -1,4 +1,3 @@
 for_session,order_type,ticker,limit_price,shares,stop_price,risk_per_share,position_cost,score,note
-2026-10-30,SELL_MOO,ASST,,120,,,,,trail broke 2026-10-29
-2026-10-30,BUY_LIMIT,NTNX,69.36,45,67.12,2.2467,3121.37,3.5,day order; 0.611 ATR below last close; sized by cost
-2026-10-30,BUY_LIMIT,UTZ,14.25,219,14.21,0.0359,3120.75,3.0,day order; 0.795 ATR below last close; sized by cost
+2026-11-02,SELL_MOO,NEO,,181,,,,,trail broke 2026-10-30
+2026-11-02,BUY_LIMIT,VLO,396.82,7,378.04,18.7875,2777.77,3.0,day order; 0.158 ATR below last close; sized by cost
