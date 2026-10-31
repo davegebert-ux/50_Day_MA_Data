@@ -84,6 +84,50 @@ PENDING_ORDERS_COLUMNS = [
     "stop_price", "risk_per_share", "position_cost", "score", "note",
 ]
 
+# ------------------------------------------------------------------
+# MANUAL EXCLUSION LIST (added 2026-10-31)
+#
+# Tickers Dave has vetoed by hand. One per line in
+# state/excluded_tickers.txt; anything after '#' is a note. Same shape as
+# state/skip_sessions.txt, and for the same reason: a human decision,
+# recorded in a file in the repo, where it can be read back later.
+#
+# WHY IT EXISTS. On 2026-10-30 the morning send placed a bid on UTZ, a
+# pending cash buyout (Intersnack, $14.25) pinned to the deal price: ADR
+# 0.23%, ATR 3 cents. Every gate reads price history, nothing in the
+# pipeline knows a deal exists, and a flat line hugging a rising 50-day is
+# exactly what the screen and MA Respect reward. Dave cancelled it at the
+# broker. Without this list it is re-bid every night until the deal
+# closes. Dave: "We need to get these kinds of things out of there for
+# sure."
+#
+# WHAT IT DOES. A listed ticker cannot become a signal. That has two
+# effects, because find_new_signals_for_date() serves both passes:
+#   - order pass: no bid is written for it, from the next nightly run on.
+#   - fill pass:  a bid for it already sent is treated as CANCELLED and is
+#                 never booked. This is what keeps the books equal to the
+#                 broker when Dave cancels there -- the 2026-10-30 UTZ case.
+#
+# THE RULE THAT MAKES THE SECOND EFFECT SAFE: add it here, and if an order
+# for it is already at the broker, cancel it there. The fill pass assumes
+# the cancel happened. A listed ticker whose order was left working and
+# filled would be held at the broker and missing from the books.
+#
+# WHAT IT DOES NOT DO. Open positions are untouched -- the already_open
+# gate runs first, and exits never pass through this function. A listed
+# ticker that is open keeps its trail and its market-on-open sell.
+#
+# FREEZE. This changes no rule. It records a veto Dave is already making
+# at the broker, so the system's books match what is actually traded. The
+# automatic version -- an ADR% floor, the mirror of ADR_CEILING_PCT -- is
+# deferred to after the freeze and must be measured before a number is
+# picked (Architecture_and_Scope_v1.md, 2026-10-30).
+#
+# A missing file means nothing is excluded, and the run is byte-identical
+# to the version before this list existed.
+# ------------------------------------------------------------------
+EXCLUDED_TICKERS_PATH = os.path.join(_STATE_DIR, "excluded_tickers.txt")
+
 SKIP_SCORE_THRESHOLD = 2.5  # MVP decision -- see Conviction_Sizing_Model_v3.md
 
 # SETUP RESET ON RE-ENTRY (added 2026-09-19) -- keep in sync with
@@ -229,6 +273,12 @@ FUNNEL_GATES = [
     "no_atr_for_entry_bid",   # ADDED 2026-09-19 with ENTRY_BID_ATR_MULT
     "no_spy_data",
     "score_below_threshold",
+    # ADDED 2026-10-31: Dave's veto, state/excluded_tickers.txt. LAST of the
+    # scan gates on purpose: a row here means the strategy wanted the trade
+    # and Dave did not. A vetoed name that fails an earlier gate is logged
+    # at that gate, which is how the funnel shows it no longer matters and
+    # can come off the list.
+    "manually_excluded",
     "no_slot_available",    # fired in size_and_open_trades(), not the scan
 ]
 # DISPOSITIONS (the other column) -- what happened to a ticker that was NOT
@@ -486,6 +536,47 @@ def set_last_run_date(date):
         f.write(str(pd.Timestamp(date).date()))
 
 
+def _ticker_key(t):
+    """Normalise a ticker for the exclusion match: upper case, with '.' and
+    '/' read as '-', so 'BRK.B', 'brk/b' and 'BRK-B' all match one file."""
+    return str(t).strip().upper().replace(".", "-").replace("/", "-")
+
+
+def load_excluded_tickers():
+    """The tickers in state/excluded_tickers.txt, normalised by _ticker_key().
+    See EXCLUDED_TICKERS_PATH for what the list does and the rule that goes
+    with it.
+
+    Forgiving on purpose, because the file is edited by hand in GitHub's web
+    editor: blank lines, '#' notes, lower case, quotes and a leading BOM are
+    all fine, and only the FIRST word on a line is read, so 'UTZ, buyout' and
+    'UTZ  buyout' both mean UTZ.
+
+    A missing file is the normal case and means nothing is excluded. An
+    unreadable one warns and excludes nothing. That direction is deliberate:
+    the opposite -- refusing to evaluate fills -- would stop real broker fills
+    being booked, which is the worse divergence.
+    """
+    out = set()
+    try:
+        with open(EXCLUDED_TICKERS_PATH, encoding="utf-8-sig",
+                  errors="replace") as f:
+            for line in f:
+                line = line.split("#", 1)[0]
+                words = (line.replace(",", " ").replace('"', " ")
+                         .replace("'", " ").split())
+                if words:
+                    out.add(_ticker_key(words[0]))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"  WARNING: could not read "
+              f"{os.path.basename(EXCLUDED_TICKERS_PATH)} "
+              f"({type(e).__name__}: {e}) -- NO tickers are excluded this "
+              f"run. Cancel any order for a vetoed ticker at the broker.")
+    return out
+
+
 # ============================================================
 # STEP 1: CHECK OPEN POSITIONS FOR EXITS (as of target_date)
 # ============================================================
@@ -718,6 +809,13 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
               f"(unclassified) rather than split into churn vs fault.")
     else:
         print(f"  Missing-bar classifier: {fetch_note}")
+
+    # ADDED 2026-10-31: Dave's veto list. Read on every call, so an edit
+    # committed during the day applies to that night's run.
+    excluded = load_excluded_tickers()
+    if excluded and mode == "fill":
+        print(f"  Manual exclusion list: {', '.join(sorted(excluded))}")
+    vetoed = []
 
     n_churn = 0
     n_fault = 0
@@ -982,6 +1080,20 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
                  score=total_score)
             continue
 
+        # MANUAL EXCLUSION (2026-10-31) -- see EXCLUDED_TICKERS_PATH. The last
+        # gate, so the row records everything the strategy decided before the
+        # veto. In the fill pass this is what stops a bid Dave cancelled at
+        # the broker from being booked; in the order pass it stops the bid.
+        if excluded and _ticker_key(ticker) in excluded:
+            _log(funnel_rows, target_date, ticker, "manually_excluded",
+                 entry_price=round(float(entry_price), 4),
+                 risk_per_share=round(float(risk_per_share), 4),
+                 adr10_pct=round(float(adr10_pct), 4),
+                 overhead_R=or_result.get("overhead_R"),
+                 score=total_score)
+            vetoed.append(ticker)
+            continue
+
         # ADDED 2026-10-19: how far the last close sits above the bid, in
         # ATRs. Used to order the nightly bid list -- see write_pending_orders.
         _dist = ((float(prior["Close"]) - float(entry_price)) / float(atr14_at_entry)
@@ -1007,6 +1119,11 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
               f"{n_fault} missing_data_for_date"
               f"{' <-- INVESTIGATE' if n_fault else ''}"
               f"{f', {n_unclassified} unclassified' if n_unclassified else ''}")
+
+    if vetoed:
+        what = "not booked" if mode == "fill" else "no bid written"
+        print(f"  Manually excluded: {', '.join(vetoed)} -- passed every "
+              f"gate; {what} (state/excluded_tickers.txt)")
 
     return signals
 
