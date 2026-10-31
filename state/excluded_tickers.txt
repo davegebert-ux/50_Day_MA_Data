@@ -1,0 +1,12 @@
+# Tickers the system must NOT bid on. One per line; anything after # is a note.
+#
+# THE RULE: add it here, and if an order for it is already at the broker,
+# cancel it there.
+#   - From the next nightly run: no new bids for it.
+#   - A bid for it that already went out is treated as cancelled and is never
+#     booked, so the broker order must actually be cancelled.
+#   - Open positions are NOT affected. Exits still go out.
+#
+# To remove a ticker, delete its line.
+
+UTZ    # 2026-10-30  Intersnack cash buyout at $14.25; pinned to the deal price
