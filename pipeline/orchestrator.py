@@ -280,10 +280,19 @@ FUNNEL_GATES = [
     # can come off the list.
     "manually_excluded",
     "no_slot_available",    # fired in size_and_open_trades(), not the scan
+    # ADDED 2026-11-01, fired by book_sent_bids() for an order that was sent:
+    # the row in state/pending_orders.csv could not be read, so whether it
+    # filled is unknown. book_sent_bids() also uses already_open,
+    # missing_data_for_date, bid_not_filled and manually_excluded.
+    "unreadable_order",
 ]
 # DISPOSITIONS (the other column) -- what happened to a ticker that was NOT
 # dropped: "opened", "skipped_zero_shares", "skipped_no_capital", and from
 # 2026-10-19 "limit_order_placed".
+#
+# "stopped_at_fill" (2026-11-01): a sent bid that filled on an open at or
+# below its own stop. Booked straight to closed_trades as a 0R round trip;
+# see book_sent_bids().
 #
 # "not_ordered" (2026-10-19) marks a ticker that cleared every gate and
 # whose bid price was reached, but which no order had been placed for --
@@ -742,7 +751,7 @@ def setup_has_reset(df, exit_date, target_date):
 
 
 def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=None,
-                              mode="fill"):
+                              mode="fill", skip_tickers=None):
     """
     Evaluates ONLY target_date as a possible touch event per ticker (still
     loading whatever trailing history is needed to compute the moving
@@ -825,6 +834,11 @@ def find_new_signals_for_date(target_date, already_open_tickers, funnel_rows=Non
     files = sorted(glob.glob(os.path.join(DATA_DIR, "*_1d_data.csv")))
     for fpath in files:
         ticker = os.path.basename(fpath).replace("_1d_data.csv", "")
+        # ADDED 2026-11-01: tickers whose order was SENT this session are
+        # judged by book_sent_bids() against the order itself, not re-scanned
+        # here. Skipped silently so each ticker still gets one funnel row.
+        if skip_tickers and ticker in skip_tickers:
+            continue
         if ticker in already_open_tickers:
             # dedup rule -- don't re-signal a ticker already in a trade
             _log(funnel_rows, target_date, ticker, "already_open")
@@ -1605,9 +1619,6 @@ def process_single_day(target_date):
     # the end, so a crash midway leaves no half-day of rows in the log.
     funnel_rows = []
 
-    signals = find_new_signals_for_date(target_date, already_open_tickers,
-                                        funnel_rows=funnel_rows)
-
     # ------------------------------------------------------------------
     # ONLY ORDERS THAT WERE ACTUALLY PLACED CAN FILL (2026-10-19)
     #
@@ -1619,9 +1630,19 @@ def process_single_day(target_date):
     # after this change, or a replay of a session whose orders were never
     # written -- and says so, because a silent fallback here would look
     # exactly like working correctly.
+    #
+    # CHANGED 2026-11-01: orders on the list are now booked AS SENT, by
+    # book_sent_bids(), and are no longer re-scanned. Read its docstring.
+    # The scan still runs for every OTHER ticker, so the funnel keeps its
+    # "not_ordered" record of what the slot cap cost.
     # ------------------------------------------------------------------
-    pending = load_pending_bids(target_date)
-    if pending is None:
+    sent = load_sent_bids(target_date)
+
+    signals = find_new_signals_for_date(target_date, already_open_tickers,
+                                        funnel_rows=funnel_rows,
+                                        skip_tickers=set(sent) if sent else None)
+
+    if sent is None:
         print("  No bid list for this session (first run under the new rules, "
               "or a replay) -- evaluating the full candidate scan instead.")
         # ADDED 2026-09-15: order candidates before sizing. Nothing tested
@@ -1629,25 +1650,21 @@ def process_single_day(target_date):
         # shuffle -- arbitrary, but without alphabetical's standing bias
         # toward early-alphabet tickers. See order_candidates().
         signals = order_candidates(signals, target_date)
+        open_df = size_and_open_trades(signals, open_df,
+                                       funnel_rows=funnel_rows,
+                                       target_date=target_date,
+                                       max_new=slots_free_at_bid_time)
     else:
-        bid_on = [s for s in signals if s["ticker"] in pending]
+        # Every signal here is a ticker no order was sent for.
         for s_ in signals:
-            if s_["ticker"] not in pending:
-                _log(funnel_rows, target_date, s_["ticker"], None, "not_ordered",
-                     entry_price=s_["entry_price"],
-                     risk_per_share=s_["risk_per_share"],
-                     adr10_pct=s_.get("adr10_pct"),
-                     overhead_R=s_.get("overhead_R"),
-                     score=s_["score_at_entry"])
-        # Keep last night's ordering; it is the order the bids went in.
-        signals = sorted(bid_on, key=lambda x: pending[x["ticker"]])
-        print(f"  Bid list for {pd.Timestamp(target_date).date()}: "
-              f"{len(pending)} order(s) placed, {len(signals)} filled")
-
-    open_df = size_and_open_trades(signals, open_df,
-                                   funnel_rows=funnel_rows,
-                                   target_date=target_date,
-                                   max_new=slots_free_at_bid_time)
+            _log(funnel_rows, target_date, s_["ticker"], None, "not_ordered",
+                 entry_price=s_["entry_price"],
+                 risk_per_share=s_["risk_per_share"],
+                 adr10_pct=s_.get("adr10_pct"),
+                 overhead_R=s_.get("overhead_R"),
+                 score=s_["score_at_entry"])
+        open_df = book_sent_bids(target_date, sent, open_df,
+                                 funnel_rows=funnel_rows)
 
     save_open_positions(open_df)
     check_capital_committed(open_df)
@@ -1777,11 +1794,31 @@ def load_pending_bids(target_date):
     signal to fall back to the full scan. That happens in exactly two
     legitimate cases: the first run after this change, and a catch-up
     replay of a session whose orders were never written. Both are logged.
+
+    CHANGED 2026-11-01: now a thin wrapper over load_sent_bids(), which
+    returns the whole order row. Same return values as before; kept so any
+    other caller still works.
+    """
+    sent = load_sent_bids(target_date)
+    if sent is None:
+        return None
+    return {t: o["order_pos"] for t, o in sent.items()}
+
+
+def load_sent_bids(target_date):
+    """The BUY_LIMIT rows written last night FOR target_date, as
+    {ticker: row}, where row holds the order exactly as written --
+    limit_price, shares, stop_price, risk_per_share, score, note -- plus
+    order_pos, its place in the list. None / {} mean what they mean in
+    load_pending_bids().
+
+    Read as TEXT (dtype=str, no NA guessing) so a ticker such as NA or NAN
+    stays a ticker, and numbers are parsed where they are used.
     """
     if not os.path.exists(PENDING_ORDERS_PATH):
         return None
     try:
-        po = pd.read_csv(PENDING_ORDERS_PATH)
+        po = pd.read_csv(PENDING_ORDERS_PATH, dtype=str, keep_default_na=False)
     except Exception as e:
         print(f"  Could not read pending orders ({e}) -- falling back to the "
               f"full scan for this session.")
@@ -1789,15 +1826,201 @@ def load_pending_bids(target_date):
     if not len(po) or "for_session" not in po.columns:
         return None
     tgt = pd.Timestamp(target_date).date().isoformat()
-    mine = po[(po["for_session"].astype(str) == tgt) &
-              (po["order_type"] == "BUY_LIMIT")]
+    mine = po[(po["for_session"].str.strip() == tgt) &
+              (po["order_type"].str.strip() == "BUY_LIMIT")]
     if not len(mine):
         # A list exists but is for another session -- it says nothing about
         # this one, so it must not be treated as "no bids were placed".
-        if str(po["for_session"].iloc[0]) != tgt:
+        if str(po["for_session"].iloc[0]).strip() != tgt:
             return None
         return {}          # list IS for today and genuinely held no bids
-    return {str(r["ticker"]): i for i, (_, r) in enumerate(mine.iterrows())}
+    out = {}
+    for i, (_, r) in enumerate(mine.iterrows()):
+        row = {k: r[k] for k in PENDING_ORDERS_COLUMNS if k in r.index}
+        row["order_pos"] = i
+        out[str(r["ticker"]).strip()] = row
+    return out
+
+
+def _num(x):
+    """float(x), or None for blank / unparseable / NaN."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return None if np.isnan(v) else v
+
+
+# ------------------------------------------------------------------
+# BOOK WHAT WAS SENT (added 2026-11-01)
+#
+# THE BUG. The fill pass used to re-derive each order instead of reading
+# it. It rescanned the ticker, recomputed the bid, and when the stock
+# opened BELOW the bid it re-sized and re-stopped the position off the
+# lower fill price. The broker does neither: it holds the share count and
+# the stop price that were sent. Found by hand on 2026-11-01, in the first
+# reconciliation:
+#
+#   NEO   sent 177 shares, limit ~17.58, stop 16.78. Opened 17.25.
+#         Books: 181 shares, stop 16.47.  Broker: 177 shares, stop 16.78.
+#
+# Every gap-down fill diverged the same way, and those are the fills the
+# 2026-10-17 study rated best.
+#
+# THE SECOND BUG, SAME ROOT. Re-scanning also re-ran every gate on the
+# fill day ([KNOWN GAP], 2026-10-19): an order placed one night could be
+# refused the next by a gate that now read differently -- GTX twice in the
+# sandbox, ~13% of bids in a small sample. That is a second veto the
+# broker does not offer. If it fills, you own it.
+#
+# THE FIX. For a ticker whose order was sent this session, the only
+# question is whether the order filled:
+#   filled   if today's Low <= the limit AS SENT
+#   entry    = min(limit as sent, today's Open)    -- a gap fills at the open
+#   shares   = as sent
+#   stop     = as sent;  risk per share = entry - stop
+# No gate, no slot cap and no capital check is re-applied: all three were
+# applied when the order was written, and the broker applies none of them
+# to a fill.
+#
+# What still applies:
+#   - the manual exclusion list (EXCLUDED_TICKERS_PATH). Listing a ticker
+#     means the order was cancelled at the broker.
+#   - an order that cannot be read, or a session bar that is missing, is
+#     NOT booked, with a warning, because whether it filled cannot be
+#     known here. Reconciliation catches either.
+#
+# OPEN AT OR BELOW THE STOP. The buy fills at the open, and the stop is
+# already at or above the market the moment it goes live. Booked as a
+# round trip -- entry and exit at the open, 0R, exit_reason
+# "stopped_at_fill" -- on the assumption that the broker's stop fires at
+# once. NOT YET OBSERVED. The broker may instead reject a stop priced
+# above the market, which would leave it holding an unprotected position.
+# The warning says to check, and the first real case settles which.
+#
+# FREEZE. This changes no decision about which orders are SENT. It makes
+# the books record what the broker actually holds.
+# ------------------------------------------------------------------
+def book_sent_bids(target_date, sent, open_df, funnel_rows=None):
+    """Judge each order sent for target_date against that session's bar,
+    and book the fills exactly as sent. See the block comment above.
+    Returns the updated open-positions frame."""
+    tgt = pd.Timestamp(target_date).normalize()
+    excluded = load_excluded_tickers()
+    already = set(open_df["ticker"]) if len(open_df) else set()
+
+    new_rows = []
+    n_not_filled = 0
+    for ticker, o in sorted(sent.items(), key=lambda kv: kv[1]["order_pos"]):
+        if ticker in already:
+            # Cannot happen from the order pass, which never bids an open
+            # ticker; only a hand edit of the books could cause it.
+            print(f"  WARNING: {ticker} had a bid sent but is already in the "
+                  f"books -- not booked twice. Check the broker for a second "
+                  f"lot.")
+            _log(funnel_rows, target_date, ticker, "already_open")
+            continue
+
+        limit = _num(o.get("limit_price"))
+        stop = _num(o.get("stop_price"))
+        shares = _num(o.get("shares"))
+        if (limit is None or stop is None or shares is None
+                or not (0 < stop < limit) or int(shares) <= 0):
+            print(f"  WARNING: the {ticker} order in state/pending_orders.csv "
+                  f"cannot be read (limit {o.get('limit_price')!r}, stop "
+                  f"{o.get('stop_price')!r}, shares {o.get('shares')!r}). Not "
+                  f"booked. If it was sent and filled, check the broker.")
+            _log(funnel_rows, target_date, ticker, "unreadable_order")
+            continue
+        shares = int(shares)
+
+        path = os.path.join(DATA_DIR, f"{ticker}_1d_data.csv")
+        df = sim.load_ticker(path) if os.path.exists(path) else None
+        if df is not None:
+            df = df[df["Date"] <= tgt].reset_index(drop=True)
+        if (df is None or not len(df)
+                or pd.Timestamp(df["Date"].iloc[-1]).normalize() != tgt):
+            print(f"  WARNING: no {tgt.date()} bar for {ticker}, which had a "
+                  f"bid sent this session -- cannot tell whether it filled. "
+                  f"Not booked. Check the broker.")
+            _log(funnel_rows, target_date, ticker, "missing_data_for_date",
+                 entry_price=limit)
+            continue
+
+        today = df.iloc[-1]
+        # ADR10 as of the prior bar, the same figure the order was sized on.
+        # Logged for the funnel only.
+        adr = ((df["High"] / df["Low"] - 1) * 100).rolling(10).mean()
+        adr = adr.iloc[-2] if len(adr) >= 2 else np.nan
+        adr = None if pd.isna(adr) else round(float(adr), 4)
+        score = _num(o.get("score"))
+        sent_risk = round(limit - stop, 4)
+
+        if float(today["Low"]) > limit:
+            n_not_filled += 1
+            _log(funnel_rows, target_date, ticker, "bid_not_filled",
+                 entry_price=limit, adr10_pct=adr)
+            continue
+
+        if _ticker_key(ticker) in excluded:
+            print(f"  Manually excluded: {ticker} -- its bid was reached; not "
+                  f"booked (state/excluded_tickers.txt)")
+            _log(funnel_rows, target_date, ticker, "manually_excluded",
+                 entry_price=limit, risk_per_share=sent_risk, adr10_pct=adr,
+                 score=score)
+            continue
+
+        entry = min(limit, float(today["Open"]))
+        cost = round(shares * entry, 2)
+        rps_for_label = _num(o.get("risk_per_share")) or sent_risk
+        constraint = shares_for(limit, rps_for_label)[1]
+
+        if entry <= stop:
+            closed_row = {
+                "ticker": ticker, "entry_date": tgt, "entry_price": entry,
+                "risk_per_share": sent_risk, "score_at_entry": score,
+                "shares": shares, "position_cost": cost,
+                "sizing_constraint": constraint,
+                "exit_date": tgt, "exit_reason": "stopped_at_fill",
+                "exit_price": entry, "realized_R": 0.0, "realized_pnl": 0.0,
+            }
+            append_closed_trade(closed_row)
+            print(f"  STOPPED AT FILL {ticker}: opened {entry:.2f}, at or below "
+                  f"its stop {stop:.2f}. Booked as a 0R round trip. CHECK THE "
+                  f"BROKER: the stop either fired at once or was rejected, "
+                  f"which would leave the position open and unprotected.")
+            _log(funnel_rows, target_date, ticker, None, "stopped_at_fill",
+                 entry_price=entry, risk_per_share=sent_risk, adr10_pct=adr,
+                 score=score, shares=shares, position_cost=cost,
+                 sizing_constraint=constraint)
+            continue
+
+        risk = round(entry - stop, 4)
+        new_rows.append({
+            "ticker": ticker, "entry_date": tgt, "entry_price": entry,
+            "risk_per_share": risk, "score_at_entry": score,
+            "shares": shares, "position_cost": cost,
+            "sizing_constraint": constraint,
+        })
+        gap = f", gap open below the {limit:.2f} limit" if entry < limit else ""
+        print(f"  OPENED {ticker}: {shares} shares at {entry:.2f}{gap}, stop "
+              f"{stop:.2f}, {shares * risk:.2f} dollars at risk, {cost:.2f} "
+              f"committed (as sent)")
+        _log(funnel_rows, target_date, ticker, None, "opened",
+             entry_price=entry, risk_per_share=risk, adr10_pct=adr,
+             score=score, shares=shares, position_cost=cost,
+             sizing_constraint=constraint)
+
+    print(f"  Bid list for {tgt.date()}: {len(sent)} order(s) sent, "
+          f"{len(new_rows)} booked open, {n_not_filled} not filled")
+    if new_rows:
+        new_df = pd.DataFrame(new_rows, columns=OPEN_POSITIONS_COLUMNS)
+        open_df = pd.concat([open_df, new_df], ignore_index=True)
+    if len(open_df) > MAX_CONCURRENT_POSITIONS:
+        print(f"  NOTE: {len(open_df)} positions open, above the "
+              f"{MAX_CONCURRENT_POSITIONS}-slot cap. Sent orders that fill are "
+              f"booked regardless -- the broker holds them.")
+    return open_df
 
 
 def write_pending_orders(target_date, open_df, queued_exits, funnel_rows=None):
