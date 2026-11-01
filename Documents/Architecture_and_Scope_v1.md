@@ -8608,3 +8608,167 @@ first (2026-10-30).
 
 **Closed this round:** manual exclusion list (built); UTZ book check (booked,
 removed); Monday UTZ cancel (not needed).
+
+---
+
+## 2026-11-01 -- [DECISION, Dave] RECONCILIATION IS MANUAL AND WEEKLY, FOR NOW
+
+Dave, on automating it now: *"I sort of think we're putting the cart before
+the horse. We haven't turned this on live yet."* The system is close to a
+proof of concept, no real money flows through it, and the setup may still
+change. Building automation now risks building it twice.
+
+Two automated routes were considered and set aside:
+
+- **Dave exports broker positions into the repo.** Rejected: it makes the
+  system depend on Dave being available to run it.
+- **TradeStation API.** The likely route at go-live: an API key from
+  TradeStation, a one-time sign-in for a long-lived token, saved as a GitHub
+  secret. Nothing is connected to TradeStation today; the September
+  order-adjustment idea never got past the idea stage. Token lifetime was
+  checked only briefly during the session -- verify when it is built.
+
+### The weekly check
+
+1. **Positions.** Broker against `state/open_positions.csv`: ticker and
+   shares; entry should agree within cents.
+   - Broker has it, books do not (STLN) -> add it to the books.
+   - Books have it, broker does not (UTZ) -> remove it, UNLESS the next run
+     will close it itself (an entry-day stop -- see NTNX below).
+2. **Working orders on tickers not held** -> cancel them. A sell stop left on
+   a flat ticker opens a short if it fires.
+3. Dave reads both off the broker; Claude builds the corrected file.
+
+---
+
+## 2026-11-01 -- FIRST RECONCILIATION
+
+| ticker | books | broker | action |
+|---|---|---|---|
+| OABI | 688 @ 4.5364 | 688 @ 4.54 | match (books hold the unrounded bid, the broker the 2-decimal limit) |
+| STLN | 485 @ 6.43 | 485 @ 6.43 | match |
+| DINO | 28 @ 110.6209 | 28 @ 110.58 | match; broker filled 4 cents better than the limit |
+| NEO | 181 @ 17.25, stop 16.47 | 177 @ 17.25, stop 16.78 | corrected to the broker -- the bug below |
+| NTNX | 45 @ 69.3637 | flat: filled 69.36, stopped 67.12 | left; the next run should close it |
+| IQV | 12 @ 255.4384 (10-07) | flat | removed |
+| NAT | -- | 415 @ 7.46, stop 7.27 (10-22) | added |
+| ASST, DK, FTNT | flat | flat | agree |
+
+**Working orders on tickers not held: none.** All clean.
+
+**NTNX is the system working, one run late.** Filled at the limit and stopped
+at 67.12; the books' stop is 67.117, a match to the cent. The fill pass opens a
+position without checking that session's stop. The next run's exit check
+replays `sim.simulate_trail()` from the entry bar and books the entry-day stop
+then. Expected Monday night: NTNX closed, exit date 2026-10-30, about -1R.
+[CHECK]
+
+**NAT** was hand-entered by Dave on 2026-10-22, the first paper week, while
+dispatch was still dry-run. It was never in the books. Added: 415 @ 7.46, stop
+7.27 (risk per share 0.19), cost 3,095.90, score blank (not known). 415 shares
+implies an order sized at a limit of about 7.51-7.53, so NAT also filled
+below its limit -- the same pattern as NEO.
+
+Two cautions, both [CHECK] after Monday night:
+- The exit check replays NAT's trail from 2026-10-22. A trail break on an
+  EARLIER session is booked closed at the next open with NO sell sent; a sell
+  is queued only when the break falls on the session being processed. If NAT
+  is gone from the book, the broker still holds it: sell it by hand.
+- Whether a NAT trade already sits in `state/closed_trades.csv` is not known.
+  If one does, P&L counts NAT twice.
+
+**IQV** predates TradersPost (2026-10-07) and is not held. Removed. When or how
+it left the broker is not known, and no closed trade is recorded for it --
+accepted under the legacy decision.
+
+**DK and FTNT** are flat at both. The legacy-positions item is closed.
+**ASST**, the first system-opened exit, is flat at both with no orders left
+behind. How it exited (its stop or a market-on-open sell) was not checked.
+
+`state/open_positions.csv` 400 -> 389 bytes: NAT, OABI, STLN, DINO, NEO, NTNX.
+Six positions, 18,607.50 committed.
+
+---
+
+## 2026-11-01 -- [BUG, CONFIRMED] A GAP FILL IS RE-SIZED AND RE-STOPPED IN THE BOOKS; THE BROKER KEEPS THE ORDER
+
+NEO is the proof. The order went out sized and stopped off its limit: 177
+shares, limit about 17.58, stop 16.78. NEO opened at 17.25, so the limit filled
+at the open -- Dave saw it fill "a little improved from the limit". The fill
+pass then:
+
+- set entry = min(bid, Open) = 17.25 -- correct;
+- recomputed risk per share from 17.25 (0.7844), putting the stop at 16.47 --
+  the broker's stop stayed at 16.78;
+- re-sized at 17.25, giving 181 shares -- the broker holds 177.
+
+In the code: `find_new_signals_for_date()` (fill mode) computes
+`risk_per_share` AFTER `entry_price = min(entry_price, Open)`, and
+`size_and_open_trades()` calls `shares_for()` on the fill price. Neither reads
+the order that was actually sent. The 4-decimal bid in the books against the
+broker's 2-decimal fill (OABI, DINO) is the same root, in cents.
+
+**Consequences:**
+
+- Every fill that opens below its limit: the books hold too many shares and a
+  stop below the broker's. The broker stops out first (NEO: 31 cents sooner)
+  while the books keep the position open.
+- [INFERENCE, not yet observed] On a deep gap -- an open below the order's
+  stop -- the broker's stop is already above the market when the buy fills,
+  and fires at once. The books show a healthy position bought cheaply. On
+  2026-10-17, fills more than 0.50 ATR below the projection measured as the
+  BEST trades (+2.3 avgR). Under the current order design those trades cannot
+  be captured as modelled.
+
+**NEO corrected by hand:** 177 shares, risk per share 0.47 (17.25 - 16.78),
+cost 3,053.25. Its R is now the broker's, so its realized R will read larger
+than under the old figure, and its trail follows the real stop.
+
+**The fix -- next build, allowed under the freeze, since the books must match
+the broker:** book what was sent. In the fill pass, read shares and stop price
+from the order row in `state/pending_orders.csv`; entry = min(limit as sent,
+Open); risk per share = entry - stop as sent. The build must handle an open
+below the stop: the broker closes that position at once.
+
+**Logged for after the freeze:** whether the stop should instead be placed
+after the fill, relative to the fill price. That changes exits, and with them
+the deep-gap trades above. It needs its own measurement.
+
+---
+
+## OPEN ITEMS -- revised 2026-11-01
+
+**After Monday night's run (2026-11-02):**
+
+1. **NTNX** closed, exit date 2026-10-30, near 67.12.
+2. **NAT** still in the book. If it is gone, sell it at the broker by hand.
+   Also check whether NAT appears in `state/closed_trades.csv`.
+
+**Now (no code):**
+
+3. **cron-job.org timezone.** Clocks fell back today. Confirm the job is set
+   to a named zone so Monday's send fires at 07:05 ET.
+4. **A second morning trigger** at about 09:15 ET (carried).
+
+**Next build:**
+
+5. **Book what was sent** (the bug above). Needs the current
+   `pipeline/orchestrator.py` (102,794 bytes).
+
+**Weekly:**
+
+6. **Reconciliation, by hand** -- the check above. Automate at go-live; the
+   TradeStation API is the likely route.
+
+**Watch (carried):** fill fidelity (Tier 2), now judged against the order AS
+SENT; subscription settings; day-order backstop; gates re-evaluated on the fill
+day.
+
+**Small, safe under the freeze:** summary email header; disposition sheet
+(adds `manually_excluded`); PAT expiry date in the calendar.
+
+**Not blocking, and deferred to the end of the freeze:** unchanged from the
+2026-10-31 list, plus re-placing the stop relative to the fill.
+
+**Closed this round:** legacy positions (DK, FTNT flat at both; IQV removed);
+leftover orders (none); ASST at the broker (flat, agrees with the books).
