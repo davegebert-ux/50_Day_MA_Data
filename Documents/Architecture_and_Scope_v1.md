@@ -8772,3 +8772,107 @@ day.
 
 **Closed this round:** legacy positions (DK, FTNT flat at both; IQV removed);
 leftover orders (none); ASST at the broker (flat, agrees with the books).
+
+---
+
+## 2026-11-01 -- [BUILT] BOOK WHAT WAS SENT
+
+Fixes the bug found in the morning's reconciliation (NEO) and, with it, the
+[KNOWN GAP] of 2026-10-19 (gates re-evaluated on the fill day). Same root:
+the fill pass re-derived each order instead of reading it.
+
+Dave asked how the system could know what was sent without an export from
+TradeStation. It does not need one: the system writes every order itself, to
+`state/pending_orders.csv`, and the morning job sends exactly those numbers.
+What it cannot know without the broker is what then HAPPENED to an order --
+rejected, partly filled, filled at an odd price. That part stays with
+reconciliation.
+
+### The rule now
+
+For a ticker whose order was sent for the session being processed
+(`book_sent_bids()`), the only question is whether the order filled:
+
+| | |
+|---|---|
+| filled | today's Low <= the limit AS SENT |
+| entry | min(limit as sent, today's Open) -- a gap fills at the open |
+| shares | as sent |
+| stop | as sent; risk per share = entry - stop |
+| gates, slot cap, capital check | NOT re-applied -- all were applied when the order was written, and the broker applies none of them to a fill |
+| manual exclusion list | still applies: a listed ticker's order was cancelled at the broker |
+| order row unreadable, or no bar for the session | not booked, with a warning to check the broker |
+
+Every other ticker is still scanned as before, so the funnel keeps its
+`not_ordered` record of what the slot cap cost. The order pass, the fallback
+scan when no list exists, and exits are unchanged.
+
+**Open at or below the stop.** The buy fills at the open, and the stop is at
+or above the market the moment it goes live. Booked straight to
+`state/closed_trades.csv` as a round trip -- entry and exit at the open, 0R,
+exit reason `stopped_at_fill` -- on the assumption that the broker's stop
+fires at once. NOT YET OBSERVED. The broker may instead reject a stop priced
+above the market and leave an unprotected position. The run prints a warning
+to check the broker, and the first real case settles which happens.
+
+**Funnel.** New gate `unreadable_order`; new disposition `stopped_at_fill`. For
+sent orders, `adr10_pct` is still logged but `overhead_R` is blank: the
+previous night's `limit_order_placed` row for the same ticker and session
+carries it.
+
+**Side fix.** The old order-list reader let pandas turn a ticker named `NA`
+into "nan". The list is now read as text.
+
+### What to expect
+
+- **Realized R on gap fills changes meaning.** R per share is now the broker's
+  (entry - stop as sent), smaller than before on a gap fill, so the same dollar
+  move reads as more R. NEO: 0.47 instead of 0.7844.
+- **Live now differs from the backtest on gap fills, by design.** `sim.py` and
+  the staged backtest still size and stop a gap fill at the fill price. Live
+  follows the order. Tier 2 comparisons on gap fills should expect the gap;
+  whether the stop should move with the fill is the post-freeze question
+  logged this morning.
+- **More sent orders get booked.** Each one the old fill pass refused on a
+  re-run gate (about 13% of bids in the 2026-10-19 sample) is now booked if it
+  filled -- which is what the broker holds.
+
+### Verification
+
+Mock repo: the real `orchestrator.py` against stub modules and synthetic data,
+NOT production. Night one writes the orders; night two fills them under set
+scenarios; compared with the 2026-10-31 version on identical inputs.
+
+| case | 2026-10-31 version | now |
+|---|---|---|
+| night one: the orders written | -- | identical |
+| normal fill (SPY) | entry 127.4365, the unrounded bid | 127.44, as sent |
+| gap fill between stop and limit (T8) | stop 115.27; broker's is 116.21 | stop 116.21 |
+| open below the stop (T7) | booked open, 29 shares (28 sent) | 0R round trip, `stopped_at_fill`, warning |
+| a gate flips overnight (T5) | not booked | booked |
+| Low exactly at the limit (T3) | not booked (unrounded bid 4 tenths of a cent lower) | booked at 74.47 |
+| excluded; limit not reached; not bid | same | same |
+
+Night three: the booked positions ran through the exit check with positive
+risk; T7's round trip correctly blocked re-entry (`no_setup_reset`); a sent
+order with no bar, one with a blank stop, and one on an already-open ticker
+each warned and booked nothing; no ticker had two funnel rows. The order-list
+reader returned the same values as before on every case except `NA`.
+
+`pipeline/orchestrator.py` 102,794 -> 113,557 bytes. The pandas
+`FutureWarning` line formerly at 821 is now line 933.
+
+---
+
+## OPEN ITEMS -- revised 2026-11-01 (evening)
+
+Changes to the morning's list only:
+
+- **Closed:** item 5, book what was sent (built above). Also closed: the
+  2026-10-19 [KNOWN GAP], gates re-evaluated on the fill day.
+- **Added to the Monday-night checks:** the first night under the new code.
+  Any sent order that filled should be booked with the share count, limit and
+  stop from the order. Any warning line in the run log is worth reading.
+- **Added to the watch list:** the first `stopped_at_fill`. Check the broker:
+  flat, or holding an unprotected position?
+- **Disposition sheet** gains `unreadable_order` and `stopped_at_fill`.
