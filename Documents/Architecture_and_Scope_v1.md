@@ -8876,3 +8876,286 @@ Changes to the morning's list only:
 - **Added to the watch list:** the first `stopped_at_fill`. Check the broker:
   flat, or holding an unprotected position?
 - **Disposition sheet** gains `unreadable_order` and `stopped_at_fill`.
+
+---
+
+## 2026-11-01 (evening) -- [RESTATED] THE HEADLINE FIGURES DESCRIBE THE OLD RULE, NOT THE LIVE ONE
+
+Source: the MA regime research chat. It replicated the system with the
+production code from Main (screen, overhead check, score, risk sizing,
+`simulate_trail()`, `setup_has_reset()`, one position per ticker) on
+split-adjusted 2016-10 to 2026-10 data that includes delisted names.
+
+| run, same data | trades | avgR | win | totalR | totalR without top 10 |
+|---|---|---|---|---|---|
+| old rules: screen on the touch day incl. close above the 50; entry at the 50 | 1,838 | +0.519 | 51.0% | +954.8 | +733.9 |
+| **live rules since 2026-10-19** | **2,690** | **+0.109** | **34.6%** | **+293.1** | **-7.4** |
+| live rules, stop as sent (today's bookkeeping) | 2,697 | +0.080 | 30.8% | +215.1 | -86.8 |
+
+Split by how the fill day closed (live rules):
+
+| fill day closed | trades | avgR | win | totalR |
+|---|---|---|---|---|
+| above the 50-day | 1,079 | +0.567 | 50.9% | +612.3 |
+| at or below the 50-day | 1,611 | -0.198 | 23.7% | -319.2 |
+
+### Why every earlier figure missed it
+
+The old screen ran on the touch-day row and required Close > SMA50 THAT DAY.
+Every headline number since September -- 1,404 trades at +0.594, +0.723 with
+the bid 0.10 ATR under, +0.801 at the projected MA, the 442 reclaims at +1.364
+-- is conditioned on the fill day closing back above the 50. A bid placed the
+night before cannot know that.
+
+This document saw part of it. On 2026-10-17: "The 98.9% fill rate is partly
+circular", and "0% of touch days close below it -- necessarily, since the
+screen requires Close > SMA50." The fills outside that population were then
+measured only BEFORE the gates (touch setups +0.322, knife-catches +0.020).
+The gated run of the 17,263 placeable fills was listed as required before
+building on 2026-10-17, deferred on 2026-10-19, and never done. The replication
+is the first measurement of the rule that has been trading.
+
+### Why no repo-data run
+
+The old rules on the research data land close to the anchor: +0.519 against
++0.594, with the same near-zero median and the same top-20 concentration. The
+data and code reproduce the old result, so the drop to +0.109 is the same data
+under a different rule, not a different universe. The original 1,579
+historical files are no longer available, and this document never recorded
+where they came from. **Record the location of any dataset an anchor depends
+on.**
+
+### [DECISION] Restated
+
+- **+0.594, +0.723, +0.801 and the reclaim +1.364 are old-rule figures.** Not
+  achievable by a resting bid. Kept as history; not the live system's
+  expectancy.
+- **The live rule's expectancy is about +0.1R per trade, roughly breakeven
+  without its top 10 trades.** Provisional: no slot cap was applied. The
+  8-slot account replay decides it.
+- **The step-back envelope** (-28.5R drawdown, 12-loss streak, -26.8R rolling
+  50) came from the old population. Re-derive it before relying on it. Tier 1
+  and Tier 2 are unaffected.
+- **Not a statement about live P&L.** Too few live trades: telling +0.1 from
+  +0.6 takes about 150.
+
+**Consequences.** Paper trading continues as a plumbing and fill-fidelity
+check. **Live money is on hold** until a placeable version shows a measured
+edge. The other-average and market-state study is held until then too.
+
+### [PROCESS] A mechanism change is a population change
+
+The 2026-10-17 freeze note carved the placeable change out as "making the
+system real, not optimising it". True of the mechanism. But the change also
+altered which trades exist, and the result was never re-measured on the
+trades it actually takes. **Any change to how an order is placed must
+re-measure expectancy on the population it trades, before it ships.** The
+2026-10-19 decision to ship without that run was reasonable for a sim account
+and is why this cost nothing. It would not have been reasonable with money.
+
+---
+
+## 2026-11-02 -- [BUG, OPEN] EXITS ARE REJECTED WHILE THE ATTACHED STOP IS WORKING
+
+NEO's market-on-open sell (trail broke 2026-10-30) was rejected at 07:05 ET:
+*"Order failed. Reason: You are long 177 shares with 177 remaining on sell
+orders!"* Payload: `{"ticker":"NEO","action":"exit","orderType":"market"}`.
+
+The FTNT message of 2026-10-29, now on a position the system opened.
+TradeStation refuses a sell that would over-commit a position while the
+attached stop covers every share. The 2026-10-30 inference holds: the failure
+is a rejected exit, not an orphaned stop opening a short.
+
+- Dave enabled the subscription's **"Cancel existing open orders before
+  placing new orders"** and hit Retry at 07:57:58 ET. Same rejection.
+  TradersPost's cancel step reported *"No NEO orders open to cancel"* while
+  TradeStation held the 177-share stop at 16.78.
+- The setting was switched on seconds before the retry and may not have
+  taken effect. TradersPost's help bot says the setting, or `"cancel": true`
+  on the exit signal, cancels the stop. That is an account, not evidence; the
+  one observation so far contradicts it.
+- **Workaround that worked:** cancel the stop by hand in TradingView, then
+  Retry. NEO is flat.
+
+**[DECISION, Dave]** Wait for the next exit with the setting on. If it fails
+again: add `"cancel": true` to the exit payload in
+`pipeline/send_orders_to_traderspost.py` and send TradersPost support the
+evidence. Until then every system exit needs the manual step, and the
+rejection email is the cue.
+
+---
+
+## 2026-11-02 -- [FINDING] NO PLACEABLE VERSION BEATS BUY-AND-HOLD: V0 TO V5c
+
+Run in the research chat on the same Drive data as the restatement, with the
+production code from Main (commit 439de01), under a written primer with every
+rule locked before its run: "Placeable Entry Test: Primer for the Research
+Chat (2026-11-02)", https://claude.ai/artifact/5H6jzbowSm1W29c8qqeHZ4.
+
+### The reclaim check: hypothesis confirmed
+
+Of 1,838 old-rule trades, 589 were reclaims. Under the live rule:
+
+| what happened to the old rule's reclaim | count | its old-rule R |
+|---|---|---|
+| blocked: still holding the ticker from an earlier fill | 196 | +147.5 |
+| blocked: stopped out earlier, no setup reset yet | 138 | +43.4 |
+| failed a gate (score 80, overhead 23, ADR 3) | 106 | |
+| never filled, or failed the prior-bar screen | 122 | |
+| taken | 27 | |
+
+The resting bid buys the same setup days early, on the way down, and its
+stop-out or open position then blocks the reclaim day the old rule took.
+
+### Results, same data, 2016-10 to 2026-10
+
+| version | rule | trades | avg R | total R | w/o top 10 | w/o top 20 | avg R w/o 2025 | 8-slot CAGR | max DD, marked daily |
+|---|---|---|---|---|---|---|---|---|---|
+| V0 | live rule, stop as sent | 2,691 | +0.101 | +271.6 | -35.8 | -184.5 | +0.085 | 1.6% | -61.8% |
+| V1 | V0 + exit next open if the fill day closed at/below the 50 | 2,767 | +0.000 | +1.3 | -183.5 | -- | -- | -- | -- |
+| V2 | confirm (touch, close above), bid next day only | 1,125 | +0.152 | +171.5 | -59.0 | -- | -- | -- | -- |
+| V3 | confirm, bid up to 3 days | 1,355 | +0.223 | +301.8 | +51.0 | -97.2 | +0.100 | 6.0% | -42.2% |
+| V4a | confirm, buy stop above the confirm-day high, ADR stop | 1,556 | +0.076 | +118.5 | -88.5 | -195.9 | +0.042 | -- | -- |
+| **V4b** | **same entry, stop just under the confirm-day low** | **1,528** | **+0.181** | **+276.3** | **+70.7** | **-56.0** | **+0.141** | **11.0%** | **-23.1%** |
+| V5 (6) | V4b + half at 1.5/2/3R, 10/20-day trail FROM ENTRY | ~1,600 | +0.002 to +0.011 | +3.5 to +17.5 | all < 0 | all < 0 | -- | 4.2% (best) | -- |
+| V5c (6) | V4b until half sells at 1.5/2/3R, then 10/20-day trail | ~1,530 | +0.083 to +0.122 | +127.8 to +186.2 | +17.9 to +61.2 | -13.5 to -48.2 | +0.061 to +0.107 | 6.2% (3R/20) | -22.4% |
+| SPY | buy and hold, dividends estimated | -- | -- | -- | -- | -- | -- | ~14.4% | -34.1% |
+
+Replay: 8 slots, 12.5% cost cap, $25,000 compounded, 10 tie-break seeds,
+2017-11-07 to 2026-10-27. Drawdown marked to market daily; closed-equity
+figures differ by a few points. SPY has no dividend data in the file: 12.9%
+price CAGR plus about 1.5% a year. Fills assume no slippage on buy stops.
+
+### What the tests found
+
+- **The edge is in setups that touch, close back above and keep going.** V3's
+  983 confirmed setups that never came back to the bid would have averaged
+  +1.8R entered at the 50 on the confirm day -- not placeable. A limit at the
+  50 cannot reach them by design; a buy stop catches some (V4b).
+- **The stop mattered more than the entry.** The same buy-stop entry made
+  +0.181R with the stop under the confirm-day low and +0.076R with the ADR
+  stop.
+- **Every early exit cut the right tail and made things worse.** V1 (exit
+  close-below fills) went to zero; V5c (sell half at a target) fell below
+  V4b at every target. The same lesson as the September no-partials
+  decision.
+- **One year can carry a result.** 2025 is 61% of V3's total R; without it V3
+  is +0.100R, the same as V0.
+- **Best found: V4b.** 11.0% a year with a -23.1% drawdown against SPY's
+  ~14.4% and -34.1%. Lower return, smaller drawdown, negative without its top
+  20, and the best of 17 versions tried on one decade -- a margin that size is
+  within luck.
+
+### [PROCESS] Three lessons from the day
+
+- **A flawed test spec looks exactly like a negative result.** V5's primer
+  started the 10/20-day trail on the entry day, below price, so it sold almost
+  every trade in a day (median hold 1 day). Caught only because the holding
+  days looked wrong. Read the mechanics of a failed variant before reading it
+  as a verdict.
+- **The bar is buy-and-hold, not V0.** Beating the live rule is easy; beating
+  SPY with dividends, on drawdowns marked daily, is the real test.
+- **Every new variant on the same decade makes a lucky winner more likely.**
+  Seventeen so far. The next result has to hold up on data none of them
+  used.
+
+### [DECISION, Dave] Not retired
+
+The locked rule (primer section 12) said a failure here ends the 50-day work.
+Dave chose not to retire it: the point of the project is to find what works,
+and every test so far differs from how professionals trade the setup.
+
+**Status:** live money on hold. Paper trading continues on the live rule as
+an infrastructure test (order sending, exits, bookkeeping, reconciliation).
+
+---
+
+## 2026-11-02 -- [NEXT LEAD] TEST IT THE WAY PROFESSIONALS TRADE IT
+
+Every version so far took every setup that passed the screen and sized them
+all the same. Professionals who trade moving-average pullbacks (O'Neil,
+Minervini, Raschke and similar) differ on four points:
+
+1. **Selective:** only market leaders, with strong earnings, in a healthy
+   market.
+2. **Strongest names only:** top relative strength.
+3. **Bet bigger on what works:** add to winners, cut losers fast.
+4. **The average is a filter and an exit, not the entry price.** V4b already
+   tests this part.
+
+V4b's weak years were weak markets (2022), which points the same way.
+
+**The plan: ONE package, locked before it runs,** with rules taken from how
+those traders describe their own methods, not from our results:
+
+| element | proposed rule |
+|---|---|
+| market filter | trade only when SPY is above its 200-day average |
+| relative strength | top 20% of the universe |
+| earnings growth | from the published method; set before the run |
+| adding to winners | from the published method; set before the run |
+| entry, stop, exit | V4b's (best found), unless the published method says otherwise |
+
+Same bar as V5c: beat SPY's total return with a smaller drawdown marked daily,
+and stay positive without the top 20 trades. **It must also hold on data the
+17 versions have not seen** -- history before 2016-10, or forward results --
+before anything is traded on it.
+
+### Earnings data: Massive, pending two answers
+
+Yahoo Finance has only recent quarters and no delisted companies: unusable for
+a ten-year backtest.
+
+Massive (Dave's current subscription, probably the Developer plan, about $79
+a month)
+has quarterly income statements with EPS back to 2009, per its announcement,
+checked only briefly. They need the **Stocks Advanced** plan, believed to be
+about $199 a month. Option: upgrade for one month, pull the history into
+Drive, then drop back, if Massive's terms allow it.
+
+**Ask Massive before paying:**
+
+1. **Are delisted companies covered?** Without them the test only sees
+   survivors.
+2. **Does each quarter carry the date it was actually reported?** Without it
+   the test uses earnings before the market knew them -- the same look-ahead
+   that inflated the old figures.
+
+---
+
+## OPEN ITEMS -- revised 2026-11-02
+
+**Tuesday morning, after tonight's run:**
+
+1. **NTNX** closed, exit date 2026-10-30, near 67.12.
+2. **NAT** still in the book; if gone, sell it at the broker by hand.
+3. **First night booking as sent:** any new fill booked with the order's
+   shares, limit and stop. Read any warning line.
+4. **NEO:** its broker fill (time and price) against the booked exit at the
+   2026-11-02 open. Also answers whether a pre-market market exit fills
+   pre-market or at the open.
+
+**Next exit:** does "Cancel existing open orders" work? If not, `"cancel":
+true` in the exit payload and a note to support.
+
+**The next lead, in order:**
+
+5. Ask Massive the two questions above.
+6. If both answers are yes, decide on the Advanced upgrade and pull the
+   earnings history.
+7. Write the professional package into the primer, locked; run it once; then
+   check it on data the 17 versions never saw.
+
+**Weekly:** manual reconciliation, next one this weekend.
+
+**Held:** live money; the other-average and market-state slices; the Donchian
+strategy stays queued behind this.
+
+**Carried:** re-derive the step-back envelope from the placeable trade file;
+summary email header; disposition sheet (adds `manually_excluded`,
+`unreadable_order`, `stopped_at_fill`); PAT expiry date in the calendar; the
+not-blocking list as of 2026-10-31.
+
+**Closed this round:** the reclaim hypothesis (confirmed); the 8-slot replay
+of the live rule (1.6% CAGR); fixes V1 to V5c (none passes the bar); the
+repo-data run (not needed).
