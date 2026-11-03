@@ -1,7 +1,5 @@
 ticker,entry_date,entry_price,risk_per_share,score_at_entry,shares,position_cost,sizing_constraint
-NAT,2026-10-22,7.46,0.19,,415,3095.9,cost
 OABI,2026-10-26,4.5364,0.2736,3.0,688,3121.04,cost
 STLN,2026-10-26,6.43,0.37,2.5,485,3118.55,cost
 DINO,2026-10-28,110.6209,4.6634,3.5,28,3097.39,cost
-NEO,2026-10-29,17.25,0.47,3.0,177,3053.25,cost
-NTNX,2026-10-30,69.3637,2.2467,3.5,45,3121.37,cost
+VLO,2026-11-02,392.68,14.64,3.0,7,2748.76,cost
