@@ -1,5 +1,10 @@
 # Scorecard Project - End-to-End Architecture (v2)
 
+> **STATUS 2026-11-03: PAUSED.** The 50-day pullback work is paused, not
+> deleted, and its order sending is being switched off. Start with the
+> entry "THE 50-DAY PULLBACK WORK IS PAUSED" near the end of this document:
+> what was found, where everything lives, and how to reopen it.
+
 *Rebuilt 2026-09-03 as a scoping aid before re-validating anything affected by the
 sim.py entry-day stop bug. Version 2 - corrects Stage 0/1 based on documentation
 found in MA_Respect_Redesign_Notes.txt, which defines the momentum screen and
@@ -9159,3 +9164,293 @@ not-blocking list as of 2026-10-31.
 **Closed this round:** the reclaim hypothesis (confirmed); the 8-slot replay
 of the live rule (1.6% CAGR); fixes V1 to V5c (none passes the bar); the
 repo-data run (not needed).
+
+---
+
+## 2026-11-03 -- [FINDING] THE PROFESSIONAL FILTERS: M1 AND M1t
+
+The "test it the way professionals trade it" lead of 2026-11-02, run in the
+research chat under primer section 13, rules locked before the run. Modelled
+on Mark Minervini (US Investing Championship winner, published rules) with his
+filters applied to V4b's entry, stop and exit, since his own entry -- a
+breakout from a tight base -- is a different setup.
+
+### The data it needed: an SEC fundamentals set, built 2026-11-03
+
+Google Drive `fundamentals_data/`, built from SEC EDGAR bulk files (free; no
+Massive upgrade). The file to join is `fundamentals_by_ticker.parquet`:
+626,617 quarterly and annual rows, 15,114 tickers, keyed by `public_date`
+(the 10-Q/10-K filing date, so slightly late but never early). Values as first
+filed; restatements kept separately. Income statement, balance sheet, cash
+flow, shares, and year-over-year and 3-year growth.
+
+- Ticker to SEC ID: 99.8% of the 8,970 ever-liquid tickers, delisted
+  included; 98.5% have financial data. AAPL, MSFT and NVDA match reported
+  figures.
+- Gaps: IFRS filers (most foreign companies) have no data; revenue is blank
+  on 28% of rows (banks, REITs); fourth quarters are derived from annual minus
+  nine months, so their EPS is approximate; 92 tickers were reused by
+  different companies (flagged).
+- Full notes: the claude.ai Project doc
+  `claude/fundamentals_data_build_2026-11-03.md`, and the research chat's
+  "Data Environment Handbook (2026-11-03)", which lists every dataset, its
+  location and its split-adjustment status.
+
+### M1 rules
+
+V4b unchanged, plus, on the confirm day:
+
+1. **Trend template:** price above a rising 150-day and 200-day average,
+   50-day above both, at least 30% above the 52-week low, within 25% of the
+   52-week high.
+2. **Relative strength** in the top 30% (percentile 70+).
+3. **SPY above its 200-day average.**
+4. **Earnings:** latest quarter's EPS up 20%+ on a year earlier and
+   accelerating; revenue up 10%+; net margin up on a year earlier. Only
+   filings public on or before the confirm day.
+5. Missing data or an ambiguous ticker = no trade.
+
+M1a takes full size at entry. M1b takes half at entry and the other half at
++1R.
+
+### The funnel
+
+| step | dropped, missing data | dropped, missed threshold | still alive |
+|---|---|---|---|
+| confirmed setups | | | 6,830 |
+| V4b gates (ADR 616, overhead 399, score 1,492) | | 2,507 | 4,323 |
+| 1. trend template | 0 | 256 | 4,067 |
+| 2. relative strength 70+ | 0 | 212 | 3,855 |
+| 3. SPY above its 200-day | 0 | 308 | 3,547 |
+| 4a. EPS +20% and accelerating | **2,124** | 894 | 529 |
+| 4b. revenue +10% | 66 | 157 | 306 |
+| 4c. net margin up | 0 | 5 | 301 |
+| 5. ambiguous ticker / no SEC ID | 3 | | 298 |
+
+298 survivors; the buy stop triggered on 169; 115 booked after the
+one-position rule.
+
+### Why 2,124 were dropped for missing data
+
+| cause | setups | share |
+|---|---|---|
+| no SEC ID / ambiguous ticker | 4 | 0.2% |
+| no 10-Q or 10-K in the prior 12 months (356 have an SEC ID but no statement data, mostly foreign filers) | 415 | 19.5% |
+| a loss a year earlier, so growth is blank | 1,058 | 49.8% |
+| an earlier quarter missing or blank (211 a real loss, 47 data gaps) | 258 | 12.1% |
+| other (232 US filers with no diluted EPS, a parsing gap; 154 annual rows only) | 389 | 18.3% |
+
+About 60% (1,269) are real losses a year earlier; about 40% (855) are data
+gaps, not repaired.
+
+### M1t: turnarounds allowed (Dave's call)
+
+A measurement, not a new strategy: Rule 4a also passes a positive EPS after a
+loss a year earlier (acceleration counted as met), and 20%+ growth where the
+earlier quarter was itself the turnaround. A loss in both years still fails.
+That rescued 524 setups; 593 survived all rules; 233 booked.
+
+### Results
+
+| version | trades | avg R | total R | without top 20 | 8-slot CAGR | max drawdown, marked daily |
+|---|---|---|---|---|---|---|
+| V4b, same window | 1,528 | +0.181 | +276.3 | -56.0 | 11.0% | -23.1% |
+| M1a | 115 | +0.058 | +6.7 | -55.9 | 1.0% | -12.6% |
+| M1b | 115 | +0.051 | +5.8 | -46.7 | 0.6% | -13.2% |
+| M1t-a | 233 | +0.111 | +25.9 | -92 | 2.3% | -16.4% |
+| M1t-b | 233 | +0.112 | +26 | -80 | 2.0% | -12.8% |
+| SPY, dividends estimated | -- | -- | -- | -- | ~14.4% | -34.1% |
+
+- **M1a and M1b: too few trades to judge** (115, under the locked minimum of
+  150).
+- **M1t fails the bar:** about 2% a year against 14.4%, negative without its
+  top 20. Without 2025, M1t-a makes +1.4R over 195 trades; 2025 supplies
+  +24.6R of its +25.9R.
+- The 118 trades the turnaround rule added averaged +0.163R (84 pure
+  loss-to-profit at +0.267R; 34 earlier-quarter turnarounds at -0.093R).
+  Under 150, so not judgeable alone.
+- **The filters cut trades without raising quality.** Every filtered version
+  averages less per trade than plain V4b. Repairing the 855 data gaps would add
+  an estimated 70 to 100 trades at about +0.1R: it cannot close a gap from 2%
+  to 14.4%. At this trade frequency the account sits mostly in cash.
+
+Files in Drive `ma_regime_backtest/`: `m1_*` and `m1t_*` (trades, run info,
+reports, 8-slot replays), `m1_diag_4a_missing.csv`, `m1_diag_4a_report.txt`,
+`m1_rs_percentile.parquet`.
+
+---
+
+## 2026-11-03 -- [DECISION, Dave] THE 50-DAY PULLBACK WORK IS PAUSED
+
+**Paused, not deleted.** Dave: "an okay place to take pause... We've worked
+this pretty hard. I'm running out of ideas." The effort moves to his Donchian
+breakout strategy. This entry is written so the work can be reopened from
+here.
+
+**Why.** 21 variants beyond the V0 baseline, all on the same 2016-2026 data,
+with rules locked before each run. None beats SPY. The best, V4b, makes 11.0% a
+year with a -23.1% drawdown against SPY's ~14.4% and -34.1%, and depends on its
+top 20 trades. The professional filters thinned the trades without improving
+them. The limit appears to be the pullback entry itself.
+
+**Accounts.**
+
+- **TradersPost:** the trial expired on the night of 2026-11-02 and was not
+  renewed. Dave will subscribe again when a strategy needs it. The live order
+  chain is therefore dead from 2026-11-03.
+- **Massive:** the subscription ends at the end of November 2026, with one
+  final copy to OneDrive. Price data stays as it is, ending 2026-10-27.
+
+### What the 50-day work established
+
+1. **The original edge was look-ahead.** +0.594R on 1,404 trades counted only
+   touch days that closed back above the 50, which a bid placed the night
+   before cannot know (2026-11-01).
+2. **The rule that traded live** (a limit at the projected 50) earns about
+   +0.1R per trade: 1.6% a year, -62% drawdown, 8 slots.
+3. **The resting bid buys the setup too early.** It fills on the way down; its
+   stop-out or open position then blocks the reclaim day the old rule took
+   (334 of 589 reclaims blocked).
+4. **The edge sits in setups that touch, close back above and keep going.** A
+   limit at the 50 cannot reach them; a buy stop above the confirm day's high
+   catches some (V4b).
+5. **Stop placement mattered more than entry.** The same buy-stop entry:
+   +0.181R with the stop under the confirm-day low, +0.076R with the ADR stop.
+6. **Every early exit hurt.** Exiting close-below fills (V1) and selling half
+   at a target (V5c) both cut the right tail.
+7. **Professional filters did not lift quality** (M1, M1t).
+8. **One year can carry a result.** 2025 supplies most of V3's and M1t's
+   profit.
+9. **Unvalidated pattern:** fills that open above the buy stop beat the rest
+   in every version from V4 on (V4b: +0.368R vs +0.097R; M1a: +0.596R vs
+   -0.218R). Found by looking across results; untested on fresh data.
+
+### Every version, one table
+
+| version | what changes | trades | avg R | without top 20 | 8-slot CAGR | max DD, marked daily |
+|---|---|---|---|---|---|---|
+| V0 | live rule: limit at projected 50 - 0.10 ATR, ADR stop as sent | 2,691 | +0.101 | -184.5 | 1.6% | -61.8% |
+| V1 | V0 + exit next open if the fill day closed at/below the 50 | 2,767 | +0.000 | -- | -- | -- |
+| V2 | confirm (touch, close above), limit next day only | 1,125 | +0.152 | -- | -- | -- |
+| V3 | confirm, limit for up to 3 days | 1,355 | +0.223 | -97.2 | 6.0% | -42.2% |
+| V4a | confirm, buy stop above the confirm-day high, ADR stop | 1,556 | +0.076 | -195.9 | -- | -- |
+| **V4b** | **same, stop just under the confirm-day low** | **1,528** | **+0.181** | **-56.0** | **11.0%** | **-23.1%** |
+| V5 (x6) | V4b + half at 1.5/2/3R, 10/20-day trail from entry (spec error) | ~1,600 | ~0 | < 0 | 4.2% (best) | -- |
+| V5c (x6) | V4b until half sells at 1.5/2/3R, then 10/20-day trail | ~1,530 | +0.083 to +0.122 | -13.5 to -48.2 | 6.2% (best) | -22.4% |
+| M1a / M1b | Minervini filters on V4b; M1b adds at +1R | 115 | +0.058 / +0.051 | -55.9 / -46.7 | 1.0% / 0.6% | -12.6% / -13.2% |
+| M1t-a / M1t-b | M1 + turnarounds allowed | 233 | +0.111 / +0.112 | -92 / -80 | 2.3% / 2.0% | -16.4% / -12.8% |
+| SPY | buy and hold, dividends estimated | -- | -- | -- | ~14.4% | -34.1% |
+
+Drive data, split-adjusted, 2016-10 to 2026-10, delisted names included.
+Production code from Main. Replay: 8 slots, 12.5% cost cap, $25,000
+compounded, 10 seeds, 2017-11-07 to 2026-10-27. Buy-stop fills assume no
+slippage. Detail in the 2026-11-02 and 2026-11-03 entries above.
+
+### Where everything lives
+
+| what | where |
+|---|---|
+| Production code | repo `davegebert-ux/50_Day_MA_Data`, branch `Main`: `pipeline/orchestrator.py` 113,557 bytes (books what was sent, exclusion list), `pipeline/send_orders_to_traderspost.py` 26,675, `pipeline/send_summary_email.py` 15,963, `scripts/pull_data.py` 50,575; workflows `daily_scorecard_automation.yml`, `send_orders_morning.yml`, `resend_orders.yml` |
+| Old research harness | branch `historical_backtest_research`, `research/staged_pipeline_backtest.py` |
+| State at pause | `state/open_positions.csv`, `closed_trades.csv`, `daily_funnel.csv`, `excluded_tickers.txt` (UTZ) |
+| Research outputs | Drive `ma_regime_backtest/`: `sim_*`, `variants_*`, `reclaim_trace.parquet`, `v4_*`, `v5_*`, `v5c_*`, `m1_*`, `m1t_*` |
+| Test specifications | primer, sections 1-13: https://claude.ai/artifact/5H6jzbowSm1W29c8qqeHZ4 |
+| Prices | Drive `donchian_data/daily_adj.parquet` (split-adjusted, 2016-10-27 to 2026-10-27, delisted included), `universe.parquet`; raw `massive_data/` is NOT split-adjusted |
+| Fundamentals | Drive `fundamentals_data/` (SEC EDGAR) |
+| Data notes | Project doc `claude/fundamentals_data_build_2026-11-03.md`; "Data Environment Handbook (2026-11-03)" |
+
+The original 1,579 repo price files behind the 1,404-trade anchor are lost;
+their location was never recorded.
+
+### How to reopen
+
+1. **Pick a hypothesis not yet tested** (the list below) and write its rules
+   into a new primer section, locked, before running anything.
+2. **Reproduce V4b first** on the same data: 1,528 trades at +0.181R. Nothing
+   else means anything until it matches.
+3. **Judge against the bar:** beat SPY's total return in the 8-slot replay
+   with a smaller drawdown marked daily; stay positive without the top 20
+   trades and without the best year; at least 150 trades.
+4. **Anything that passes needs fresh data** none of the 21 variants used:
+   forward paper results, or pre-2016 history (not available on the plans that
+   have lapsed).
+5. **To trade it:** build the order path for the new entry (V4b's confirm-day
+   logic and buy stops are NOT built in production), subscribe to TradersPost
+   again, and restart the schedules (shutdown list below, in reverse).
+
+### Left open
+
+**Untested leads:**
+
+- Gap-up fills as a rule (point 9 above), on fresh data only.
+- The other-average and market-regime study (10/20/100-day, SPY regimes):
+  held since 2026-11-01; its first pass used clean-only events and medians, so
+  it needs redoing with reclaims and R before any conclusion.
+- Minervini's actual entry, a breakout from a tight base: moves to the
+  Donchian work.
+- Portfolio-level sizing toward winners beyond the simple +1R add in M1b.
+
+**Data:**
+
+- Fundamentals gaps: 232 US filers with no diluted EPS (a parsing gap), 356
+  SEC IDs with no statement data (mostly foreign filers), 35 derived-Q4 gaps.
+  Not repaired.
+- "Loss a year ago" examples not checked against filings (GLW 2025-12-04, GM
+  2021-04-22, CG 2021-07-20).
+- SPY dividends: no dividend data; total return is price plus about 1.5% a
+  year.
+
+**Infrastructure, unanswered when TradersPost lapsed:**
+
+- Whether "Cancel existing open orders" stops the exit rejections (NEO,
+  2026-11-02). Any strategy with an attached stop, Donchian included, meets
+  this again.
+- NEO's broker fill against its booked exit; the NTNX and NAT checks after the
+  2026-11-02 run. Not done; moot once the paper positions are closed.
+
+**Carried:** re-derive the step-back envelope from the placeable trades;
+summary email header; disposition sheet (adds `manually_excluded`,
+`unreadable_order`, `stopped_at_fill`); the not-blocking list as of
+2026-10-31.
+
+### Shutdown, 2026-11-03 (with TradersPost gone)
+
+| | step | to restart |
+|---|---|---|
+| 1 | cron-job.org: disable "50MA morning order send" | enable it |
+| 2 | GitHub Actions: disable the nightly scorecard workflow (`daily_scorecard_automation.yml`) and "Send Orders" (`send_orders_morning.yml`) | enable both |
+| 3 | GitHub: delete the repository variable `TRADERSPOST_MODE` (sending reverts to dry run) | set it to `live` |
+| 4 | TradeStation sim: close the remaining positions (NAT, OABI, STLN, DINO, and any fills since 2026-11-01) and cancel their stops | -- |
+| 5 | GitHub: revoke the fine-grained token cron-job.org used | new token, saved in cron-job.org |
+
+Left in place: secrets `TRADERSPOST_WEBHOOK_URL` (dead until replaced) and the
+`SCORECARD_EMAIL_*` set. The books in `state/` stop updating at the last run.
+
+### Lessons carried to the Donchian work
+
+1. Measure the rule you can actually place, on the trades it actually takes,
+   before building it.
+2. The bar is SPY's total return, with drawdowns marked daily, not the
+   previous version.
+3. Check every result without its top 20 trades and without its best year;
+   under 150 trades is too few to judge.
+4. Lock the rules before the run, and count the variants tried on the same
+   data.
+5. Book what was sent; reconcile against the broker; the broker wins.
+6. An HTTP 200 is receipt, not acceptance; a vendor's bot is an account, not
+   evidence.
+7. Record where every dataset lives.
+8. A flawed test spec looks exactly like a negative result: check the
+   mechanics (holding days, exit reasons) before reading a verdict.
+
+---
+
+## OPEN ITEMS -- revised 2026-11-03 (50-day work paused)
+
+**Now:** the shutdown steps above.
+
+**Next focus:** the Donchian breakout strategy, its own paper account (decided
+2026-10-19), carrying over the infrastructure, the SEC fundamentals, the
+Minervini filters and the lessons above.
+
+**50-day system:** paused. Everything open is listed under "Left open" above.
